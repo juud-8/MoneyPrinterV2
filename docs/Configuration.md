@@ -44,6 +44,19 @@ All your configurations will be in a file in the root directory, called `config.
     - `platforms`: `string[]` - Platforms to target. Supported values in v1 are `tiktok` and `instagram`.
     - `account_ids`: `number[]` - Optional fixed Post Bridge account IDs to avoid account-selection prompts.
     - `auto_crosspost`: `boolean` - If `true`, cross-post automatically after a successful YouTube upload. If `false`, interactive runs ask and cron runs skip.
+- `youtube_api_key`: `string` - Google Cloud API key with **YouTube Data API v3** enabled, used by `src/youtube_metrics.py` and the web UI's "Refresh YouTube metrics" button to pull public view/like/comment counts and channel subscriber snapshots into `.mp/analytics.json`. Note: AI Studio Gemini keys do **not** work here — create a standard API key in Google Cloud Console ([enable the API](https://console.cloud.google.com/apis/library/youtube.googleapis.com), then [create credentials](https://console.cloud.google.com/apis/credentials)). Falls back to the `YOUTUBE_API_KEY` environment variable.
+- `premium_image_model`: `string` - Gemini image model used for the `premium_image` asset tier (thumbnails, and any shot a brand opts into premium stills).
+- `standard_image_provider`: `string` - Provider for standard-tier still images: `gemini` (default) or `fal`. `fal` routes every standard shot to the much cheaper fal.ai image model (`fal_image_model`) and falls back to Gemini on failure; the `premium_image` tier always stays on Gemini. Brands can override via `production.standard_image_provider`.
+- `fal_image_model`: `string` - fal.ai model id for standard-tier still images when `standard_image_provider` is `fal` (default: `fal-ai/flux/schnell`, roughly $0.003/image vs ~$0.067 for Gemini stills). Verify against fal.ai's current catalog/pricing before changing.
+- `fal_api_key`: `string` - Your fal.ai API key, used for the `premium_video` asset tier and (when `standard_image_provider` is `fal`) standard still images. If empty, MPV2 falls back to the `FAL_KEY` environment variable. Premium video is off by default for every brand — see [the brand setup guide](../brands/ACCOUNT_SETUP.md) to opt in.
+- `fal_video_model`: `string` - fal.ai model id for premium video clips (default: `fal-ai/veo3.1/fast`, $0.10/s vs $0.20/s for full Veo 3.1). Verify against fal.ai's current catalog/pricing before changing.
+- `fal_video_resolution`: `string` - Resolution requested from the fal.ai video model (default: `1080p`).
+- `fal_video_poll_timeout_seconds`: `number` - Max seconds to wait for a fal.ai video generation job before giving up and falling back to a premium still image.
+- `premium_video_max_duration_seconds`: `number` - Hard cap on a single premium video clip's requested duration (cost control; default: `6`).
+- `asset_spend_alert_threshold_usd`: `number` - Informational threshold: the weekly analytics review warns if recent (7-day) premium asset spend exceeds this (default: `25`). Does not block generation.
+- `fishaudio_api_key`: `string` - Fish Audio API key, used when `tts_provider` is `fishaudio` (~$15 per 1M characters — roughly 90% cheaper than ElevenLabs). If empty, MPV2 falls back to the `FISH_AUDIO_API_KEY` environment variable.
+- `fishaudio_voice_id`: `string` - Fish Audio voice model reference id (create/clone a voice at [fish.audio](https://fish.audio)). Brands can override via `production.fishaudio_voice_id`.
+- `fishaudio_model`: `string` - Fish Audio TTS model (default: `s2-pro`). On failure, MPV2 falls back to ElevenLabs (if configured) and then KittenTTS.
 
 ## Example
 
@@ -95,7 +108,10 @@ All your configurations will be in a file in the root directory, called `config.
 ## Environment Variable Fallbacks
 
 - `GEMINI_API_KEY`: used when `nanobanana2_api_key` is empty.
+- `YOUTUBE_API_KEY`: used when `youtube_api_key` is empty.
 - `POST_BRIDGE_API_KEY`: used when `post_bridge.api_key` is empty.
+- `FAL_KEY`: used when `fal_api_key` is empty.
+- `FISH_AUDIO_API_KEY`: used when `fishaudio_api_key` is empty.
 
 Example:
 

@@ -1,6 +1,16 @@
-import ollama
+import os
 
-from config import get_ollama_base_url
+import ollama
+import requests
+
+from config import (
+    get_gemini_api_key,
+    get_gemini_model,
+    get_llm_provider,
+    get_ollama_base_url,
+    get_quality_llm_provider,
+    get_verbose,
+)
 
 _selected_model: str | None = None
 
@@ -38,17 +48,44 @@ def get_active_model() -> str | None:
     return _selected_model
 
 
-def generate_text(prompt: str, model_name: str = None) -> str:
-    """
-    Generates text using the local Ollama server.
+def _generate_gemini(prompt: str, model: str | None = None) -> str:
+    api_key = get_gemini_api_key()
+    if not api_key:
+        raise RuntimeError("Gemini API key not configured for cloud LLM.")
 
-    Args:
-        prompt (str): User prompt
-        model_name (str): Optional model name override
+    model_name = model or get_gemini_model()
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.85,
+            "maxOutputTokens": 8192,
+        },
+    }
+    response = requests.post(
+        url,
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+    )
+    response.raise_for_status()
+    body = response.json()
 
-    Returns:
-        response (str): Generated text
-    """
+    candidates = body.get("candidates", [])
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: {body}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text_parts = [p.get("text", "") for p in parts if p.get("text")]
+    if not text_parts:
+        raise RuntimeError("Gemini returned empty text.")
+    return "".join(text_parts).strip()
+
+
+def _generate_ollama(prompt: str, model_name: str | None) -> str:
     model = model_name or _selected_model
     if not model:
         raise RuntimeError(
@@ -59,5 +96,36 @@ def generate_text(prompt: str, model_name: str = None) -> str:
         model=model,
         messages=[{"role": "user", "content": prompt}],
     )
-
     return response["message"]["content"].strip()
+
+
+def generate_text(
+    prompt: str,
+    model_name: str = None,
+    quality: bool = False,
+) -> str:
+    """
+    Generates text using the configured LLM provider.
+
+    Args:
+        prompt (str): User prompt
+        model_name (str): Optional model name override (Ollama or Gemini)
+        quality (bool): If True, prefer quality_llm_provider (usually Gemini)
+
+    Returns:
+        response (str): Generated text
+    """
+    provider = get_quality_llm_provider() if quality else get_llm_provider()
+
+    if provider == "gemini":
+        try:
+            return _generate_gemini(prompt, model_name)
+        except Exception as gemini_err:
+            if get_verbose():
+                from status import warning
+                warning(f"Gemini failed, falling back to Ollama: {gemini_err}")
+            if get_llm_provider() == "ollama" or _selected_model:
+                return _generate_ollama(prompt, model_name)
+            raise
+
+    return _generate_ollama(prompt, model_name)

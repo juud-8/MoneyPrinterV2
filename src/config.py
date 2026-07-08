@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import srt_equalizer
 
 from termcolor import colored
 
@@ -294,6 +293,8 @@ def equalize_subtitles(srt_path: str, max_chars: int = 10) -> None:
     Returns:
         None
     """
+    import srt_equalizer
+
     srt_equalizer.equalize_srt_file(srt_path, srt_path, max_chars)
     
 def get_font() -> str:
@@ -327,18 +328,172 @@ def get_imagemagick_path() -> str:
 
 def get_script_sentence_length() -> int:
     """
-    Gets the forced script's sentence length.
-    In case there is no sentence length in config, returns 4 when none
-
-    Returns:
-        length (int): Length of script's sentence
+    Gets the forced script's sentence length (brand override, then config).
     """
+    try:
+        from brand_switcher import get_production_setting
+
+        val = get_production_setting("script_sentence_length", None)
+        if val is not None:
+            return int(val)
+    except Exception:
+        pass
+
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         config_json = json.load(file)
-        if (config_json.get("script_sentence_length") is not None):
+        if config_json.get("script_sentence_length") is not None:
             return config_json["script_sentence_length"]
-        else:
-            return 4
+        return 4
+
+def get_llm_provider() -> str:
+    """Default LLM provider: ollama or gemini."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("llm_provider", "ollama").lower()
+
+
+def get_quality_llm_provider() -> str:
+    """LLM for hooks/scripts/titles — usually gemini for quality."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("quality_llm_provider", "gemini").lower()
+
+
+def get_gemini_api_key() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        cfg = json.load(file)
+        return cfg.get("gemini_api_key", "") or cfg.get("nanobanana2_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
+
+
+def get_gemini_model() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("gemini_model", "gemini-2.0-flash")
+
+
+def get_youtube_api_key() -> str:
+    """Google API key with YouTube Data API v3 enabled (public video stats).
+
+    Falls back to the Gemini key since both are Google API keys — enabling
+    the YouTube Data API on the existing key is the zero-extra-setup path.
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        cfg = json.load(file)
+        return (
+            cfg.get("youtube_api_key", "")
+            or os.environ.get("YOUTUBE_API_KEY", "")
+            or cfg.get("gemini_api_key", "")
+            or cfg.get("nanobanana2_api_key", "")
+            or os.environ.get("GEMINI_API_KEY", "")
+        )
+
+
+def get_tts_provider() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("tts_provider", "kittentts").lower()
+
+
+def get_elevenlabs_api_key() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("elevenlabs_api_key", "") or os.environ.get("ELEVENLABS_API_KEY", "")
+
+
+def get_elevenlabs_voice_id() -> str:
+    try:
+        from brand_switcher import get_production_setting
+
+        val = get_production_setting("elevenlabs_voice_id", None)
+        if val:
+            return val
+    except Exception:
+        pass
+
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("elevenlabs_voice_id", "")
+
+
+def get_elevenlabs_model() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("elevenlabs_model", "eleven_multilingual_v2")
+
+
+def get_fishaudio_api_key() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("fishaudio_api_key", "") or os.environ.get("FISH_AUDIO_API_KEY", "")
+
+
+def get_fishaudio_voice_id() -> str:
+    """Fish Audio voice model reference id (brand override, then config)."""
+    try:
+        from brand_switcher import get_production_setting
+
+        val = get_production_setting("fishaudio_voice_id", None)
+        if val:
+            return val
+    except Exception:
+        pass
+
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("fishaudio_voice_id", "")
+
+
+def get_fishaudio_model() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("fishaudio_model", "s2-pro")
+
+
+def get_images_per_second() -> float:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return float(json.load(file).get("images_per_second", 0.28))
+
+
+def get_ken_burns_enabled() -> bool:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return bool(json.load(file).get("ken_burns_enabled", True))
+
+
+def get_crossfade_duration() -> float:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return float(json.load(file).get("crossfade_duration", 0.4))
+
+
+def get_word_captions_enabled() -> bool:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return bool(json.load(file).get("word_captions_enabled", True))
+
+
+def get_review_before_upload() -> bool:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return bool(json.load(file).get("review_before_upload", True))
+
+
+def get_channel_config_file() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get(
+            "channel_config_file", "brands/the_strange_archive/manifest.json"
+        )
+
+
+def get_channel_funnel_config() -> dict:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("channel_funnel", {})
+
+
+def get_premium_image_model() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("premium_image_model", "gemini-3.1-flash-image-preview")
+
+
+def get_longform_target_minutes() -> int:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return int(json.load(file).get("longform_target_minutes", 8))
+
+
+def get_longform_enabled() -> bool:
+    try:
+        from brand_switcher import is_longform_enabled
+
+        return is_longform_enabled()
+    except Exception:
+        return True
+
 
 def get_post_bridge_config() -> dict:
     """
@@ -403,3 +558,101 @@ def get_post_bridge_config() -> dict:
             raw_config.get("auto_crosspost", defaults["auto_crosspost"])
         ),
     }
+
+
+def get_fal_api_key() -> str:
+    """
+    Gets the fal.ai API key (used for premium video clip generation).
+
+    Returns:
+        key (str): API key, falling back to the FAL_KEY env var (fal's
+            own SDK convention).
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        configured = json.load(file).get("fal_api_key", "")
+        return configured or os.environ.get("FAL_KEY", "")
+
+
+def get_standard_image_provider() -> str:
+    """
+    Provider for standard-tier still images: "gemini" (default) or "fal".
+
+    Brands can override via `production.standard_image_provider`. "fal" routes
+    standard shots to the cheaper fal.ai image model (`fal_image_model`) and
+    falls back to Gemini on failure; premium_image always stays on Gemini.
+    """
+    try:
+        from brand_switcher import get_production_setting
+
+        val = get_production_setting("standard_image_provider", None)
+        if val:
+            return str(val).lower()
+    except Exception:
+        pass
+
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("standard_image_provider", "gemini").lower()
+
+
+def get_fal_image_model() -> str:
+    """
+    Gets the fal.ai model id used for standard-tier still images.
+
+    Returns:
+        model_id (str): e.g. "fal-ai/flux/schnell". Verify against fal.ai's
+            current model catalog/pricing before changing.
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("fal_image_model", "fal-ai/flux/schnell")
+
+
+def get_fal_video_model() -> str:
+    """
+    Gets the fal.ai model id used for premium video clip generation.
+
+    Returns:
+        model_id (str): e.g. "fal-ai/veo3.1". Verify against fal.ai's
+            current model catalog/pricing before changing.
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("fal_video_model", "fal-ai/veo3.1")
+
+
+def get_fal_video_resolution() -> str:
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("fal_video_resolution", "1080p")
+
+
+def get_fal_video_poll_timeout() -> float:
+    """Max seconds to wait for a fal.ai video generation job to complete."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return float(json.load(file).get("fal_video_poll_timeout_seconds", 240))
+
+
+def get_premium_video_max_duration_seconds() -> float:
+    """Cap on a single premium video clip's duration (cost control)."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return float(json.load(file).get("premium_video_max_duration_seconds", 6))
+
+
+def get_ai_disclosure_default() -> bool:
+    """
+    Default for whether `upload_video()` should attempt to mark YouTube's
+    'Altered or synthetic content' disclosure as Yes. Brands can override via
+    `production.ai_disclosure`.
+
+    Default is True: YouTube's own help docs state disclosing AI content has
+    no monetization/reach downside, and AI-image/voice providers increasingly
+    embed detectable provenance metadata (SynthID/C2PA) that YouTube's
+    auto-detection can flag anyway — so proactively disclosing is the safer
+    default for any brand built on this engine's AI pipeline.
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return bool(json.load(file).get("ai_disclosure_default", True))
+
+
+def get_asset_spend_alert_threshold_usd() -> float:
+    """Weekly premium-asset spend (USD) above which the weekly review should
+    surface a warning. Purely informational — does not block generation."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return float(json.load(file).get("asset_spend_alert_threshold_usd", 25))

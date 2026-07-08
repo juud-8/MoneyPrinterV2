@@ -4,6 +4,8 @@
 - `src/` contains the application code. Use `src/main.py` as the interactive entrypoint.
 - `src/classes/` holds provider-specific components (for example `YouTube.py`, `Twitter.py`, `Tts.py`, `AFM.py`, `Outreach.py`).
 - Shared utilities and configuration live in modules like `src/config.py`, `src/utils.py`, `src/cache.py`, and `src/constants.py`.
+- `src/brand_switcher.py`, `src/content_styles.py`, `src/asset_gen.py`, `src/asset_strategy.py` implement the multi-brand system and tiered asset generation — keep these brand-agnostic; a brand's behavior should come entirely from its manifest, never from an `if brand_id == "..."` check in engine code.
+- `brands/<brand_id>/` holds each brand's manifest (`manifest.json`), brand-specific assets (e.g. an outro clip), and any brand-pinned scheduled-run scripts. This directory is content/business data, not engine code — treat it as gitignored/private by default.
 - `scripts/` contains helper workflows such as setup, preflight checks, and upload helpers.
 - `docs/` contains feature documentation; `assets/` and `fonts/` contain static resources.
 
@@ -24,11 +26,13 @@
 - Prefer small, explicit functions and preserve existing CLI-first behavior.
 
 ## Testing Guidelines
-- There is currently no enforced automated test suite or coverage threshold.
+- There is a `tests/` suite (`python -m unittest discover -s tests`) covering pure-logic modules: config parsing, brand resolution (`brand_switcher`), content styles, asset strategy/fallback (`asset_gen`/`asset_strategy`), description building (`content_funnel`), and Post Bridge. There is no enforced coverage threshold, and the Selenium/MoviePy pipeline itself is not covered by automated tests.
+- On Windows, set `$env:PYTHONIOENCODING = "utf-8"` before running tests/scripts in PowerShell — `status.py`'s emoji-prefixed log messages otherwise crash under the default `cp1252` console encoding.
 - Minimum validation for changes:
+  - Run `python -m unittest discover -s tests`
   - Run `python3 scripts/preflight_local.py`
   - Smoke-test impacted flows via `python3 src/main.py`
-- When adding tests, place them in a top-level `tests/` directory with names like `test_<module>.py`.
+- When adding tests, place them in the top-level `tests/` directory with names like `test_<module>.py`, and isolate any test that touches `.mp/` (cache files) by patching the relevant path function (e.g. `cache.get_cache_path`) to a temp directory — several existing tests do this; never let a test write to the real `.mp/` cache.
 
 ## Commit & Pull Request Guidelines
 - Follow the existing commit style: imperative summaries like `Fix ...`, `Update ...`, optionally with issue refs (for example `(#128)`).
@@ -38,4 +42,6 @@
 
 ## Security & Configuration Tips
 - Treat `config.json` as environment-specific; do not commit real API keys or private profile paths.
-- Start from `config.example.json` and prefer environment variables where supported (for example `GEMINI_API_KEY`).
+- Start from `config.example.json` and prefer environment variables where supported (for example `GEMINI_API_KEY`, `ELEVENLABS_API_KEY`, `FAL_KEY`).
+- `brands/<brand_id>/manifest.json` files can contain account-identifying info (Google account email, channel id, voice id) — treat them with the same care as `config.json` even though they aren't gitignored by default; avoid putting real secrets directly in a manifest.
+- Generated video output (`output/`) is gitignored — never force-add it; these are large binaries that don't belong in git history.

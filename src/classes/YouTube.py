@@ -1,9 +1,7 @@
 import re
-import base64
 import json
 import time
 import os
-import requests
 import assemblyai as aai
 
 from utils import *
@@ -12,24 +10,43 @@ from .Tts import TTS
 from llm_provider import generate_text
 from config import *
 from status import *
+from content_funnel import build_description
+from asset_gen import AssetResult, generate_image as gen_image, generate_asset_with_fallback
+from asset_strategy import shot_role_for_index, tier_for_shot_role
+from video_effects import apply_ken_burns, apply_crossfade
+from video_captions import composite_captions_on_video
+from analytics import log_video, log_asset_spend
+from brand_switcher import get_production_setting, load_active_brand
+from content_styles import get_content_style, DEFAULT_SCRIPT_RULES
+from topic_scoring import pick_best
 from uuid import uuid4
 from constants import *
-from typing import List
-from moviepy.editor import *
+from typing import List, Optional
+from moviepy import (
+    AudioFileClip,
+    ImageClip,
+    TextClip,
+    VideoFileClip,
+    CompositeVideoClip,
+    CompositeAudioClip,
+    concatenate_videoclips,
+    afx,
+)
 from termcolor import colored
-from selenium_firefox import *
 from selenium import webdriver
-from moviepy.video.fx.all import crop
-from moviepy.config import change_settings
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import ElementClickInterceptedException
 from moviepy.video.tools.subtitles import SubtitlesClip
 from webdriver_manager.firefox import GeckoDriverManager
 from datetime import datetime
 
-# Set ImageMagick Path
-change_settings({"IMAGEMAGICK_BINARY": get_imagemagick_path()})
+# MoviePy 2.x uses IMAGEMAGICK_BINARY env var (no change_settings API)
+os.environ["IMAGEMAGICK_BINARY"] = get_imagemagick_path()
 
 
 class YouTube:
@@ -75,6 +92,11 @@ class YouTube:
         self._language: str = language
 
         self.images = []
+        self.asset_modalities = []  # parallel to self.images: "image" | "video_clip"
+        self.format_type = "short"
+        self.research_notes = ""
+        self.last_upload_error = None
+        self.chapters = []
 
         # Initialize the Firefox profile
         self.options: Options = Options()
@@ -90,14 +112,24 @@ class YouTube:
 
         self.options.add_argument("-profile")
         self.options.add_argument(self._fp_profile_path)
-
-        # Set the service
         self.service: Service = Service(GeckoDriverManager().install())
+        self.browser: webdriver.Firefox | None = None
 
-        # Initialize the browser
-        self.browser: webdriver.Firefox = webdriver.Firefox(
-            service=self.service, options=self.options
-        )
+    def _ensure_browser(self) -> webdriver.Firefox:
+        """Launch Firefox on first upload (not needed for video generation)."""
+        if self.browser is None:
+            self.browser = webdriver.Firefox(
+                service=self.service, options=self.options
+            )
+        return self.browser
+
+    def close_browser(self) -> None:
+        if self.browser is not None:
+            try:
+                self.browser.quit()
+            except Exception:
+                pass
+            self.browser = None
 
     @property
     def niche(self) -> str:
@@ -119,17 +151,41 @@ class YouTube:
         """
         return self._language
 
-    def generate_response(self, prompt: str, model_name: str = None) -> str:
+    def generate_response(
+        self, prompt: str, model_name: str = None, quality: bool = False
+    ) -> str:
         """
         Generates an LLM Response based on a prompt and the user-provided model.
 
         Args:
             prompt (str): The prompt to use in the text generation.
+            quality (bool): Use quality LLM (Gemini) for hooks/scripts/titles.
 
         Returns:
             response (str): The generated AI Repsonse.
         """
-        return generate_text(prompt, model_name=model_name)
+        return generate_text(prompt, model_name=model_name, quality=quality)
+
+    def generate_research(self) -> str:
+        """
+        Add original value layer — key facts and angles for AI-policy compliance.
+
+        Returns:
+            research_notes (str): Brief research bullets for the scriptwriter.
+        """
+        prompt = f"""
+        You are researching a YouTube video for niche: {self.niche}.
+        Topic idea: {getattr(self, 'subject', self.niche)}
+
+        Provide 4-6 specific, factual bullet points a creator can use for an original
+        explainer (real tool names, realistic workflows, concrete outcomes).
+        No fluff. No markdown headers. One bullet per line starting with "-".
+        """
+        notes = self.generate_response(prompt, quality=True)
+        self.research_notes = notes
+        if get_verbose():
+            info(f" => Research notes:\n{notes[:300]}...")
+        return notes
 
     def generate_topic(self) -> str:
         """
@@ -138,126 +194,345 @@ class YouTube:
         Returns:
             topic (str): The generated topic.
         """
-        completion = self.generate_response(
-            f"Please generate a specific video idea that takes about the following topic: {self.niche}. Make it exactly one sentence. Only return the topic, nothing else."
+        preset = (getattr(self, "subject", None) or "").strip()
+        if preset:
+            self.subject = preset
+            if get_verbose():
+                info(f" => Using preset topic: {self.subject}")
+            return self.subject
+
+        style = get_content_style()
+
+        episode_hint = ""
+        if style["uses_episode_hint"]:
+            ep = getattr(self, "episode_number", None)
+            if ep:
+                ep_label = str(ep).zfill(2) if str(ep).isdigit() else str(ep)
+                episode_hint = (
+                    f"\n- This is Episode {ep_label} — the series premiere. "
+                    "Make it iconic, self-contained, and the kind of story viewers share."
+                )
+
+        prompt = style["topic_prompt"](self.niche, episode_hint)
+
+        # Steer topics toward what actually performed once the brand has
+        # enough tracked view data (see performance_insights.py). Empty
+        # string until then, so behavior is unchanged for new brands.
+        try:
+            from performance_insights import build_topic_insights_block
+
+            active_brand = load_active_brand() or {}
+            insights = build_topic_insights_block(active_brand.get("brand_id", ""))
+            if insights:
+                prompt += "\n" + insights
+                if get_verbose():
+                    info(" => Topic prompt includes channel performance insights.")
+        except Exception as e:
+            warning(f"Performance insights skipped: {e}")
+
+        candidate_count = max(1, int(style.get("topic_candidate_count", 1) or 1))
+
+        candidates = []
+        for _ in range(candidate_count):
+            completion = self.generate_response(prompt, quality=True)
+            if completion:
+                candidates.append(completion.strip().strip('"').strip("'"))
+
+        if not candidates:
+            error("Failed to generate Topic.")
+            self.subject = ""
+            return self.subject
+
+        if len(candidates) > 1:
+            self.subject = pick_best(candidates)
+            if get_verbose():
+                info(f" => Picked best of {len(candidates)} topic candidates: {self.subject}")
+        else:
+            self.subject = candidates[0]
+
+        return self.subject
+
+    def _short_speech_wps(self) -> float:
+        return 2.5
+
+    def _get_outro_path(self) -> str:
+        rel = get_production_setting("outro_clip", "") or ""
+        if not rel:
+            return ""
+        path = rel if os.path.isabs(rel) else os.path.join(ROOT_DIR, rel)
+        return path if os.path.isfile(path) else ""
+
+    def _outro_duration(self) -> float:
+        configured = get_production_setting("outro_duration_seconds", None)
+        if configured:
+            return float(configured)
+        outro_path = self._get_outro_path()
+        if not outro_path:
+            return 0.0
+        try:
+            with VideoFileClip(outro_path) as clip:
+                return float(clip.duration or 0.0)
+        except Exception:
+            return 0.0
+
+    def _short_target_duration(self) -> float:
+        if self.format_type == "longform":
+            return 45.0  # unused for long-form pacing today; kept for signature symmetry
+
+        style = get_content_style()
+        default_seconds = style["default_target_seconds"]
+        total = float(
+            get_production_setting("target_duration_seconds", default_seconds)
+            or default_seconds
         )
 
-        if not completion:
-            error("Failed to generate Topic.")
+        if style["subtract_outro_from_target"]:
+            outro = self._outro_duration()
+            if outro > 0:
+                return max(total - outro, style["min_target_floor_seconds"])
 
-        self.subject = completion
+        return total
 
-        return completion
+    def _short_target_words(self) -> int:
+        return int(self._short_target_duration() * self._short_speech_wps())
 
-    def generate_script(self) -> str:
+    def _short_min_words(self) -> int:
+        return int(self._short_target_duration() * 2.2)
+
+    def _short_max_words(self) -> Optional[int]:
+        """Word count corresponding to a style's hard length ceiling
+        (e.g. ~95s), or None if the style doesn't set one."""
+        style = get_content_style()
+        ceiling_secs = style.get("max_target_ceiling_seconds")
+        if not ceiling_secs:
+            return None
+        return int(ceiling_secs * self._short_speech_wps())
+
+    def generate_script(self, _attempt: int = 0) -> str:
         """
-        Generate a script for a video, depending on the subject of the video, the number of paragraphs, and the AI model.
+        Generate a hook-first script with retention beats and CTA.
 
         Returns:
             script (str): The script of the video.
         """
         sentence_length = get_script_sentence_length()
+        research = getattr(self, "research_notes", "") or ""
+        style = get_content_style()
+        is_short = self.format_type != "longform"
+
+        if is_short and style["short_script_rules"]:
+            target_secs = int(self._short_target_duration())
+            target_words = self._short_target_words()
+            min_words = self._short_min_words()
+            script_rules = style["short_script_rules"]
+            length_instruction = style["short_length_instruction"](
+                target_secs, target_words, min_words
+            )
+        else:
+            script_rules = DEFAULT_SCRIPT_RULES
+            if self.format_type == "longform":
+                target_words = get_longform_target_minutes() * 130
+                length_instruction = (
+                    f"Write approximately {target_words} words ({get_longform_target_minutes()} minutes spoken). "
+                    "Structure with clear sections/chapters. Include 3-5 retention hooks ('But here's the thing...', etc.)."
+                )
+            else:
+                length_instruction = (
+                    f"Exactly {sentence_length} short sentences. Total under 45 seconds when spoken."
+                )
+
         prompt = f"""
-        Generate a script for a video in {sentence_length} sentences, depending on the subject of the video.
+        Write a YouTube {self.format_type} voiceover script.
 
-        The script is to be returned as a string with the specified number of paragraphs.
+        RULES:
+        {script_rules}
+        - Use short punchy sentences for Shorts; slightly longer for long-form
+        - {length_instruction}
+        - Language: {self.language}
+        - NO markdown, NO titles, NO stage directions, NO quotes around the script
+        - Return ONLY the spoken script
 
-        Here is an example of a string:
-        "This is an example string."
-
-        Do not under any circumstance reference this prompt in your response.
-
-        Get straight to the point, don't start with unnecessary things like, "welcome to this video".
-
-        Obviously, the script should be related to the subject of the video.
-        
-        YOU MUST NOT EXCEED THE {sentence_length} SENTENCES LIMIT. MAKE SURE THE {sentence_length} SENTENCES ARE SHORT.
-        YOU MUST NOT INCLUDE ANY TYPE OF MARKDOWN OR FORMATTING IN THE SCRIPT, NEVER USE A TITLE.
-        YOU MUST WRITE THE SCRIPT IN THE LANGUAGE SPECIFIED IN [LANGUAGE].
-        ONLY RETURN THE RAW CONTENT OF THE SCRIPT. DO NOT INCLUDE "VOICEOVER", "NARRATOR" OR SIMILAR INDICATORS OF WHAT SHOULD BE SPOKEN AT THE BEGINNING OF EACH PARAGRAPH OR LINE. YOU MUST NOT MENTION THE PROMPT, OR ANYTHING ABOUT THE SCRIPT ITSELF. ALSO, NEVER TALK ABOUT THE AMOUNT OF PARAGRAPHS OR LINES. JUST WRITE THE SCRIPT
-        
-        Subject: {self.subject}
-        Language: {self.language}
+        Topic: {self.subject}
+        Research to incorporate:
+        {research}
         """
-        completion = self.generate_response(prompt)
+        completion = self.generate_response(prompt, quality=True)
 
-        # Apply regex to remove *
         completion = re.sub(r"\*", "", completion)
+        completion = re.sub(r"^#+\s*", "", completion, flags=re.MULTILINE)
 
         if not completion:
             error("The generated script is empty.")
             return
 
-        if len(completion) > 5000:
-            if get_verbose():
-                warning("Generated Script is too long. Retrying...")
-            return self.generate_script()
+        max_len = 15000 if self.format_type == "longform" else 5000
+        if len(completion) > max_len:
+            if _attempt < 4:
+                if get_verbose():
+                    warning("Generated Script is too long. Retrying...")
+                return self.generate_script(_attempt + 1)
+            completion = completion[:max_len]
 
-        self.script = completion
+        self.script = completion.strip()
 
-        return completion
+        if style["enforce_min_word_count"] and is_short:
+            word_count = len(self.script.split())
+            min_words = self._short_min_words()
+            if word_count < min_words and _attempt < 3:
+                warning(
+                    f"Script too short ({word_count} words, need ≥{min_words}). Retrying..."
+                )
+                return self.generate_script(_attempt + 1)
 
-    def generate_metadata(self) -> dict:
+        if style.get("enforce_max_word_count") and is_short:
+            max_words = self._short_max_words()
+            word_count = len(self.script.split())
+            if max_words and word_count > max_words:
+                if _attempt < 3:
+                    warning(
+                        f"Script too long ({word_count} words, cap ~{max_words}). Retrying..."
+                    )
+                    return self.generate_script(_attempt + 1)
+                warning(
+                    f"Script still over the ~{max_words}-word cap after retries "
+                    f"({word_count} words) — proceeding with the longer script rather "
+                    "than truncating mid-sentence."
+                )
+
+        return self.script
+
+    def generate_metadata(self, _attempt: int = 0) -> dict:
         """
-        Generates Video metadata for the to-be-uploaded YouTube Short (Title, Description).
+        Generates Video metadata for the to-be-uploaded YouTube video.
 
         Returns:
             metadata (dict): The generated metadata.
         """
-        title = self.generate_response(
-            f"Please generate a YouTube Video Title for the following subject, including hashtags: {self.subject}. Only return the title, nothing else. Limit the title under 100 characters."
+        title_prompt = f"""Write a YouTube title for this video.
+
+Topic: {self.subject}
+Format: {self.format_type}
+
+Rules:
+- Under 70 characters
+- Do NOT include hashtags — they belong in the description, not the title
+- Use curiosity or specificity (numbers, real names, dates)
+- Return ONLY the title"""
+
+        title_candidate_count = max(
+            1, int(get_content_style().get("title_candidate_count", 1) or 1)
         )
+        title_candidates = []
+        for _ in range(title_candidate_count):
+            candidate = self.generate_response(title_prompt, quality=True)
+            if candidate:
+                cleaned = candidate.split("\n")[0].strip().strip('"').strip("'")
+                # Hashtags in titles get truncated into junk fragments ("#His")
+                # once suffixes/length limits apply — hard-strip them even if
+                # the LLM ignores the prompt rule. Description keeps hashtags.
+                cleaned = re.sub(r"\s*#\w+", "", cleaned).strip(" -|—")
+                if cleaned:
+                    title_candidates.append(cleaned)
+
+        if len(title_candidates) > 1:
+            title = pick_best(title_candidates)
+            if get_verbose():
+                info(f" => Picked best of {len(title_candidates)} title candidates: {title}")
+        else:
+            title = title_candidates[0] if title_candidates else ""
+
+        ep = getattr(self, "episode_number", None)
+        if ep and not re.match(r"^episode\s", title, re.IGNORECASE):
+            ep_label = str(ep).zfill(2) if str(ep).isdigit() else str(ep)
+            prefix = f"Episode {ep_label}: "
+            max_base = 100 - len(prefix)
+            if len(title) > max_base:
+                title = title[:max_base].rstrip(" .,#")
+            title = prefix + title
 
         if len(title) > 100:
-            if get_verbose():
-                warning("Generated Title is too long. Retrying...")
-            return self.generate_metadata()
+            if _attempt < 4:
+                if get_verbose():
+                    warning(
+                        f"Generated Title is too long ({len(title)} chars). Retrying..."
+                    )
+                return self.generate_metadata(_attempt + 1)
+            title = title[:100].rstrip()
 
-        description = self.generate_response(
-            f"Please generate a YouTube Video Description for the following script: {self.script}. Only return the description, nothing else."
+        title_suffix = get_production_setting("title_suffix", "") or ""
+        if title_suffix and title_suffix.strip() not in title:
+            candidate = f"{title} {title_suffix.strip()}".strip()
+            if len(candidate) <= 100:
+                title = candidate
+            else:
+                max_base = 100 - len(title_suffix.strip()) - 1
+                title = f"{title[:max_base].rstrip()} {title_suffix.strip()}"
+
+        raw_description = self.generate_response(
+            f"""Write a YouTube description body (2-4 short paragraphs) for this script.
+Include timestamps placeholder only if long-form.
+Do NOT include affiliate links — those are added automatically.
+
+Script:
+{self.script[:3000]}""",
+            quality=True,
+        )
+
+        description = build_description(
+            raw_description,
+            subject=self.subject,
+            format_type=self.format_type,
+            include_affiliate=True,
         )
 
         self.metadata = {"title": title, "description": description}
 
         return self.metadata
 
-    def generate_prompts(self) -> List[str]:
+    def _calculate_image_count(self, estimated_duration: float = None) -> int:
+        """Derive image count from script length / duration — not len(script)/3."""
+        if estimated_duration is None:
+            word_count = len(self.script.split())
+            wps = 2.5 if self.format_type == "short" else 2.2
+            estimated_duration = word_count / wps
+
+        rate = get_images_per_second()
+        if self.format_type == "longform":
+            rate = min(rate, 0.12)
+
+        count = max(3, int(estimated_duration * rate) + 1)
+        cap = 50 if self.format_type == "longform" else 12
+        return min(count, cap)
+
+    def generate_prompts(self, _attempt: int = 0) -> List[str]:
         """
         Generates AI Image Prompts based on the provided Video Script.
 
         Returns:
             image_prompts (List[str]): Generated List of image prompts.
         """
-        n_prompts = len(self.script) / 3
+        n_prompts = self._calculate_image_count()
+
+        style_suffix = get_production_setting("image_style_suffix", "") or (
+            "cinematic documentary illustration style, high contrast, dramatic lighting, "
+            "no text in images, 9:16 vertical"
+        )
 
         prompt = f"""
-        Generate {n_prompts} Image Prompts for AI Image Generation,
-        depending on the subject of a video.
+        Generate exactly {n_prompts} image prompts for AI image generation for a {self.format_type} video.
         Subject: {self.subject}
+        Niche: {self.niche}
 
-        The image prompts are to be returned as
-        a JSON-Array of strings.
+        Style: {style_suffix}
 
-        Each search term should consist of a full sentence,
-        always add the main subject of the video.
+        Return ONLY a JSON array of strings, e.g. ["prompt 1", "prompt 2"]
 
-        Be emotional and use interesting adjectives to make the
-        Image Prompt as detailed as possible.
-
-        YOU MUST ONLY RETURN THE JSON-ARRAY OF STRINGS.
-        YOU MUST NOT RETURN ANYTHING ELSE.
-        YOU MUST NOT RETURN THE SCRIPT.
-
-        The search terms must be related to the subject of the video.
-        Here is an example of a JSON-Array of strings:
-        ["image prompt 1", "image prompt 2", "image prompt 3"]
-
-        For context, here is the full text:
-        {self.script}
+        Script excerpt:
+        {self.script[:2000]}
         """
 
         completion = (
-            str(self.generate_response(prompt))
+            str(self.generate_response(prompt, quality=True))
             .replace("```json", "")
             .replace("```", "")
         )
@@ -281,12 +556,23 @@ class YouTube:
                 r = re.compile(r"\[.*\]")
                 image_prompts = r.findall(completion)
                 if len(image_prompts) == 0:
+                    if _attempt < 4:
+                        if get_verbose():
+                            warning("Failed to generate Image Prompts. Retrying...")
+                        return self.generate_prompts(_attempt + 1)
                     if get_verbose():
-                        warning("Failed to generate Image Prompts. Retrying...")
-                    return self.generate_prompts()
+                        warning("Using fallback image prompts after retries.")
+                    image_prompts = [
+                        f"Cinematic tech visual about {self.subject}, dramatic lighting, 9:16"
+                    ] * max(1, int(n_prompts))
 
-        if len(image_prompts) > n_prompts:
-            image_prompts = image_prompts[: int(n_prompts)]
+        n_prompts_int = int(n_prompts)
+        if len(image_prompts) > n_prompts_int:
+            image_prompts = image_prompts[:n_prompts_int]
+        while len(image_prompts) < n_prompts_int:
+            image_prompts.append(
+                f"Professional AI automation scene related to {self.subject}, vertical 9:16"
+            )
 
         self.image_prompts = image_prompts
 
@@ -294,100 +580,75 @@ class YouTube:
 
         return image_prompts
 
-    def _persist_image(self, image_bytes: bytes, provider_label: str) -> str:
+    def generate_image(self, prompt: str, use_premium: bool = False) -> str:
         """
-        Writes generated image bytes to a PNG file in .mp.
-
-        Args:
-            image_bytes (bytes): Image payload
-            provider_label (str): Label for logging
-
-        Returns:
-            path (str): Absolute image path
-        """
-        image_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".png")
-
-        with open(image_path, "wb") as image_file:
-            image_file.write(image_bytes)
-
-        if get_verbose():
-            info(f' => Wrote image from {provider_label} to "{image_path}"')
-
-        self.images.append(image_path)
-        return image_path
-
-    def generate_image_nanobanana2(self, prompt: str) -> str:
-        """
-        Generates an AI Image using Nano Banana 2 API (Gemini image API).
-
-        Args:
-            prompt (str): Prompt for image generation
-
-        Returns:
-            path (str): The path to the generated image.
-        """
-        print(f"Generating Image using Nano Banana 2 API: {prompt}")
-
-        api_key = get_nanobanana2_api_key()
-        if not api_key:
-            error("nanobanana2_api_key is not configured.")
-            return None
-
-        base_url = get_nanobanana2_api_base_url().rstrip("/")
-        model = get_nanobanana2_model()
-        aspect_ratio = get_nanobanana2_aspect_ratio()
-
-        endpoint = f"{base_url}/models/{model}:generateContent"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "responseModalities": ["IMAGE"],
-                "imageConfig": {"aspectRatio": aspect_ratio},
-            },
-        }
-
-        try:
-            response = requests.post(
-                endpoint,
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json=payload,
-                timeout=300,
-            )
-            response.raise_for_status()
-            body = response.json()
-
-            candidates = body.get("candidates", [])
-            for candidate in candidates:
-                content = candidate.get("content", {})
-                for part in content.get("parts", []):
-                    inline_data = part.get("inlineData") or part.get("inline_data")
-                    if not inline_data:
-                        continue
-                    data = inline_data.get("data")
-                    mime_type = inline_data.get("mimeType") or inline_data.get("mime_type", "")
-                    if data and str(mime_type).startswith("image/"):
-                        image_bytes = base64.b64decode(data)
-                        return self._persist_image(image_bytes, "Nano Banana 2 API")
-
-            if get_verbose():
-                warning(f"Nano Banana 2 did not return an image payload. Response: {body}")
-            return None
-        except Exception as e:
-            if get_verbose():
-                warning(f"Failed to generate image with Nano Banana 2 API: {str(e)}")
-            return None
-
-    def generate_image(self, prompt: str) -> str:
-        """
-        Generates an AI Image based on the given prompt using Nano Banana 2.
+        Generates an AI Image based on the given prompt using the configured
+        asset provider (see `asset_gen.py`).
 
         Args:
             prompt (str): Reference for image generation
+            use_premium (bool): Use premium image model
 
         Returns:
             path (str): The path to the generated image.
         """
-        return self.generate_image_nanobanana2(prompt)
+        result = gen_image(prompt, use_premium=use_premium)
+        if result:
+            self.images.append(result.path)
+            self.asset_modalities.append(result.modality)
+            return result.path
+        return None
+
+    def generate_thumbnail(self) -> str:
+        """
+        Generate a 16:9 thumbnail image with bold topic text area.
+
+        Returns:
+            path (str): Path to thumbnail PNG
+        """
+        thumb_prompt = self.generate_response(
+            f"""Write ONE image generation prompt for a YouTube thumbnail (16:9).
+Topic: {self.subject}
+Style: high contrast, dark navy background, teal accents, dramatic lighting,
+split layout with space for bold text, no small unreadable text baked in.
+Return ONLY the prompt sentence.""",
+            quality=True,
+        )
+        thumb_result = gen_image(
+            thumb_prompt,
+            aspect_ratio="16:9",
+            use_premium=True,
+        )
+        if not thumb_result:
+            return None
+        path = thumb_result.path
+
+        # Overlay title text with Pillow
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            img = Image.open(path).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            font_path = os.path.join(get_fonts_dir(), get_font())
+            try:
+                font = ImageFont.truetype(font_path, 72)
+            except Exception:
+                font = ImageFont.load_default()
+
+            title_short = self.metadata.get("title", self.subject)[:40].upper()
+            # Shadow
+            draw.text((42, img.height - 180), title_short, font=font, fill="black")
+            draw.text((40, img.height - 182), title_short, font=font, fill="#FFD93D")
+
+            thumb_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + "_thumb.png")
+            img.save(thumb_path)
+            self.thumbnail_path = thumb_path
+            success(f"Generated thumbnail: {thumb_path}")
+            return thumb_path
+        except Exception as e:
+            warning(f"Thumbnail text overlay failed: {e}")
+            self.thumbnail_path = path
+            return path
 
     def generate_script_to_speech(self, tts_instance: TTS) -> str:
         """
@@ -404,14 +665,12 @@ class YouTube:
         # Clean script, remove every character that is not a word character, a space, a period, a question mark, or an exclamation mark.
         self.script = re.sub(r"[^\w\s.?!]", "", self.script)
 
-        tts_instance.synthesize(self.script, path)
-
-        self.tts_path = path
+        self.tts_path = tts_instance.synthesize(self.script, path)
 
         if get_verbose():
-            info(f' => Wrote TTS to "{path}"')
+            info(f' => Wrote TTS to "{self.tts_path}"')
 
-        return path
+        return self.tts_path
 
     def add_video(self, video: dict) -> None:
         """
@@ -549,6 +808,42 @@ class YouTube:
 
         return srt_path
 
+    def _build_video_clip_shot(self, video_path: str, target_duration: float):
+        """
+        Load a premium-generated video clip shot, normalize it to 9:16, and
+        fit it to its allotted slot duration — trimmed if longer, held on
+        its last frame if shorter. No Ken Burns/crossfade treatment since
+        the clip already has its own motion.
+        """
+        clip = VideoFileClip(video_path).with_fps(30)
+
+        if round((clip.w / clip.h), 4) < 0.5625:
+            clip = clip.cropped(
+                width=clip.w,
+                height=round(clip.w / 0.5625),
+                x_center=clip.w / 2,
+                y_center=clip.h / 2,
+            )
+        else:
+            clip = clip.cropped(
+                width=round(0.5625 * clip.h),
+                height=clip.h,
+                x_center=clip.w / 2,
+                y_center=clip.h / 2,
+            )
+        clip = clip.resized(new_size=(1080, 1920))
+
+        if clip.duration > target_duration:
+            clip = clip.subclipped(0, target_duration)
+        elif clip.duration < target_duration:
+            freeze = clip.to_ImageClip(
+                t=max(clip.duration - 0.04, 0),
+                duration=target_duration - clip.duration,
+            ).with_fps(30)
+            clip = concatenate_videoclips([clip, freeze], method="compose")
+
+        return clip.with_duration(target_duration)
+
     def combine(self) -> str:
         """
         Combines everything into the final video.
@@ -564,9 +859,9 @@ class YouTube:
 
         # Make a generator that returns a TextClip when called with consecutive
         generator = lambda txt: TextClip(
-            txt,
+            text=txt,
             font=os.path.join(get_fonts_dir(), get_font()),
-            fontsize=100,
+            font_size=100,
             color="#FFFF00",
             stroke_color="black",
             stroke_width=5,
@@ -578,110 +873,263 @@ class YouTube:
 
         clips = []
         tot_dur = 0
-        # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
+        ken_burns = get_ken_burns_enabled()
+        idx = 0
         while tot_dur < max_duration:
-            for image_path in self.images:
-                clip = ImageClip(image_path)
-                clip.duration = req_dur
-                clip = clip.set_fps(30)
+            for slot, image_path in enumerate(self.images):
+                modality = (
+                    self.asset_modalities[slot]
+                    if slot < len(self.asset_modalities)
+                    else "image"
+                )
 
-                # Not all images are same size,
-                # so we need to resize them
-                if round((clip.w / clip.h), 4) < 0.5625:
-                    if get_verbose():
-                        info(f" => Resizing Image: {image_path} to 1080x1920")
-                    clip = crop(
-                        clip,
-                        width=clip.w,
-                        height=round(clip.w / 0.5625),
-                        x_center=clip.w / 2,
-                        y_center=clip.h / 2,
-                    )
+                if modality == "video_clip":
+                    clip = self._build_video_clip_shot(image_path, req_dur)
                 else:
-                    if get_verbose():
-                        info(f" => Resizing Image: {image_path} to 1920x1080")
-                    clip = crop(
-                        clip,
-                        width=round(0.5625 * clip.h),
-                        height=clip.h,
-                        x_center=clip.w / 2,
-                        y_center=clip.h / 2,
-                    )
-                clip = clip.resize((1080, 1920))
+                    clip = ImageClip(image_path, duration=req_dur).with_fps(30)
 
-                # FX (Fade In)
-                # clip = clip.fadein(2)
+                    if round((clip.w / clip.h), 4) < 0.5625:
+                        if get_verbose():
+                            info(f" => Resizing Image: {image_path} to 1080x1920")
+                        clip = clip.cropped(
+                            width=clip.w,
+                            height=round(clip.w / 0.5625),
+                            x_center=clip.w / 2,
+                            y_center=clip.h / 2,
+                        )
+                    else:
+                        if get_verbose():
+                            info(f" => Resizing Image: {image_path} to 1920x1080")
+                        clip = clip.cropped(
+                            width=round(0.5625 * clip.h),
+                            height=clip.h,
+                            x_center=clip.w / 2,
+                            y_center=clip.h / 2,
+                        )
+                    clip = clip.resized(new_size=(1080, 1920))
+
+                    if ken_burns:
+                        clip = apply_ken_burns(clip, req_dur, index=idx)
+                        idx += 1
 
                 clips.append(clip)
                 tot_dur += clip.duration
 
-        final_clip = concatenate_videoclips(clips)
-        final_clip = final_clip.set_fps(30)
-        random_song = choose_random_song()
+        if get_crossfade_duration() > 0 and len(clips) > 1:
+            clips = apply_crossfade(clips, fade_duration=get_crossfade_duration())
+
+        final_clip = concatenate_videoclips(clips, method="compose").with_fps(30)
+        random_song = choose_random_song(
+            prefer_keywords=get_content_style()["music_keywords"]
+        )
 
         subtitles = None
+        subtitles_path = None
         try:
             subtitles_path = self.generate_subtitles(self.tts_path)
-            equalize_subtitles(subtitles_path, 10)
-            subtitles = SubtitlesClip(subtitles_path, generator)
-            subtitles.set_pos(("center", "center"))
+            equalize_subtitles(subtitles_path, 8)
         except Exception as e:
-            warning(f"Failed to generate subtitles, continuing without subtitles: {e}")
+            warning(f"Failed to generate subtitles: {e}")
 
-        random_song_clip = AudioFileClip(random_song).set_fps(44100)
+        random_song_clip = AudioFileClip(random_song).with_fps(44100)
 
         # Turn down volume
-        random_song_clip = random_song_clip.fx(afx.volumex, 0.1)
-        comp_audio = CompositeAudioClip([tts_clip.set_fps(44100), random_song_clip])
+        random_song_clip = random_song_clip.with_effects([afx.MultiplyVolume(0.1)])
+        comp_audio = CompositeAudioClip([tts_clip.with_fps(44100), random_song_clip])
 
-        final_clip = final_clip.set_audio(comp_audio)
-        final_clip = final_clip.set_duration(tts_clip.duration)
+        final_clip = final_clip.with_audio(comp_audio)
+        final_clip = final_clip.with_duration(tts_clip.duration)
 
-        if subtitles is not None:
+        if subtitles_path and get_word_captions_enabled():
+            try:
+                final_clip = composite_captions_on_video(final_clip, subtitles_path)
+            except Exception as e:
+                warning(f"Word captions failed, falling back to block subtitles: {e}")
+                subtitles = SubtitlesClip(subtitles_path, make_textclip=generator)
+                subtitles = subtitles.with_position(("center", "center"))
+                final_clip = CompositeVideoClip([final_clip, subtitles])
+        elif subtitles_path:
+            subtitles = SubtitlesClip(subtitles_path, make_textclip=generator)
+            subtitles = subtitles.with_position(("center", "center"))
             final_clip = CompositeVideoClip([final_clip, subtitles])
 
-        final_clip.write_videofile(combined_image_path, threads=threads)
+        outro_path = self._get_outro_path()
+        if outro_path:
+            info(f" => Appending brand outro ({self._outro_duration():.1f}s)...")
+            outro_clip = VideoFileClip(outro_path).with_fps(30)
+            if outro_clip.w != 1080 or outro_clip.h != 1920:
+                outro_clip = outro_clip.resized(new_size=(1080, 1920))
+            final_clip = concatenate_videoclips(
+                [final_clip, outro_clip], method="compose"
+            )
+            final_clip.write_videofile(combined_image_path, threads=threads)
+            outro_clip.close()
+        else:
+            final_clip.write_videofile(combined_image_path, threads=threads)
 
         success(f'Wrote Video to "{combined_image_path}"')
 
         return combined_image_path
 
-    def generate_video(self, tts_instance: TTS) -> str:
+    def _generate_shot_asset(
+        self, prompt: str, tier: str, *, per_shot_seconds: float
+    ) -> AssetResult:
+        """Generate one shot asset; fall back to a safe prompt or prior frame on block."""
+        kwargs = {
+            "aspect_ratio": get_nanobanana2_aspect_ratio(),
+            "video_duration_seconds": min(
+                max(per_shot_seconds, 3.0), get_premium_video_max_duration_seconds()
+            ),
+        }
+        try:
+            return generate_asset_with_fallback(prompt, tier, **kwargs)
+        except RuntimeError:
+            style_suffix = get_production_setting("image_style_suffix", "") or (
+                "cinematic documentary illustration style, high contrast, dramatic lighting, "
+                "no text in images, 9:16 vertical"
+            )
+            safe_prompt = (
+                f"Abstract symbolic vintage engraving evoking the theme of {self.subject}, "
+                f"non-graphic, no corpses or gore, {style_suffix}"
+            )
+            warning(
+                f"Asset generation failed for prompt {prompt[:60]!r}…; retrying with safe fallback."
+            )
+            try:
+                return generate_asset_with_fallback(safe_prompt, "standard", **kwargs)
+            except RuntimeError:
+                if self.images:
+                    warning("Safe fallback also failed; reusing previous shot image.")
+                    return AssetResult(
+                        path=self.images[-1],
+                        modality="image",
+                        tier="standard",
+                        provider="reuse",
+                    )
+                raise
+
+    def _generate_pipeline(self, tts_instance: TTS, interactive: bool = True) -> str:
+        """Shared generation pipeline for short and long-form."""
+        self.images = []
+        self.asset_modalities = []
+
+        self.generate_topic()
+        self.generate_research()
+        self.generate_script()
+        self.generate_metadata()
+        self.generate_prompts()
+
+        # Per-shot asset tier (see asset_strategy.py): brand-configurable,
+        # defaults to "standard" for every shot unless a brand manifest
+        # opts in (e.g. production.asset_strategy.hook = "premium_video").
+        per_shot_seconds = self._short_target_duration() / max(len(self.image_prompts), 1)
+        for i, prompt in enumerate(self.image_prompts):
+            role = shot_role_for_index(i)
+            tier = tier_for_shot_role(role)
+            result = self._generate_shot_asset(
+                prompt,
+                tier,
+                per_shot_seconds=per_shot_seconds,
+            )
+            self.images.append(result.path)
+            self.asset_modalities.append(result.modality)
+            if result.tier != "standard":
+                active_brand = load_active_brand()
+                log_asset_spend(
+                    video_title=getattr(self, "subject", ""),
+                    role=role,
+                    tier=result.tier,
+                    modality=result.modality,
+                    provider=result.provider,
+                    cost_usd=result.cost_usd,
+                    brand_id=active_brand.get("brand_id", ""),
+                )
+
+        self.generate_script_to_speech(tts_instance)
+
+        style = get_content_style()
+        if style["enforce_min_audio_duration"] and self.format_type != "longform":
+            min_duration = self._short_target_duration() * style["min_audio_duration_ratio"]
+            for _ in range(2):
+                audio_duration = AudioFileClip(self.tts_path).duration
+                if audio_duration >= min_duration:
+                    break
+                warning(
+                    f"Voiceover only {audio_duration:.1f}s "
+                    f"(target {self._short_target_duration():.0f}s). Regenerating longer script..."
+                )
+                self.generate_script()
+                self.generate_metadata()
+                self.generate_script_to_speech(tts_instance)
+
+        # Recalculate image timing now that we have real audio duration
+        actual_count = self._calculate_image_count(
+            estimated_duration=AudioFileClip(self.tts_path).duration
+        )
+        if actual_count < len(self.images):
+            self.images = self.images[:actual_count]
+            self.asset_modalities = self.asset_modalities[:actual_count]
+        elif actual_count > len(self.images) and self.image_prompts:
+            while len(self.images) < actual_count:
+                self.generate_image(self.image_prompts[-1])
+
+        path = self.combine()
+        self.video_path = os.path.abspath(path)
+
+        brand = load_active_brand()
+        brand_id = brand.get("brand_id", "default")
+        saved = save_video_output(
+            self.video_path, brand_id, self.metadata.get("title", "")
+        )
+        if saved:
+            self.output_video_path = saved
+            success(f" => Saved copy: {saved}")
+
+        if self.format_type == "longform":
+            self.generate_thumbnail()
+
+        log_video(
+            title=self.metadata.get("title", ""),
+            format_type=self.format_type,
+            niche=self.niche,
+            video_path=self.video_path,
+            subject=self.subject,
+            brand_id=brand_id,
+            status="generated",
+        )
+        return path
+
+    def generate_video(self, tts_instance: TTS, interactive: bool = True) -> str:
         """
         Generates a YouTube Short based on the provided niche and language.
 
         Args:
             tts_instance (TTS): Instance of TTS Class.
+            interactive (bool): Allow premium hero prompt and review prompts.
 
         Returns:
             path (str): The path to the generated MP4 File.
         """
-        # Generate the Topic
-        self.generate_topic()
-
-        # Generate the Script
-        self.generate_script()
-
-        # Generate the Metadata
-        self.generate_metadata()
-
-        # Generate the Image Prompts
-        self.generate_prompts()
-
-        # Generate the Images
-        for prompt in self.image_prompts:
-            self.generate_image(prompt)
-
-        # Generate the TTS
-        self.generate_script_to_speech(tts_instance)
-
-        # Combine everything
-        path = self.combine()
+        self.format_type = "short"
+        path = self._generate_pipeline(tts_instance, interactive=interactive)
 
         if get_verbose():
-            info(f" => Generated Video: {path}")
+            info(f" => Generated Short: {path}")
 
-        self.video_path = os.path.abspath(path)
+        return path
+
+    def generate_longform_video(self, tts_instance: TTS, interactive: bool = True) -> str:
+        """
+        Generates a long-form YouTube video (6-10 min target) with thumbnail.
+
+        Returns:
+            path (str): Path to generated MP4.
+        """
+        self.format_type = "longform"
+        path = self._generate_pipeline(tts_instance, interactive=interactive)
+
+        if get_verbose():
+            info(f" => Generated long-form video: {path}")
 
         return path
 
@@ -692,13 +1140,184 @@ class YouTube:
         Returns:
             channel_id (str): The Channel ID.
         """
-        driver = self.browser
-        driver.get("https://studio.youtube.com")
+        driver = self._ensure_browser()
         time.sleep(2)
         channel_id = driver.current_url.split("/")[-1]
         self.channel_id = channel_id
 
         return channel_id
+
+    def _require_elements(
+        self, driver, by, value, minimum: int = 1, context: str = ""
+    ) -> list:
+        """
+        Find elements and fail loudly (with a clear, specific message) if
+        YouTube Studio's DOM doesn't match what this upload flow expects —
+        instead of a confusing IndexError/NoSuchElementException deep in
+        Selenium internals when YT Studio's UI changes.
+        """
+        elements = driver.find_elements(by, value)
+        if len(elements) < minimum:
+            label = f" ({context})" if context else ""
+            raise RuntimeError(
+                f"YouTube Studio upload flow{label}: expected at least {minimum} "
+                f"element(s) matching {by}={value!r}, found {len(elements)}. "
+                "YouTube Studio's UI likely changed — this selector needs updating."
+            )
+        return elements
+
+    def _set_ai_disclosure(self, driver, disclose: bool) -> None:
+        """
+        Best-effort: set YouTube Studio's AI-content disclosure ("Altered or
+        synthetic content" Yes/No control, added to the upload flow's
+        "Show more" section in 2025). This UI is much newer than the
+        long-stable made-for-kids radios, so — unlike `_require_elements` —
+        this NEVER raises or aborts the upload if it can't find/click the
+        control. It only logs a clear warning so a human can check it
+        manually before publishing (see `review_gate.py`'s pre-upload
+        summary), because a wrong/missed disclosure is a compliance risk,
+        not a crash-worthy one, and a fragile selector here should never be
+        able to break uploads for every brand.
+        """
+        try:
+            show_more = driver.find_elements(
+                By.XPATH, "//*[self::button or self::div][contains(., 'Show more')]"
+            )
+            for el in show_more:
+                try:
+                    el.click()
+                    time.sleep(0.5)
+                    break
+                except Exception:
+                    continue
+
+            target_text = "Yes" if disclose else "No"
+            disclosure_section = driver.find_elements(
+                By.XPATH,
+                "//*[contains(translate(text(), 'ALTEREDSYNTHETIC', 'alteredsynthetic'), 'altered') "
+                "or contains(translate(text(), 'ALTEREDSYNTHETIC', 'alteredsynthetic'), 'synthetic')]",
+            )
+            if not disclosure_section:
+                warning(
+                    "Could not find the 'Altered or synthetic content' disclosure "
+                    "control in YouTube Studio (UI may have changed). Verify it "
+                    f"manually before publishing — intended setting: {target_text}."
+                )
+                return
+
+            option = driver.find_elements(
+                By.XPATH, f"//*[@role='radio' or @type='radio'][.//text()='{target_text}' or @aria-label='{target_text}']"
+            )
+            if not option:
+                warning(
+                    "Found the AI-disclosure section but not a clickable "
+                    f"'{target_text}' control. Verify and set it manually before publishing."
+                )
+                return
+
+            option[0].click()
+            if get_verbose():
+                info(f" => Set AI-content disclosure to '{target_text}'.")
+        except Exception as e:
+            warning(
+                f"AI-content disclosure step failed ({e}). Verify it manually "
+                "before publishing — this never blocks the upload."
+            )
+
+    def _capture_upload_dialog_video_id(self, driver) -> str:
+        """Read the video id from the upload dialog's "Video link" field.
+
+        YouTube Studio assigns the final video id the moment the upload
+        starts and shows it as a `https://youtu.be/<id>` link inside the
+        dialog. Grabbing it here is the only reliable source — the video
+        list can still show an OLDER video at the top while the new upload
+        is processing, which previously caused stale URLs to be logged
+        against new videos (breaking per-video metrics).
+
+        Best-effort: returns "" if the link isn't found so the caller can
+        fall back to the (title-verified) video list.
+        """
+        try:
+            anchors = driver.find_elements(
+                By.XPATH, "//a[contains(@href, 'youtu.be/')]"
+            )
+            for anchor in anchors:
+                href = anchor.get_attribute("href") or ""
+                video_id = href.rstrip("/").split("/")[-1].split("?")[0]
+                if video_id:
+                    return video_id
+        except Exception as e:
+            if get_verbose():
+                warning(f"Could not read video link from upload dialog: {e}")
+        return ""
+
+    @staticmethod
+    def _normalize_title_for_match(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+    def _find_uploaded_video_id_in_list(self, driver) -> str:
+        """Fallback URL capture: scan the Studio video list for a row whose
+        title matches this upload. Returns "" when no row matches — a wrong
+        URL is worse than no URL (it corrupts per-video metrics)."""
+        videos = self._require_elements(
+            driver,
+            By.TAG_NAME,
+            "ytcp-video-row",
+            minimum=1,
+            context="video list after upload",
+        )
+        expected = self._normalize_title_for_match(self.metadata.get("title", ""))
+
+        for row in videos:
+            try:
+                row_text = self._normalize_title_for_match(row.text)
+                anchor = row.find_element(By.TAG_NAME, "a")
+                href = anchor.get_attribute("href") or ""
+            except Exception:
+                continue
+            # Studio truncates long titles in the list — match on a prefix.
+            if expected and expected[:60] in row_text:
+                return href.rstrip("/").split("/edit")[0].split("/")[-1]
+
+        warning(
+            "Could not find the uploaded video in the Studio list by title — "
+            "it may still be processing. Logging the upload without a URL "
+            "rather than risking a stale one; the next metrics refresh won't "
+            "track this video until the URL is added to .mp/analytics.json."
+        )
+        return ""
+
+    def _dismiss_youtube_overlays(self, driver) -> None:
+        """Close hashtag/social suggestion dropdowns that block Studio textboxes."""
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    def _set_textbox_value(self, element, text: str, driver=None) -> None:
+        """Fill a YouTube Studio contenteditable textbox (clear() often fails on these)."""
+        try:
+            element.click()
+        except ElementClickInterceptedException:
+            if driver:
+                self._dismiss_youtube_overlays(driver)
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", element
+                )
+                time.sleep(0.2)
+            try:
+                element.click()
+            except ElementClickInterceptedException:
+                if driver:
+                    driver.execute_script("arguments[0].focus();", element)
+                else:
+                    raise
+
+        time.sleep(0.3)
+        element.send_keys(Keys.CONTROL, "a")
+        element.send_keys(Keys.BACKSPACE)
+        element.send_keys(text)
 
     def upload_video(self) -> bool:
         """
@@ -710,7 +1329,8 @@ class YouTube:
         try:
             self.get_channel_id()
 
-            driver = self.browser
+            driver = self._ensure_browser()
+            wait = WebDriverWait(driver, 60)
             verbose = get_verbose()
 
             # Go to youtube.com/upload
@@ -718,16 +1338,29 @@ class YouTube:
 
             # Set video file
             FILE_PICKER_TAG = "ytcp-uploads-file-picker"
-            file_picker = driver.find_element(By.TAG_NAME, FILE_PICKER_TAG)
+            file_picker = wait.until(
+                EC.presence_of_element_located((By.TAG_NAME, FILE_PICKER_TAG))
+            )
             INPUT_TAG = "input"
             file_input = file_picker.find_element(By.TAG_NAME, INPUT_TAG)
             file_input.send_keys(self.video_path)
 
-            # Wait for upload to finish
-            time.sleep(5)
+            # Wait for upload dialog and title field
+            wait.until(
+                EC.presence_of_all_elements_located((By.ID, YOUTUBE_TEXTBOX_ID))
+            )
+            time.sleep(3)
 
             # Set title
-            textboxes = driver.find_elements(By.ID, YOUTUBE_TEXTBOX_ID)
+            textboxes = self._require_elements(
+                driver, By.ID, YOUTUBE_TEXTBOX_ID, minimum=2, context="title/description textboxes"
+            )
+            if len(textboxes) != 2 and verbose:
+                warning(
+                    f"Expected exactly 2 textboxes (title, description) but found "
+                    f"{len(textboxes)}. Using first as title, last as description — "
+                    "verify this is still correct if upload looks wrong."
+                )
 
             title_el = textboxes[0]
             description_el = textboxes[-1]
@@ -735,22 +1368,30 @@ class YouTube:
             if verbose:
                 info("\t=> Setting title...")
 
-            title_el.click()
-            time.sleep(1)
-            title_el.clear()
-            title_el.send_keys(self.metadata["title"])
+            self._set_textbox_value(title_el, self.metadata["title"], driver=driver)
 
             if verbose:
                 info("\t=> Setting description...")
 
-            # Set description
-            time.sleep(10)
-            description_el.click()
+            # Hashtags in the title open a suggestion dropdown that blocks the description box
+            self._dismiss_youtube_overlays(driver)
             time.sleep(0.5)
-            description_el.clear()
-            description_el.send_keys(self.metadata["description"])
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", description_el
+            )
+            time.sleep(0.5)
+            self._set_textbox_value(
+                description_el, self.metadata["description"], driver=driver
+            )
 
             time.sleep(0.5)
+
+            # Capture the assigned video id from the dialog's "Video link"
+            # field now — it's final as soon as the upload starts, and is
+            # immune to the stale-top-row problem in the video list.
+            uploaded_video_id = self._capture_upload_dialog_video_id(driver)
+            if verbose and uploaded_video_id:
+                info(f"\t=> Captured video id from upload dialog: {uploaded_video_id}")
 
             # Set `made for kids` option
             if verbose:
@@ -769,6 +1410,12 @@ class YouTube:
                 is_for_kids_checkbox.click()
 
             time.sleep(0.5)
+
+            # Best-effort: set the "Altered or synthetic content" disclosure.
+            disclose_ai = get_production_setting(
+                "ai_disclosure", get_ai_disclosure_default()
+            )
+            self._set_ai_disclosure(driver, bool(disclose_ai))
 
             # Click next
             if verbose:
@@ -796,7 +1443,13 @@ class YouTube:
             if verbose:
                 info("\t=> Setting as unlisted...")
 
-            radio_button = driver.find_elements(By.XPATH, YOUTUBE_RADIO_BUTTON_XPATH)
+            radio_button = self._require_elements(
+                driver,
+                By.XPATH,
+                YOUTUBE_RADIO_BUTTON_XPATH,
+                minimum=3,
+                context="visibility radio buttons (private/unlisted/public)",
+            )
             radio_button[2].click()
 
             if verbose:
@@ -809,30 +1462,42 @@ class YouTube:
             # Wait for 2 seconds
             time.sleep(2)
 
-            # Get latest video
             if verbose:
                 info("\t=> Getting video URL...")
 
-            # Get the latest uploaded video URL
-            driver.get(
-                f"https://studio.youtube.com/channel/{self.channel_id}/videos/short"
-            )
-            time.sleep(2)
-            videos = driver.find_elements(By.TAG_NAME, "ytcp-video-row")
-            first_video = videos[0]
-            anchor_tag = first_video.find_element(By.TAG_NAME, "a")
-            href = anchor_tag.get_attribute("href")
-            if verbose:
-                info(f"\t=> Extracting video ID from URL: {href}")
-            video_id = href.split("/")[-2]
+            # Last chance to read the dialog link if the earlier capture
+            # missed it (e.g. the link renders late on slow uploads).
+            if not uploaded_video_id:
+                uploaded_video_id = self._capture_upload_dialog_video_id(driver)
 
-            # Build URL
-            url = build_url(video_id)
+            if not uploaded_video_id:
+                # Fallback: scan the Studio video list, but only trust a row
+                # whose title matches this upload — the top row can still be
+                # an older video while the new one is processing.
+                driver.get(
+                    f"https://studio.youtube.com/channel/{self.channel_id}/videos/short"
+                )
+                time.sleep(2)
+                uploaded_video_id = self._find_uploaded_video_id_in_list(driver)
+
+            url = build_url(uploaded_video_id) if uploaded_video_id else ""
 
             self.uploaded_video_url = url
 
+            upload_brand = load_active_brand()
+            log_video(
+                title=self.metadata.get("title", ""),
+                format_type=getattr(self, "format_type", "short"),
+                niche=self.niche,
+                video_path=self.video_path,
+                url=url,
+                subject=getattr(self, "subject", ""),
+                brand_id=upload_brand.get("brand_id", ""),
+                status="uploaded",
+            )
+
             if verbose:
-                success(f" => Uploaded Video: {url}")
+                success(f" => Uploaded Video: {url or '(URL not captured)'}")
 
             # Add video to cache
             self.add_video(
@@ -845,11 +1510,21 @@ class YouTube:
             )
 
             # Close the browser
-            driver.quit()
+            self.close_browser()
 
             return True
-        except:
-            self.browser.quit()
+        except Exception as e:
+            import traceback
+
+            # Persist the real cause on the instance — callers only see a
+            # bool return value, so without this, scheduled/cron runs that
+            # log "UPLOAD FAILED" to a file have no way to know why.
+            self.last_upload_error = f"{type(e).__name__}: {e}"
+            self.last_upload_traceback = traceback.format_exc()
+            error(f"YouTube upload failed: {e}")
+            if get_verbose():
+                traceback.print_exc()
+            self.close_browser()
             return False
 
     def get_videos(self) -> List[dict]:

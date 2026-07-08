@@ -10,6 +10,8 @@ OPTIONS = [
     "Twitter Bot",
     "Affiliate Marketing",
     "Outreach",
+    "Switch Brand",
+    "Brand Dashboard",
     "Quit"
 ]
 
@@ -29,7 +31,9 @@ TWITTER_CRON_OPTIONS = [
 
 YOUTUBE_OPTIONS = [
     "Upload Short",
+    "Upload Long-Form Video",
     "Show all Shorts",
+    "Weekly Analytics Review",
     "Setup CRON Job",
     "Quit"
 ]

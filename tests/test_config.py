@@ -80,5 +80,65 @@ class PostBridgeConfigTests(unittest.TestCase):
         self.assertFalse(post_bridge_config["enabled"])
 
 
+class AiDisclosureDefaultTests(unittest.TestCase):
+    def write_config(self, directory: str, payload: dict) -> None:
+        with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def test_defaults_to_true_when_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertTrue(config.get_ai_disclosure_default())
+
+    def test_respects_explicit_false(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {"ai_disclosure_default": False})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertFalse(config.get_ai_disclosure_default())
+
+
+class ImageAndTtsProviderConfigTests(unittest.TestCase):
+    def write_config(self, directory: str, payload: dict) -> None:
+        with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def test_standard_image_provider_defaults_to_gemini(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertEqual(config.get_standard_image_provider(), "gemini")
+
+    def test_standard_image_provider_normalizes_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {"standard_image_provider": "FAL"})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertEqual(config.get_standard_image_provider(), "fal")
+
+    def test_fal_image_model_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertEqual(config.get_fal_image_model(), "fal-ai/flux/schnell")
+
+    def test_fishaudio_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir), patch.dict(
+                os.environ, {}, clear=False
+            ):
+                os.environ.pop("FISH_AUDIO_API_KEY", None)
+                self.assertEqual(config.get_fishaudio_api_key(), "")
+                self.assertEqual(config.get_fishaudio_model(), "s2-pro")
+
+    def test_fishaudio_api_key_env_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {"fishaudio_api_key": ""})
+            with patch.object(config, "ROOT_DIR", temp_dir), patch.dict(
+                os.environ, {"FISH_AUDIO_API_KEY": "env-key"}
+            ):
+                self.assertEqual(config.get_fishaudio_api_key(), "env-key")
+
+
 if __name__ == "__main__":
     unittest.main()

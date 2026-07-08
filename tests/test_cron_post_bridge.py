@@ -40,6 +40,7 @@ import cron
 
 
 class CronPostBridgeTests(unittest.TestCase):
+    @patch("cron.should_proceed_with_upload")
     @patch("cron.maybe_crosspost_youtube_short")
     @patch("cron.YouTube")
     @patch("cron.TTS")
@@ -54,7 +55,12 @@ class CronPostBridgeTests(unittest.TestCase):
         tts_cls_mock,
         youtube_cls_mock,
         crosspost_mock,
+        should_proceed_mock,
     ) -> None:
+        # Isolated from the real review gate / active brand on disk (e.g.
+        # pilot_mode) — this test is only about cron.py's own
+        # upload-fails-so-skip-crosspost branching, not the review gate.
+        should_proceed_mock.return_value = True
         get_verbose_mock.return_value = False
         get_accounts_mock.return_value = [
             {

@@ -8,3 +8,24 @@ niche.txt
 *.exe
 auto.sh
 .DS_Store
+
+# Generated video artifacts (large binaries — never commit)
+output/
+
+# Local setup notes that may contain machine-specific paths/account info
+PHASE0_SETUP_NOTES.txt
+COMMANDS.md
+SETUP_CHECKLIST.md
+
+# Private brand data — channel manifests, assets, and brand-pinned scripts
+# (the engine is brand-agnostic; brands/ is private by convention)
+brands/
+run_daily_*.ps1
+scripts/*strange_archive*
+scripts/run_july4_shorts.ps1
+
+# Personal outreach content
+outreach_message.html
+
+# Logs
+*.log

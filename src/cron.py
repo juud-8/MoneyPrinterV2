@@ -9,28 +9,34 @@ from classes.Twitter import Twitter
 from classes.YouTube import YouTube
 from llm_provider import select_model
 from post_bridge_integration import maybe_crosspost_youtube_short
+from review_gate import should_proceed_with_upload
+from brand_switcher import (
+    bootstrap_brand,
+    get_active_brand_id,
+    load_active_brand,
+    resolve_youtube_account,
+    set_active_brand,
+)
 
 def main():
     """Main function to post content to Twitter or upload videos to YouTube.
 
-    This function determines its operation based on command-line arguments:
-    - If the purpose is "twitter", it initializes a Twitter account and posts a message.
-    - If the purpose is "youtube", it initializes a YouTube account, generates a video with TTS, and uploads it.
-
     Command-line arguments:
-        sys.argv[1]: A string indicating the purpose, either "twitter" or "youtube".
-        sys.argv[2]: A string representing the account UUID.
-
-    The function also handles verbose output based on user settings and reports success or errors as appropriate.
-
-    Args:
-        None. The function uses command-line arguments accessed via sys.argv.
-
-    Returns:
-        None. The function performs operations based on the purpose and account UUID and does not return any value."""
+        sys.argv[1]: purpose — "twitter" or "youtube"
+        sys.argv[2]: account UUID (youtube) or account UUID (twitter)
+        sys.argv[3]: Ollama model name
+        sys.argv[4]: optional brand_id override
+    """
     purpose = str(sys.argv[1])
     account_id = str(sys.argv[2])
     model = str(sys.argv[3]) if len(sys.argv) > 3 else None
+    brand_id = str(sys.argv[4]) if len(sys.argv) > 4 else None
+
+    if brand_id:
+        set_active_brand(brand_id)
+        bootstrap_brand(brand_id)
+    else:
+        bootstrap_brand(get_active_brand_id())
 
     if model:
         select_model(model)
@@ -68,10 +74,20 @@ def main():
         if not account_id:
             error("Account UUID cannot be empty.")
 
+        # Prefer account linked to active brand
+        brand = load_active_brand()
+        brand_account = resolve_youtube_account(brand, create=False)
+        if brand_account and brand_account.get("id") != account_id:
+            if verbose:
+                warning(
+                    f"Cron account {account_id} differs from active brand account "
+                    f"{brand_account.get('id')}; using cron account id."
+                )
+
         for acc in accounts:
             if acc["id"] == account_id:
                 if verbose:
-                    info("Initializing YouTube...")
+                    info(f"Initializing YouTube ({load_active_brand().get('channel_name')})...")
                 youtube = YouTube(
                     acc["id"],
                     acc["nickname"],
@@ -79,18 +95,26 @@ def main():
                     acc["niche"],
                     acc["language"]
                 )
-                youtube.generate_video(tts)
-                upload_success = youtube.upload_video()
-                if upload_success:
-                    if verbose:
-                        success("Uploaded Short.")
-                    maybe_crosspost_youtube_short(
-                        video_path=youtube.video_path,
-                        title=youtube.metadata.get("title", ""),
-                        interactive=False,
-                    )
+                youtube.generate_video(tts, interactive=False)
+                if should_proceed_with_upload(
+                    youtube.video_path,
+                    youtube.metadata.get("title", ""),
+                    youtube.metadata.get("description", ""),
+                    interactive=False,
+                ):
+                    upload_success = youtube.upload_video()
+                    if upload_success:
+                        if verbose:
+                            success("Uploaded Short.")
+                        maybe_crosspost_youtube_short(
+                            video_path=youtube.video_path,
+                            title=youtube.metadata.get("title", ""),
+                            interactive=False,
+                        )
+                    else:
+                        warning("YouTube upload failed. Skipping Post Bridge cross-post.")
                 else:
-                    warning("YouTube upload failed. Skipping Post Bridge cross-post.")
+                    warning("Upload skipped by review gate.")
                 break
     else:
         error("Invalid Purpose, exiting...")

@@ -17,6 +17,82 @@ from classes.Outreach import Outreach
 from classes.AFM import AffiliateMarketing
 from llm_provider import list_models, select_model, get_active_model
 from post_bridge_integration import maybe_crosspost_youtube_short
+from review_gate import should_proceed_with_upload
+from analytics import print_weekly_review
+from dashboard import print_cli_dashboard, write_html_dashboard
+from brand_switcher import (
+    bootstrap_brand,
+    get_active_brand_id,
+    get_active_brand_summary,
+    list_brands,
+    load_active_brand,
+    resolve_youtube_account,
+    switch_brand,
+)
+
+
+def run_switch_brand_menu() -> None:
+    """Interactive brand switcher submenu."""
+    brands = list_brands()
+    if not brands:
+        warning("No brand manifests found in brands/.")
+        return
+
+    info("\n============ SWITCH BRAND ============", False)
+    for idx, b in enumerate(brands):
+        marker = " (active)" if b["is_active"] else ""
+        status_parts = []
+        if not b["profile_exists"]:
+            status_parts.append("profile missing")
+        if not b["voice_configured"]:
+            status_parts.append("voice: global fallback")
+        status = f" [{', '.join(status_parts)}]" if status_parts else ""
+        print(
+            colored(
+                f" {idx + 1}. {b['channel_name']}{marker}{status}",
+                "green" if b["is_active"] else "cyan",
+            )
+        )
+    print(colored(f" {len(brands) + 1}. Back", "cyan"))
+    info("======================================\n", False)
+
+    choice = question("Select brand: ").strip()
+    if choice == str(len(brands) + 1):
+        return
+
+    try:
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(brands):
+            raise ValueError("out of range")
+    except ValueError:
+        error("Invalid selection.")
+        return
+
+    brand_id = brands[idx]["brand_id"]
+    if brand_id == get_active_brand_id():
+        info(f"Already on {brands[idx]['channel_name']}.")
+        return
+
+    summary = switch_brand(brand_id)
+    success(f"Switched to {summary['channel_name']}")
+    info(f"  Niche: {summary['niche']}", False)
+    info(f"  Voice: {summary['voice_id']}", False)
+    info(f"  Profile: {summary['firefox_profile']}", False)
+    if summary["account_id"]:
+        success(f"  YouTube account linked: {summary['account_id']}")
+    for w in summary.get("warnings", []):
+        warning(w)
+
+
+def resolve_active_youtube_account():
+    """Return YouTube account dict for the active brand, or None."""
+    try:
+        brand = load_active_brand()
+        return resolve_youtube_account(brand, create=True)
+    except Exception as e:
+        warning(f"Could not resolve active brand account: {e}")
+        return None
+
 
 def main():
     """Main entry point for the application, providing a menu-driven interface
@@ -68,9 +144,13 @@ def main():
     if user_input == 1:
         info("Starting YT Shorts Automater...")
 
+        active_brand = load_active_brand()
+        info(f"Active brand: {active_brand.get('channel_name')} ({active_brand.get('brand_id')})", False)
+
+        selected_account = resolve_active_youtube_account()
         cached_accounts = get_accounts("youtube")
 
-        if len(cached_accounts) == 0:
+        if selected_account is None and len(cached_accounts) == 0:
             warning("No accounts found in cache. Create one now?")
             user_input = question("Yes/No: ")
 
@@ -95,7 +175,10 @@ def main():
                 add_account("youtube", account_data)
 
                 success("Account configured successfully!")
-        else:
+                selected_account = resolve_active_youtube_account()
+                cached_accounts = get_accounts("youtube")
+
+        if selected_account is None and len(cached_accounts) > 0:
             table = PrettyTable()
             table.field_names = ["ID", "UUID", "Nickname", "Niche"]
 
@@ -129,8 +212,6 @@ def main():
 
                 return
 
-            selected_account = None
-
             for account in cached_accounts:
                 if str(cached_accounts.index(account) + 1) == user_input:
                     selected_account = account
@@ -138,16 +219,19 @@ def main():
             if selected_account is None:
                 error("Invalid account selected. Please try again.", "red")
                 main()
-            else:
-                youtube = YouTube(
-                    selected_account["id"],
-                    selected_account["nickname"],
-                    selected_account["firefox_profile"],
-                    selected_account["niche"],
-                    selected_account["language"]
-                )
+                return
 
-                while True:
+        if selected_account is not None:
+            success(f"Using account: {selected_account['nickname']} (brand: {active_brand.get('brand_id')})")
+            youtube = YouTube(
+                selected_account["id"],
+                selected_account["nickname"],
+                selected_account["firefox_profile"],
+                selected_account["niche"],
+                selected_account["language"]
+            )
+
+            while True:
                     rem_temp_files()
                     info("\n============ OPTIONS ============", False)
 
@@ -161,19 +245,43 @@ def main():
                     tts = TTS()
 
                     if user_input == 1:
-                        youtube.generate_video(tts)
+                        youtube.generate_video(tts, interactive=True)
                         upload_to_yt = question("Do you want to upload this video to YouTube? (Yes/No): ")
                         if upload_to_yt.lower() == "yes":
-                            upload_success = youtube.upload_video()
-                            if upload_success:
-                                maybe_crosspost_youtube_short(
-                                    video_path=youtube.video_path,
-                                    title=youtube.metadata.get("title", ""),
-                                    interactive=True,
-                                )
-                            else:
-                                warning("YouTube upload failed. Skipping Post Bridge cross-post.")
+                            if should_proceed_with_upload(
+                                youtube.video_path,
+                                youtube.metadata.get("title", ""),
+                                youtube.metadata.get("description", ""),
+                                interactive=True,
+                            ):
+                                upload_success = youtube.upload_video()
+                                if upload_success:
+                                    maybe_crosspost_youtube_short(
+                                        video_path=youtube.video_path,
+                                        title=youtube.metadata.get("title", ""),
+                                        interactive=True,
+                                    )
+                                else:
+                                    warning("YouTube upload failed. Skipping Post Bridge cross-post.")
                     elif user_input == 2:
+                        if not get_longform_enabled():
+                            warning("Long-form is disabled for the active brand. Switch brand or enable in brand JSON.")
+                        else:
+                            youtube.generate_longform_video(tts, interactive=True)
+                            upload_to_yt = question("Do you want to upload this long-form video? (Yes/No): ")
+                            if upload_to_yt.lower() == "yes":
+                                if should_proceed_with_upload(
+                                    youtube.video_path,
+                                    youtube.metadata.get("title", ""),
+                                    youtube.metadata.get("description", ""),
+                                    interactive=True,
+                                ):
+                                    upload_success = youtube.upload_video()
+                                    if upload_success:
+                                        success("Long-form upload complete.")
+                                    else:
+                                        warning("YouTube upload failed.")
+                    elif user_input == 3:
                         videos = youtube.get_videos()
 
                         if len(videos) > 0:
@@ -190,7 +298,9 @@ def main():
                             print(videos_table)
                         else:
                             warning(" No videos found.")
-                    elif user_input == 3:
+                    elif user_input == 4:
+                        print_weekly_review()
+                    elif user_input == 5:
                         info("How often do you want to upload?")
 
                         info("\n============ OPTIONS ============", False)
@@ -202,23 +312,28 @@ def main():
                         user_input = int(question("Select an Option: "))
 
                         cron_script_path = os.path.join(ROOT_DIR, "src", "cron.py")
-                        command = ["python", cron_script_path, "youtube", selected_account['id'], get_active_model()]
+                        command = [
+                            "python",
+                            cron_script_path,
+                            "youtube",
+                            selected_account["id"],
+                            get_active_model(),
+                            get_active_brand_id(),
+                        ]
 
                         def job():
                             subprocess.run(command)
 
                         if user_input == 1:
-                            # Upload Once
                             schedule.every(1).day.do(job)
                             success("Set up CRON Job.")
                         elif user_input == 2:
-                            # Upload Twice a day
                             schedule.every().day.at("10:00").do(job)
                             schedule.every().day.at("16:00").do(job)
                             success("Set up CRON Job.")
                         else:
                             break
-                    elif user_input == 4:
+                    elif user_input == 6:
                         if get_verbose():
                             info(" => Climbing Options Ladder...", False)
                         break
@@ -427,6 +542,20 @@ def main():
 
         outreach.start()
     elif user_input == 5:
+        run_switch_brand_menu()
+    elif user_input == 6:
+        print_cli_dashboard()
+        if question("Generate HTML dashboard? (Yes/No): ").strip().lower() == "yes":
+            path = write_html_dashboard()
+            success(f"HTML dashboard written to: {path}")
+            if sys.platform == "win32":
+                try:
+                    os.startfile(path)  # type: ignore[attr-defined]
+                except OSError:
+                    info(f"Open manually: {path}", False)
+            else:
+                info(f"Open in browser: {path}", False)
+    elif user_input == 7:
         if get_verbose():
             print(colored(" => Quitting...", "blue"))
         sys.exit(0)
@@ -436,6 +565,15 @@ def main():
     
 
 if __name__ == "__main__":
+    import sys
+
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     # Print ASCII Banner
     print_banner()
 
@@ -446,6 +584,12 @@ if __name__ == "__main__":
 
     # Setup file tree
     assert_folder_structure()
+
+    try:
+        bootstrap_brand(get_active_brand_id())
+        print(colored(f"Active brand: {get_active_brand_summary()}", "green"))
+    except Exception as e:
+        warning(f"Brand bootstrap: {e}")
 
     # Remove temporary files
     rem_temp_files()

@@ -6,7 +6,6 @@ kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kitten
 soundfile
 prettytable
 webdriver_manager
-selenium_firefox
 selenium
 ollama
 moviepy
@@ -17,3 +16,4 @@ faster-whisper
 srt_equalizer
 undetected_chromedriver
 platformdirs
+flask

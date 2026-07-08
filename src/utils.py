@@ -1,8 +1,11 @@
 import os
 import random
+import re
+import shutil
 import zipfile
 import requests
 import platform
+from datetime import datetime
 
 from status import *
 from config import *
@@ -43,6 +46,32 @@ def build_url(youtube_video_id: str) -> str:
         url (str): The URL to the YouTube video.
     """
     return f"https://www.youtube.com/watch?v={youtube_video_id}"
+
+
+def save_video_output(video_path: str, brand_id: str, title: str = "") -> str:
+    """
+    Copy a finished MP4 to output/{brand_id}/ so it survives .mp temp cleanup.
+
+    Returns:
+        str: Absolute path to the saved copy, or empty string on failure.
+    """
+    if not video_path or not os.path.isfile(video_path):
+        return ""
+
+    out_dir = os.path.join(ROOT_DIR, "output", brand_id)
+    os.makedirs(out_dir, exist_ok=True)
+
+    slug = re.sub(r"[^\w\s-]", "", title)[:60].strip().replace(" ", "_")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{ts}_{slug}.mp4" if slug else f"{ts}.mp4"
+    dest = os.path.join(out_dir, filename)
+
+    try:
+        shutil.copy2(video_path, dest)
+        return os.path.abspath(dest)
+    except OSError as e:
+        warning(f"Could not save video to output folder: {e}")
+        return ""
 
 
 def rem_temp_files() -> None:
@@ -134,9 +163,12 @@ def fetch_songs() -> None:
         error(f"Error occurred while fetching songs: {str(e)}")
 
 
-def choose_random_song() -> str:
+def choose_random_song(prefer_keywords: list[str] | None = None) -> str:
     """
     Chooses a random song from the songs/ directory.
+
+    Args:
+        prefer_keywords: If set, prefer files whose name contains any keyword.
 
     Returns:
         str: The path to the chosen song.
@@ -151,6 +183,14 @@ def choose_random_song() -> str:
         ]
         if len(songs) == 0:
             raise RuntimeError("No audio files found in Songs directory")
+        if prefer_keywords:
+            preferred = [
+                name
+                for name in songs
+                if any(kw.lower() in name.lower() for kw in prefer_keywords)
+            ]
+            if preferred:
+                songs = preferred
         song = random.choice(songs)
         success(f" => Chose song: {song}")
         return os.path.join(ROOT_DIR, "Songs", song)

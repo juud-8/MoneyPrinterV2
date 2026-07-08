@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoneyPrinterV2 — Control Panel</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --panel-2: #141c29;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --amber: #d29922;
+      --border: #30363d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header, main { max-width: 1280px; margin: 0 auto; padding: 20px 24px; }
+    header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+    h1 { margin: 0; font-size: 1.5rem; }
+    h2 { font-size: 1.15rem; margin: 28px 0 12px; }
+    .muted { color: var(--muted); }
+    .small { font-size: 0.82rem; }
+    button {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 14px;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: #1f6feb; border-color: #1f6feb; }
+    button.primary:hover { background: #2f81f7; }
+    button.danger { border-color: var(--red); color: var(--red); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 8px 0 4px; width: 100%; }
+    .totals div { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .totals strong { display: block; font-size: 1.35rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+    .card h3 { margin: 0 0 2px; font-size: 1.05rem; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0; }
+    .stats div { text-align: center; background: rgba(255,255,255,0.03); border-radius: 8px; padding: 8px 4px; }
+    .stats strong { display: block; font-size: 1.1rem; }
+    .stats span { color: var(--muted); font-size: 0.72rem; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+    .pill { display: inline-block; font-size: 0.7rem; padding: 2px 9px; border-radius: 999px; background: rgba(88,166,255,0.15); color: var(--accent); }
+    .pill.green { background: rgba(63,185,80,0.15); color: var(--green); }
+    .pill.red { background: rgba(248,81,73,0.15); color: var(--red); }
+    .pill.amber { background: rgba(210,153,34,0.18); color: var(--amber); }
+    details.slots { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+    details.slots summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+    .slot-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+    .slot-row label { width: 52px; color: var(--muted); font-size: 0.82rem; }
+    .slot-row input {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 5px 8px;
+      width: 76px;
+      font-family: inherit;
+    }
+    ul.plain { list-style: none; margin: 8px 0 0; padding: 0; }
+    ul.plain li { padding: 6px 0; border-top: 1px solid var(--border); font-size: 0.87rem; }
+    ul.plain a { color: var(--accent); text-decoration: none; word-break: break-all; }
+    .jobs-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    .jobs-table th, .jobs-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    .jobs-table th { color: var(--muted); font-weight: 500; font-size: 0.78rem; }
+    .jobs-table tr.selectable { cursor: pointer; }
+    .jobs-table tr.selectable:hover { background: rgba(255,255,255,0.03); }
+    #log-view {
+      background: #0a0e13;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      max-height: 380px;
+      overflow-y: auto;
+      font-family: Consolas, monospace;
+      font-size: 0.78rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      display: none;
+    }
+    canvas { max-height: 240px; }
+    #toast {
+      position: fixed; bottom: 20px; right: 20px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; padding: 12px 18px;
+      display: none; max-width: 420px; z-index: 50;
+    }
+    .flex-between { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MoneyPrinterV2 <span class="muted">Control Panel</span></h1>
+    <span class="muted small" id="generated-at"></span>
+    <span style="flex:1"></span>
+    <button id="refresh-metrics" class="primary">↻ Refresh YouTube metrics</button>
+    <div class="totals" id="totals"></div>
+  </header>
+  <main>
+    <h2>Brands</h2>
+    <div class="grid" id="brands"></div>
+
+    <h2 class="flex-between">Jobs <span class="muted small">auto-refreshes</span></h2>
+    <div class="card">
+      <table class="jobs-table">
+        <thead><tr><th>Started</th><th>Job</th><th>Status</th><th></th></tr></thead>
+        <tbody id="jobs-body"><tr><td colspan="4" class="muted">No jobs yet this session.</td></tr></tbody>
+      </table>
+      <div id="log-view"></div>
+    </div>
+
+    <h2>Charts</h2>
+    <div class="grid">
+      <div class="card"><h3>Posts over time</h3><canvas id="timelineChart"></canvas></div>
+      <div class="card"><h3>Premium spend by tier</h3><canvas id="tierChart"></canvas></div>
+    </div>
+
+    <h2>Recent posts</h2>
+    <div class="card"><ul class="plain" id="recent-posts"></ul></div>
+  </main>
+  <div id="toast"></div>
+
+  <script>
+    let brandsCache = [];
+    let selectedJob = null;
+    let logOffset = 0;
+    let charts = {};
+
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+    function toast(msg, isError) {
+      const el = $("toast");
+      el.textContent = msg;
+      el.style.borderColor = isError ? "var(--red)" : "var(--green)";
+      el.style.display = "block";
+      clearTimeout(el._t);
+      el._t = setTimeout(() => el.style.display = "none", 5000);
+    }
+
+    async function api(path, opts) {
+      const res = await fetch(path, opts);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || res.statusText);
+      return body;
+    }
+
+    function fmt(n) {
+      if (n === null || n === undefined) return "—";
+      return n >= 1000 ? n.toLocaleString() : String(n);
+    }
+
+    function renderTotals(data) {
+      const t = data.totals;
+      const spendKey = `spend_${data.window_days}d_usd`;
+      $("generated-at").textContent = `Updated ${data.generated_at} · window ${data.window_days}d`;
+      $("totals").innerHTML = `
+        <div><strong>${t.videos}</strong><span class="muted small">Posts (deduped)</span></div>
+        <div><strong>${t.uploaded}</strong><span class="muted small">Uploaded</span></div>
+        <div><strong>$${(t[spendKey] ?? 0).toFixed(2)}</strong><span class="muted small">Premium spend (${data.window_days}d)</span></div>
+        <div><strong>$${t.spend_all_time_usd.toFixed(2)}</strong><span class="muted small">Premium spend (all time)</span></div>`;
+    }
+
+    function slotEditor(brand) {
+      const slots = brand.publish_slots || {};
+      const names = Object.keys(slots).length ? Object.keys(slots) : ["early", "prime"];
+      const rows = names.map(name => {
+        const s = slots[name] || {};
+        return `
+          <div class="slot-row" data-slot="${esc(name)}">
+            <label>${esc(name)}</label>
+            <input data-k="window_start" value="${esc(s.window_start || "")}" placeholder="HH:MM" title="Window start">
+            <span class="muted">→</span>
+            <input data-k="window_end" value="${esc(s.window_end || "")}" placeholder="HH:MM" title="Window end">
+            <span class="muted small" title="Schedule the Windows Task ~30min before window start">task hint: ${esc(s.scheduler_start_hint || "—")}</span>
+          </div>`;
+      }).join("");
+      return `
+        <details class="slots">
+          <summary>Publish times (windows the scheduler targets)</summary>
+          ${rows}
+          <div class="actions">
+            <button onclick="saveSlots('${esc(brand.brand_id)}', this)">Save publish times</button>
+          </div>
+          <p class="muted small">The daily runner picks a random moment inside each window. Make sure the Windows Task Scheduler trigger still starts before the window opens.</p>
+        </details>`;
+    }
+
+    function insightsBlock(ins) {
+      if (!ins) return "";
+      if (!ins.active) {
+        return `<p class="muted small">Insights: ${ins.sample_size}/${ins.min_sample} videos with metrics — topic steering activates automatically once there's enough data.</p>`;
+      }
+      const top = ins.top.map(v => `<li>▲ ${esc(v.title.slice(0, 70))} <span class="pill green">${fmt(v.views)} views</span></li>`).join("");
+      const bottom = ins.bottom.map(v => `<li>▼ ${esc(v.title.slice(0, 70))} <span class="pill red">${fmt(v.views)} views</span></li>`).join("");
+      return `<details class="slots"><summary>Performance insights (feeding topic generation)</summary><ul class="plain">${top}${bottom}</ul></details>`;
+    }
+
+    function renderBrands(overview) {
+      const container = $("brands");
+      container.innerHTML = "";
+      const summaries = Object.fromEntries(overview.brands.map(b => [b.brand_id, b]));
+      const snaps = overview.channel_snapshots || {};
+      const insights = overview.insights || {};
+      const spendKey = `spend_${overview.window_days}d_usd`;
+
+      for (const brand of brandsCache) {
+        const s = summaries[brand.brand_id] || {};
+        const snap = snaps[brand.brand_id];
+        const card = document.createElement("article");
+        card.className = "card";
+        card.innerHTML = `
+          <div class="flex-between">
+            <h3>${esc(brand.channel_name)}</h3>
+            <span>
+              ${brand.is_active ? '<span class="pill green">active</span>' : ""}
+              ${brand.pilot_mode ? '<span class="pill amber" title="Pilot mode: Generate &amp; Post confirms the pilot review gate for you — review output quality regularly.">pilot</span>' : ""}
+            </span>
+          </div>
+          <p class="muted small">${esc(brand.brand_id)}</p>
+          <div class="stats">
+            <div><strong>${fmt(snap ? snap.subscribers : null)}</strong><span>Subs</span></div>
+            <div><strong>${fmt(snap ? snap.total_views : null)}</strong><span>Channel views</span></div>
+            <div><strong>${fmt(s.uploaded_count ?? 0)}</strong><span>Uploaded</span></div>
+            <div><strong>$${(s[spendKey] ?? 0).toFixed(2)}</strong><span>Spend (${overview.window_days}d)</span></div>
+          </div>
+          ${snap ? `<p class="muted small">Channel snapshot: ${esc(snap.date)}</p>` : `<p class="muted small">No channel snapshot yet — hit "Refresh YouTube metrics".</p>`}
+          <div class="actions">
+            <button onclick="generate('${esc(brand.brand_id)}', false, this)">Generate only</button>
+            <button class="primary" onclick="generate('${esc(brand.brand_id)}', true, this)">Generate &amp; Post now</button>
+          </div>
+          ${insightsBlock(insights[brand.brand_id])}
+          ${slotEditor(brand)}`;
+        container.appendChild(card);
+      }
+    }
+
+    function renderRecentPosts(overview) {
+      const items = (overview.videos || []).slice(0, 15).map(v => `
+        <li>
+          <span class="muted">${esc(v.date || "")}</span>
+          <span class="pill">${esc(v.status || "generated")}</span>
+          <span class="pill">${esc(v.brand_id || "")}</span>
+          ${v.views !== null && v.views !== undefined ? `<span class="pill green">${fmt(v.views)} views</span>` : ""}
+          ${esc((v.title || "").slice(0, 85))}
+          ${v.url ? `<br><a href="${esc(v.url)}" target="_blank" rel="noopener">${esc(v.url)}</a>` : ""}
+        </li>`).join("");
+      $("recent-posts").innerHTML = items || '<li class="muted">No posts logged yet.</li>';
+    }
+
+    function renderCharts(overview) {
+      const byDay = {};
+      for (const v of overview.videos || []) {
+        const d = (v.date || "").slice(0, 10);
+        if (d) byDay[d] = (byDay[d] || 0) + 1;
+      }
+      const days = Object.keys(byDay).sort();
+      drawChart("timelineChart", "bar", days, days.map(d => byDay[d]), "Posts");
+
+      const tiers = overview.spend_by_tier || {};
+      drawChart("tierChart", "doughnut", Object.keys(tiers), Object.values(tiers), "USD");
+    }
+
+    function drawChart(id, type, labels, values, label) {
+      if (charts[id]) charts[id].destroy();
+      if (!labels.length) return;
+      charts[id] = new Chart($(id), {
+        type,
+        data: { labels, datasets: [{ label, data: values, backgroundColor: ["#58a6ff", "#3fb950", "#d29922", "#f85149", "#a371f7"] }] },
+        options: {
+          responsive: true,
+          plugins: { legend: { labels: { color: "#e6edf3" } } },
+          ...(type === "bar" ? { scales: {
+            x: { ticks: { color: "#8b949e" }, grid: { color: "#30363d" } },
+            y: { ticks: { color: "#8b949e" }, grid: { color: "#30363d" } }
+          }} : {})
+        }
+      });
+    }
+
+    async function generate(brandId, upload, btn) {
+      if (upload && !confirm(`Generate AND upload a new Short for "${brandId}" now?\n\nThis launches the full pipeline (LLM → TTS → images → video → Selenium upload).`)) return;
+      btn.disabled = true;
+      try {
+        const job = await api("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ brand_id: brandId, upload })
+        });
+        toast(`Started: ${job.label}`);
+        selectJob(job.id);
+        await refreshJobs();
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function saveSlots(brandId, btn) {
+      const details = btn.closest("details");
+      const payload = {};
+      for (const row of details.querySelectorAll(".slot-row")) {
+        const slot = {};
+        for (const input of row.querySelectorAll("input")) {
+          if (input.value.trim()) slot[input.dataset.k] = input.value.trim();
+        }
+        if (Object.keys(slot).length) payload[row.dataset.slot] = slot;
+      }
+      btn.disabled = true;
+      try {
+        await api(`/api/brands/${brandId}/slots`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        toast("Publish times saved to brand manifest.");
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    $("refresh-metrics").addEventListener("click", async () => {
+      const btn = $("refresh-metrics");
+      btn.disabled = true;
+      try {
+        const job = await api("/api/metrics/refresh", { method: "POST" });
+        toast("Metrics refresh started — dashboard updates when it finishes.");
+        selectJob(job.id);
+        await refreshJobs();
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    function selectJob(jobId) {
+      selectedJob = jobId;
+      logOffset = 0;
+      $("log-view").textContent = "";
+      $("log-view").style.display = "block";
+    }
+
+    async function refreshJobs() {
+      const jobs = await api("/api/jobs");
+      const body = $("jobs-body");
+      if (!jobs.length) {
+        body.innerHTML = '<tr><td colspan="4" class="muted">No jobs yet this session.</td></tr>';
+        return;
+      }
+      body.innerHTML = jobs.map(j => {
+        const pill = j.status === "running" ? "pill amber" : j.status === "succeeded" ? "pill green" : "pill red";
+        const cancel = j.status === "running" ? `<button class="danger" onclick="event.stopPropagation(); cancelJob('${j.id}')">Cancel</button>` : "";
+        return `<tr class="selectable" onclick="selectJob('${j.id}')">
+          <td class="muted">${esc(j.started_at)}</td>
+          <td>${esc(j.label)}</td>
+          <td><span class="${pill}">${esc(j.status)}</span></td>
+          <td>${cancel}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    async function cancelJob(jobId) {
+      try {
+        await api(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+        toast("Job cancelled.");
+        await refreshJobs();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    }
+
+    async function pollLog() {
+      if (!selectedJob) return;
+      try {
+        const res = await api(`/api/jobs/${selectedJob}/log?offset=${logOffset}`);
+        if (res.text) {
+          const el = $("log-view");
+          const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+          el.textContent += res.text;
+          logOffset = res.offset;
+          if (stick) el.scrollTop = el.scrollHeight;
+        }
+      } catch (e) { /* job may not exist yet */ }
+    }
+
+    async function refreshOverview() {
+      const [overview, brands] = await Promise.all([api("/api/overview"), api("/api/brands")]);
+      brandsCache = brands;
+      renderTotals(overview);
+      // Don't rebuild brand cards while the user is typing in a slot editor.
+      const editing = document.activeElement && $("brands").contains(document.activeElement);
+      if (!editing) renderBrands(overview);
+      renderRecentPosts(overview);
+      renderCharts(overview);
+    }
+
+    refreshOverview().catch(e => toast(e.message, true));
+    refreshJobs().catch(() => {});
+    setInterval(() => refreshJobs().catch(() => {}), 3000);
+    setInterval(pollLog, 1500);
+    setInterval(() => refreshOverview().catch(() => {}), 60000);
+  </script>
+</body>
+</html>
