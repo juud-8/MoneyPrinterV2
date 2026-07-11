@@ -41,7 +41,11 @@ def run_switch_brand_menu() -> None:
     info("\n============ SWITCH BRAND ============", False)
     for idx, b in enumerate(brands):
         marker = " (active)" if b["is_active"] else ""
+        if b.get("is_archived"):
+            marker += " [ARCHIVED]"
         status_parts = []
+        if b.get("is_archived"):
+            status_parts.append("archived — cannot run")
         if not b["profile_exists"]:
             status_parts.append("profile missing")
         if not b["voice_configured"]:
@@ -69,6 +73,9 @@ def run_switch_brand_menu() -> None:
         return
 
     brand_id = brands[idx]["brand_id"]
+    if brands[idx].get("is_archived"):
+        error(f"{brands[idx]['channel_name']} is archived and cannot be activated.")
+        return
     if brand_id == get_active_brand_id():
         info(f"Already on {brands[idx]['channel_name']}.")
         return

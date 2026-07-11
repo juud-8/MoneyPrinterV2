@@ -34,6 +34,14 @@ def main():
     episode = _parse_episode(sys.argv)
     topic = _parse_flag(sys.argv, "--topic")
 
+    from archived_brands import assert_brand_runnable, is_brand_archived
+
+    if is_brand_archived(brand_id):
+        print(f"ERROR: {brand_id} is archived and cannot generate or upload.")
+        print("See brands/_archived/sixty_second_thrillers/README.md to resurrect.")
+        sys.exit(2)
+    assert_brand_runnable(brand_id)
+
     if do_upload:
         os.environ.setdefault("MPV2_PILOT_UPLOAD_CONFIRMED", "1")
 

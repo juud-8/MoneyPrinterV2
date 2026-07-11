@@ -125,6 +125,11 @@ def api_generate():
     if not load_brand(brand_id):
         return jsonify({"error": f"Unknown brand: {brand_id}"}), 404
 
+    from archived_brands import is_brand_archived
+
+    if is_brand_archived(brand_id):
+        return jsonify({"error": f"Brand '{brand_id}' is archived and cannot run."}), 403
+
     args = [brand_id]
     env_extra = {}
     if upload:

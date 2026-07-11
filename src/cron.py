@@ -10,6 +10,7 @@ from classes.YouTube import YouTube
 from llm_provider import select_model
 from post_bridge_integration import maybe_crosspost_youtube_short
 from review_gate import should_proceed_with_upload
+from archived_brands import assert_brand_runnable, is_brand_archived
 from brand_switcher import (
     bootstrap_brand,
     get_active_brand_id,
@@ -33,6 +34,12 @@ def main():
     brand_id = str(sys.argv[4]) if len(sys.argv) > 4 else None
 
     if brand_id:
+        if is_brand_archived(brand_id):
+            error(
+                f"Brand '{brand_id}' is archived and cannot run via cron. "
+                "Remove it from ARCHIVED_BRANDS to resurrect."
+            )
+            sys.exit(2)
         set_active_brand(brand_id)
         bootstrap_brand(brand_id)
     else:

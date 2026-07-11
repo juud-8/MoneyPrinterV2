@@ -5,6 +5,7 @@ import json
 import os
 from uuid import uuid4
 
+from archived_brands import assert_brand_runnable, is_brand_archived
 from cache import add_account, get_accounts, get_youtube_cache_path
 from config import ROOT_DIR
 
@@ -70,6 +71,7 @@ def list_brands() -> list[dict]:
                 "channel_name": manifest.get("channel_name", brand_id),
                 "channel_id": manifest.get("channel_id", ""),
                 "niche": manifest.get("niche", ""),
+                "is_archived": is_brand_archived(brand_id),
                 "is_active": brand_id == active_id,
                 "profile_exists": bool(profile and os.path.isdir(profile)),
                 "profile_path": profile,
@@ -124,6 +126,7 @@ def get_active_brand_id() -> str:
 
 def set_active_brand(brand_id: str) -> None:
     """Persist active brand selection."""
+    assert_brand_runnable(brand_id)
     if not load_brand(brand_id):
         raise ValueError(f"Unknown brand: {brand_id}")
     _write_json(ACTIVE_BRAND_PATH, {"active_brand_id": brand_id})
@@ -265,6 +268,7 @@ def switch_brand(brand_id: str) -> dict:
     """
     Switch active brand, bootstrap account link, return summary dict.
     """
+    assert_brand_runnable(brand_id)
     brand = load_brand(brand_id)
     if not brand:
         raise ValueError(f"Unknown brand: {brand_id}")
