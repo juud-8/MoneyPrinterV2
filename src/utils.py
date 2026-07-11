@@ -87,8 +87,11 @@ def rem_temp_files() -> None:
     files = os.listdir(mp_dir)
 
     for file in files:
-        if not file.endswith(".json"):
-            os.remove(os.path.join(mp_dir, file))
+        path = os.path.join(mp_dir, file)
+        # Only top-level scratch files are temporary; subdirectories
+        # (.mp/logs, .mp/analysis) hold data that must survive runs.
+        if not file.endswith(".json") and os.path.isfile(path):
+            os.remove(path)
 
 
 def fetch_songs() -> None:

@@ -28,6 +28,8 @@ def _load() -> dict:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
         data.setdefault("asset_spend", [])
+        data.setdefault("duration_rejections", [])
+        data.setdefault("topic_rejections", [])
         return data
 
 
@@ -153,6 +155,9 @@ def log_video(
     subject: str = "",
     brand_id: str = "",
     status: str = "generated",
+    experiment: dict | None = None,
+    research: dict | None = None,
+    production: dict | None = None,
 ) -> None:
     """Log a published or generated video for later weekly review."""
     data = _load()
@@ -168,10 +173,18 @@ def log_video(
             "brand_id": brand_id,
             "status": status,
             "views": None,
+            "engaged_views": None,
             "ctr": None,
             "avg_view_duration": None,
+            "avg_view_pct": None,
+            "subscribers_gained": None,
+            "subscribers_lost": None,
+            "shares": None,
             "rpm": None,
             "affiliate_clicks": None,
+            "experiment": dict(experiment or {}),
+            "research": dict(research or {}),
+            "production": dict(production or {}),
             "notes": "",
         }
     )
@@ -230,6 +243,55 @@ def log_asset_spend(
             "modality": modality,
             "provider": provider,
             "cost_usd": round(float(cost_usd or 0.0), 2),
+        }
+    )
+    _save(data)
+
+
+def log_topic_rejection(
+    candidate: str,
+    matched: str,
+    similarity: float,
+    brand_id: str = "",
+) -> None:
+    """Log a candidate topic skipped as a near-duplicate of recent history."""
+    data = _load()
+    data.setdefault("topic_rejections", []).append(
+        {
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "candidate": candidate[:300],
+            "matched": matched[:300],
+            "similarity": round(float(similarity), 3),
+            "brand_id": brand_id,
+        }
+    )
+    _save(data)
+
+
+def log_duration_rejection(
+    video_subject: str,
+    audio_seconds: float,
+    cap_seconds: float,
+    attempt: int,
+    action: str,
+    brand_id: str = "",
+) -> None:
+    """Log a voiceover that ran past the hard duration gate.
+
+    `action` is "retry" (regenerating with a shorter-script instruction)
+    or "abort" (still over the cap after retries — generation dropped,
+    never uploaded).
+    """
+    data = _load()
+    data.setdefault("duration_rejections", []).append(
+        {
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "video_subject": video_subject,
+            "brand_id": brand_id,
+            "audio_seconds": round(float(audio_seconds), 1),
+            "cap_seconds": round(float(cap_seconds), 1),
+            "attempt": attempt,
+            "action": action,
         }
     )
     _save(data)

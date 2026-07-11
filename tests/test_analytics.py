@@ -63,6 +63,21 @@ class AnalyticsDashboardTests(unittest.TestCase):
         with open(self.analytics_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
 
+    def test_log_topic_rejection_appends_entry(self) -> None:
+        analytics.log_topic_rejection(
+            candidate="The Emu War, but reworded",
+            matched="Australia's Bizarre Emu War",
+            similarity=0.814,
+            brand_id="alpha",
+        )
+        with open(self.analytics_path, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(len(data["topic_rejections"]), 1)
+        entry = data["topic_rejections"][0]
+        self.assertEqual(entry["matched"], "Australia's Bizarre Emu War")
+        self.assertEqual(entry["brand_id"], "alpha")
+        self.assertAlmostEqual(entry["similarity"], 0.814)
+
     def test_dedupe_prefers_uploaded_row_with_url(self) -> None:
         self._write_analytics(
             {
@@ -167,6 +182,22 @@ class AnalyticsDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard["totals"]["videos"], 2)
         self.assertEqual(dashboard["totals"]["uploaded"], 1)
         self.assertEqual(dashboard["totals"]["spend_7d_usd"], 1.25)
+
+    def test_log_video_records_experiment_research_and_production_metadata(self) -> None:
+        analytics.log_video(
+            title="Measured video",
+            format_type="short",
+            niche="history",
+            experiment={"experiment_id": "visual-01", "variant": "archive"},
+            research={"grounded": True, "source_count": 3},
+            production={"tts_provider": "kittentts", "asset_count": 8},
+        )
+        entry = analytics._load()["videos"][0]
+        self.assertEqual(entry["experiment"]["variant"], "archive")
+        self.assertTrue(entry["research"]["grounded"])
+        self.assertEqual(entry["production"]["asset_count"], 8)
+        self.assertIn("engaged_views", entry)
+        self.assertIn("subscribers_gained", entry)
 
 
 if __name__ == "__main__":

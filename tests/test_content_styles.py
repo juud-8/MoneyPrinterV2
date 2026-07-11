@@ -116,16 +116,41 @@ class GetContentStyleTests(unittest.TestCase):
         ):
             self.assertIn(avoided, prompt)
 
-    def test_weird_history_targets_70_to_85_seconds_with_narration_ceiling(self) -> None:
+    def test_weird_history_targets_50_to_60_seconds_with_hard_audio_gate(self) -> None:
         style = get_content_style(
             {"production": {"content_style": "weird_history"}}
         )
-        self.assertTrue(70.0 <= style["default_target_seconds"] <= 85.0)
+        self.assertTrue(50.0 <= style["default_target_seconds"] <= 60.0)
         self.assertTrue(style["subtract_outro_from_target"])
         self.assertTrue(style["enforce_max_word_count"])
-        # Narration ceiling leaves headroom for a ~2.8s appended outro (~95s total).
-        self.assertEqual(style["max_target_ceiling_seconds"], 92.0)
+        # Script-length ceiling stays below the hard audio gate so a slow
+        # TTS read still clears it.
+        self.assertEqual(style["max_target_ceiling_seconds"], 70.0)
+        self.assertEqual(style["max_audio_duration_seconds"], 75.0)
+        self.assertLess(
+            style["max_target_ceiling_seconds"], style["max_audio_duration_seconds"]
+        )
         self.assertTrue(style["enforce_min_word_count"])
+
+    def test_weird_history_topic_and_title_require_number_plus_absurdity(self) -> None:
+        style = get_content_style(
+            {"production": {"content_style": "weird_history"}}
+        )
+        prompt = style["topic_prompt"]("weird but true history", "")
+        self.assertIn("MUST pair a specific number", prompt)
+        self.assertIn("50-60 second", prompt)
+        title_rules = style["title_rules"]
+        self.assertIn("MUST contain at least one specific number", title_rules)
+        self.assertIn("absurd conflict or outcome", title_rules)
+
+    def test_weird_history_script_demands_setup_punchline_structure(self) -> None:
+        style = get_content_style(
+            {"production": {"content_style": "weird_history"}}
+        )
+        instruction = style["short_length_instruction"](52, 130, 114)
+        self.assertIn("punchline", instruction)
+        self.assertIn("never a list", instruction)
+        self.assertIn("punchline", style["short_script_rules"])
 
     def test_weird_history_enables_topic_and_title_candidate_scoring(self) -> None:
         style = get_content_style(
@@ -141,6 +166,8 @@ class GetContentStyleTests(unittest.TestCase):
             self.assertEqual(style["title_candidate_count"], 1)
             self.assertFalse(style["enforce_max_word_count"])
             self.assertIsNone(style["max_target_ceiling_seconds"])
+            self.assertIsNone(style["title_rules"])
+            self.assertIsNone(style["max_audio_duration_seconds"])
 
 
 if __name__ == "__main__":

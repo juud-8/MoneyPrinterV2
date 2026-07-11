@@ -15,10 +15,29 @@ from asset_gen import AssetResult, generate_image as gen_image, generate_asset_w
 from asset_strategy import shot_role_for_index, tier_for_shot_role
 from video_effects import apply_ken_burns, apply_crossfade
 from video_captions import composite_captions_on_video
-from analytics import log_video, log_asset_spend
+from analytics import (
+    log_video,
+    log_asset_spend,
+    log_duration_rejection,
+    log_topic_rejection,
+)
 from brand_switcher import get_production_setting, load_active_brand
-from content_styles import get_content_style, DEFAULT_SCRIPT_RULES
+from content_styles import get_content_style, resolve_style_name, DEFAULT_SCRIPT_RULES
 from topic_scoring import pick_best
+from content_strategy import (
+    build_topic_strategy_block,
+    recent_topic_labels,
+    script_engagement_instruction,
+)
+from research_brief import (
+    build_grounded_research_prompt,
+    collect_sources,
+    parse_research_brief,
+    render_research_notes,
+    research_quality_issues,
+    save_research_brief,
+)
+from topic_similarity import find_near_duplicate
 from uuid import uuid4
 from constants import *
 from typing import List, Optional
@@ -93,8 +112,14 @@ class YouTube:
 
         self.images = []
         self.asset_modalities = []  # parallel to self.images: "image" | "video_clip"
+        self.asset_results = []
         self.format_type = "short"
+        self.run_id = str(uuid4())
         self.research_notes = ""
+        self.research_brief = {}
+        self.research_brief_path = ""
+        self.experiment_metadata = {}
+        self.production_metadata = {}
         self.last_upload_error = None
         self.chapters = []
 
@@ -173,6 +198,37 @@ class YouTube:
         Returns:
             research_notes (str): Brief research bullets for the scriptwriter.
         """
+        active_brand = load_active_brand() or {}
+        style_name = resolve_style_name(active_brand)
+        requires_grounding = style_name in {"narrative_nonfiction", "weird_history"}
+
+        if requires_grounding:
+            topic = getattr(self, "subject", self.niche)
+            sources = collect_sources(topic)
+            if len(sources) < 2:
+                raise RuntimeError(
+                    f"Grounded research found only {len(sources)} usable source(s) for "
+                    f"{topic!r}; refusing to generate an unverified nonfiction script."
+                )
+            prompt = build_grounded_research_prompt(topic, self.niche, sources)
+            raw = self.generate_response(prompt, quality=True)
+            brief = parse_research_brief(raw, topic, sources)
+            issues = research_quality_issues(brief)
+            if issues:
+                raise RuntimeError("Research quality gate failed: " + "; ".join(issues))
+            brief["brand_id"] = active_brand.get("brand_id", "")
+            brief["content_style"] = style_name
+            self.research_brief = brief
+            self.research_brief_path = save_research_brief(
+                brief, active_brand.get("brand_id", "unknown")
+            )
+            self.research_notes = render_research_notes(brief)
+            info(
+                f" => Grounded research: {len(brief['claims'])} claims across "
+                f"{len(brief['cited_source_ids'])} cited sources."
+            )
+            return self.research_notes
+
         prompt = f"""
         You are researching a YouTube video for niche: {self.niche}.
         Topic idea: {getattr(self, 'subject', self.niche)}
@@ -215,13 +271,17 @@ class YouTube:
 
         prompt = style["topic_prompt"](self.niche, episode_hint)
 
+        active_brand = load_active_brand() or {}
+        strategy_block = build_topic_strategy_block(active_brand)
+        if strategy_block:
+            prompt += "\n\n" + strategy_block
+
         # Steer topics toward what actually performed once the brand has
         # enough tracked view data (see performance_insights.py). Empty
         # string until then, so behavior is unchanged for new brands.
         try:
             from performance_insights import build_topic_insights_block
 
-            active_brand = load_active_brand() or {}
             insights = build_topic_insights_block(active_brand.get("brand_id", ""))
             if insights:
                 prompt += "\n" + insights
@@ -233,15 +293,33 @@ class YouTube:
         candidate_count = max(1, int(style.get("topic_candidate_count", 1) or 1))
 
         candidates = []
-        for _ in range(candidate_count):
+        recent_labels = recent_topic_labels(active_brand)
+        max_attempts = candidate_count + 2 if recent_labels else candidate_count
+        for _ in range(max_attempts):
             completion = self.generate_response(prompt, quality=True)
             if completion:
-                candidates.append(completion.strip().strip('"').strip("'"))
+                candidate = completion.strip().strip('"').strip("'")
+                duplicate = find_near_duplicate(candidate, recent_labels)
+                if duplicate:
+                    warning(
+                        f"Rejected near-duplicate topic ({duplicate[1]:.0%} similar "
+                        f"to \"{duplicate[0][:80]}\"): {candidate}"
+                    )
+                    log_topic_rejection(
+                        candidate=candidate,
+                        matched=duplicate[0],
+                        similarity=duplicate[1],
+                        brand_id=active_brand.get("brand_id", ""),
+                    )
+                    continue
+                candidates.append(candidate)
+                if len(candidates) >= candidate_count:
+                    break
 
         if not candidates:
-            error("Failed to generate Topic.")
-            self.subject = ""
-            return self.subject
+            raise RuntimeError(
+                "No novel topic candidate passed generation and duplicate checks."
+            )
 
         if len(candidates) > 1:
             self.subject = pick_best(candidates)
@@ -308,9 +386,13 @@ class YouTube:
             return None
         return int(ceiling_secs * self._short_speech_wps())
 
-    def generate_script(self, _attempt: int = 0) -> str:
+    def generate_script(self, _attempt: int = 0, shorten_note: str = "") -> str:
         """
         Generate a hook-first script with retention beats and CTA.
+
+        Args:
+            shorten_note: Extra instruction injected when a previous take's
+                voiceover ran past the style's hard audio-duration gate.
 
         Returns:
             script (str): The script of the video.
@@ -319,6 +401,12 @@ class YouTube:
         research = getattr(self, "research_notes", "") or ""
         style = get_content_style()
         is_short = self.format_type != "longform"
+        engagement_instruction = script_engagement_instruction(load_active_brand() or {})
+        engagement_rule = (
+            f"\n        - {engagement_instruction}"
+            if is_short and engagement_instruction
+            else ""
+        )
 
         if is_short and style["short_script_rules"]:
             target_secs = int(self._short_target_duration())
@@ -341,14 +429,17 @@ class YouTube:
                     f"Exactly {sentence_length} short sentences. Total under 45 seconds when spoken."
                 )
 
+        shorten_rule = f"\n        - {shorten_note}" if shorten_note else ""
+
         prompt = f"""
         Write a YouTube {self.format_type} voiceover script.
 
         RULES:
-        {script_rules}
+        {script_rules}{engagement_rule}{shorten_rule}
         - Use short punchy sentences for Shorts; slightly longer for long-form
         - {length_instruction}
         - Language: {self.language}
+        - Source markers such as [S1] are audit metadata; never include them in the spoken script
         - NO markdown, NO titles, NO stage directions, NO quotes around the script
         - Return ONLY the spoken script
 
@@ -360,6 +451,7 @@ class YouTube:
 
         completion = re.sub(r"\*", "", completion)
         completion = re.sub(r"^#+\s*", "", completion, flags=re.MULTILINE)
+        completion = re.sub(r"\s*\[S\d+(?:\s*,\s*S\d+)*\]", "", completion)
 
         if not completion:
             error("The generated script is empty.")
@@ -370,7 +462,7 @@ class YouTube:
             if _attempt < 4:
                 if get_verbose():
                     warning("Generated Script is too long. Retrying...")
-                return self.generate_script(_attempt + 1)
+                return self.generate_script(_attempt + 1, shorten_note=shorten_note)
             completion = completion[:max_len]
 
         self.script = completion.strip()
@@ -382,7 +474,7 @@ class YouTube:
                 warning(
                     f"Script too short ({word_count} words, need ≥{min_words}). Retrying..."
                 )
-                return self.generate_script(_attempt + 1)
+                return self.generate_script(_attempt + 1, shorten_note=shorten_note)
 
         if style.get("enforce_max_word_count") and is_short:
             max_words = self._short_max_words()
@@ -392,7 +484,7 @@ class YouTube:
                     warning(
                         f"Script too long ({word_count} words, cap ~{max_words}). Retrying..."
                     )
-                    return self.generate_script(_attempt + 1)
+                    return self.generate_script(_attempt + 1, shorten_note=shorten_note)
                 warning(
                     f"Script still over the ~{max_words}-word cap after retries "
                     f"({word_count} words) — proceeding with the longer script rather "
@@ -408,6 +500,10 @@ class YouTube:
         Returns:
             metadata (dict): The generated metadata.
         """
+        style = get_content_style()
+        style_title_rules = (style.get("title_rules") or "").strip()
+        extra_title_rules = f"\n{style_title_rules}" if style_title_rules else ""
+
         title_prompt = f"""Write a YouTube title for this video.
 
 Topic: {self.subject}
@@ -417,29 +513,35 @@ Rules:
 - Under 70 characters
 - Do NOT include hashtags — they belong in the description, not the title
 - Use curiosity or specificity (numbers, real names, dates)
-- Return ONLY the title"""
+- Return ONLY the title{extra_title_rules}"""
 
-        title_candidate_count = max(
-            1, int(get_content_style().get("title_candidate_count", 1) or 1)
-        )
-        title_candidates = []
-        for _ in range(title_candidate_count):
-            candidate = self.generate_response(title_prompt, quality=True)
-            if candidate:
-                cleaned = candidate.split("\n")[0].strip().strip('"').strip("'")
-                # Hashtags in titles get truncated into junk fragments ("#His")
-                # once suffixes/length limits apply — hard-strip them even if
-                # the LLM ignores the prompt rule. Description keeps hashtags.
-                cleaned = re.sub(r"\s*#\w+", "", cleaned).strip(" -|—")
-                if cleaned:
-                    title_candidates.append(cleaned)
-
-        if len(title_candidates) > 1:
-            title = pick_best(title_candidates)
+        preset_title = (getattr(self, "preset_title", "") or "").strip()
+        if preset_title:
+            title = preset_title
             if get_verbose():
-                info(f" => Picked best of {len(title_candidates)} title candidates: {title}")
+                info(f" => Using preset title: {title}")
         else:
-            title = title_candidates[0] if title_candidates else ""
+            title_candidate_count = max(
+                1, int(style.get("title_candidate_count", 1) or 1)
+            )
+            title_candidates = []
+            for _ in range(title_candidate_count):
+                candidate = self.generate_response(title_prompt, quality=True)
+                if candidate:
+                    cleaned = candidate.split("\n")[0].strip().strip('"').strip("'")
+                    # Hashtags in titles get truncated into junk fragments ("#His")
+                    # once suffixes/length limits apply — hard-strip them even if
+                    # the LLM ignores the prompt rule. Description keeps hashtags.
+                    cleaned = re.sub(r"\s*#\w+", "", cleaned).strip(" -|—")
+                    if cleaned:
+                        title_candidates.append(cleaned)
+
+            if len(title_candidates) > 1:
+                title = pick_best(title_candidates)
+                if get_verbose():
+                    info(f" => Picked best of {len(title_candidates)} title candidates: {title}")
+            else:
+                title = title_candidates[0] if title_candidates else ""
 
         ep = getattr(self, "episode_number", None)
         if ep and not re.match(r"^episode\s", title, re.IGNORECASE):
@@ -1008,10 +1110,108 @@ Return ONLY the prompt sentence.""",
                     )
                 raise
 
+    def _build_experiment_metadata(self) -> dict:
+        brand = load_active_brand() or {}
+        production = brand.get("production") or {}
+        configured = production.get("experiment") or {}
+        if not isinstance(configured, dict):
+            configured = {}
+        return {
+            "run_id": self.run_id,
+            "experiment_id": os.environ.get(
+                "MPV2_EXPERIMENT_ID", str(configured.get("id") or "baseline")
+            ).strip(),
+            "variant": os.environ.get(
+                "MPV2_EXPERIMENT_VARIANT", str(configured.get("variant") or "control")
+            ).strip(),
+            "content_style": resolve_style_name(brand),
+            "format": self.format_type,
+        }
+
+    def _research_metadata(self) -> dict:
+        brief = self.research_brief or {}
+        return {
+            "grounded": bool(brief),
+            "brief_path": self.research_brief_path,
+            "claim_count": len(brief.get("claims") or []),
+            "source_count": len(brief.get("sources") or []),
+            "cited_source_count": len(brief.get("cited_source_ids") or []),
+        }
+
+    def _enforce_max_audio_duration(self, tts_instance: TTS, style: dict) -> None:
+        """Hard duration gate on the real TTS voiceover.
+
+        A voiceover past the style's `max_audio_duration_seconds` is
+        rejected, regenerated with an explicit shorter-script instruction,
+        and — if it STILL runs long — the whole generation is aborted via
+        RuntimeError rather than passed through to upload. Every rejection
+        is logged to analytics.json (duration_rejections) for review.
+        """
+        max_audio = style.get("max_audio_duration_seconds")
+        if not max_audio or self.format_type == "longform":
+            return
+
+        brand_id = (load_active_brand() or {}).get("brand_id", "")
+        audio_duration = AudioFileClip(self.tts_path).duration
+        for attempt in range(1, 3):
+            if audio_duration <= max_audio:
+                return
+            warning(
+                f"Voiceover {audio_duration:.1f}s exceeds the {max_audio:.0f}s hard "
+                f"cap — rejecting and regenerating shorter (attempt {attempt}/2)..."
+            )
+            log_duration_rejection(
+                video_subject=getattr(self, "subject", ""),
+                audio_seconds=audio_duration,
+                cap_seconds=max_audio,
+                attempt=attempt,
+                action="retry",
+                brand_id=brand_id,
+            )
+            target_words = self._short_target_words()
+            self.generate_script(
+                shorten_note=(
+                    f"CRITICAL: the previous script produced {audio_duration:.0f} "
+                    f"seconds of narration, over the hard {max_audio:.0f}-second "
+                    f"limit. Write a SUBSTANTIALLY shorter script (~{target_words} "
+                    "words): cut setup beats and adjectives, keep the punchline."
+                )
+            )
+            self.generate_metadata()
+            self.generate_script_to_speech(tts_instance)
+            self.production_metadata["tts_provider"] = getattr(
+                tts_instance, "last_provider_used", ""
+            )
+            self.production_metadata["tts_model"] = getattr(
+                tts_instance, "last_model_used", ""
+            )
+            audio_duration = AudioFileClip(self.tts_path).duration
+
+        if audio_duration > max_audio:
+            log_duration_rejection(
+                video_subject=getattr(self, "subject", ""),
+                audio_seconds=audio_duration,
+                cap_seconds=max_audio,
+                attempt=3,
+                action="abort",
+                brand_id=brand_id,
+            )
+            raise RuntimeError(
+                f"Voiceover still {audio_duration:.1f}s (cap {max_audio:.0f}s) after "
+                "shorter-script retries — aborting this generation instead of "
+                "uploading an over-length Short."
+            )
+
     def _generate_pipeline(self, tts_instance: TTS, interactive: bool = True) -> str:
         """Shared generation pipeline for short and long-form."""
+        self.run_id = str(uuid4())
         self.images = []
         self.asset_modalities = []
+        self.asset_results = []
+        self.research_notes = ""
+        self.research_brief = {}
+        self.research_brief_path = ""
+        self.production_metadata = {}
 
         self.generate_topic()
         self.generate_research()
@@ -1033,6 +1233,7 @@ Return ONLY the prompt sentence.""",
             )
             self.images.append(result.path)
             self.asset_modalities.append(result.modality)
+            self.asset_results.append(result)
             if result.tier != "standard":
                 active_brand = load_active_brand()
                 log_asset_spend(
@@ -1046,6 +1247,12 @@ Return ONLY the prompt sentence.""",
                 )
 
         self.generate_script_to_speech(tts_instance)
+        self.production_metadata["tts_provider"] = getattr(
+            tts_instance, "last_provider_used", ""
+        )
+        self.production_metadata["tts_model"] = getattr(
+            tts_instance, "last_model_used", ""
+        )
 
         style = get_content_style()
         if style["enforce_min_audio_duration"] and self.format_type != "longform":
@@ -1061,6 +1268,14 @@ Return ONLY the prompt sentence.""",
                 self.generate_script()
                 self.generate_metadata()
                 self.generate_script_to_speech(tts_instance)
+                self.production_metadata["tts_provider"] = getattr(
+                    tts_instance, "last_provider_used", ""
+                )
+                self.production_metadata["tts_model"] = getattr(
+                    tts_instance, "last_model_used", ""
+                )
+
+        self._enforce_max_audio_duration(tts_instance, style)
 
         # Recalculate image timing now that we have real audio duration
         actual_count = self._calculate_image_count(
@@ -1088,6 +1303,23 @@ Return ONLY the prompt sentence.""",
         if self.format_type == "longform":
             self.generate_thumbnail()
 
+        self.production_metadata.update(
+            {
+                "asset_count": len(self.asset_results),
+                "asset_modalities": [result.modality for result in self.asset_results],
+                "asset_tiers": [result.tier for result in self.asset_results],
+                "asset_providers": [result.provider for result in self.asset_results],
+                "estimated_asset_cost_usd": round(
+                    sum(float(result.cost_usd or 0.0) for result in self.asset_results), 2
+                ),
+                "target_duration_seconds": (
+                    get_longform_target_minutes() * 60
+                    if self.format_type == "longform"
+                    else self._short_target_duration()
+                ),
+            }
+        )
+
         log_video(
             title=self.metadata.get("title", ""),
             format_type=self.format_type,
@@ -1096,6 +1328,9 @@ Return ONLY the prompt sentence.""",
             subject=self.subject,
             brand_id=brand_id,
             status="generated",
+            experiment=self._build_experiment_metadata(),
+            research=self._research_metadata(),
+            production=self.production_metadata,
         )
         return path
 
@@ -1494,6 +1729,9 @@ Return ONLY the prompt sentence.""",
                 subject=getattr(self, "subject", ""),
                 brand_id=upload_brand.get("brand_id", ""),
                 status="uploaded",
+                experiment=self._build_experiment_metadata(),
+                research=self._research_metadata(),
+                production=self.production_metadata,
             )
 
             if verbose:

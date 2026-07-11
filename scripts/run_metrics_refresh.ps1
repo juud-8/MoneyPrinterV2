@@ -1,17 +1,21 @@
-# Weekly YouTube metrics refresh for MoneyPrinterV2.
+# Scheduled YouTube metrics refresh for MoneyPrinterV2.
 #
 # Pulls public view/like/comment counts + channel snapshots into
 # .mp/analytics.json (repairs stale URLs first). Safe to run anytime;
-# intended for Windows Task Scheduler once a week.
+# intended for Windows Task Scheduler.
 #
 # Manual:
 #   powershell -ExecutionPolicy Bypass -File scripts\run_metrics_refresh.ps1
 #
 # Register weekly task (Sunday 9:00 AM local):
 #   powershell -ExecutionPolicy Bypass -File scripts\run_metrics_refresh.ps1 -Register
+#
+# Register daily task (9:00 AM local):
+#   powershell -ExecutionPolicy Bypass -File scripts\run_metrics_refresh.ps1 -Register -Daily
 
 param(
     [switch]$Register,
+    [switch]$Daily,
     [string]$TaskName = "MoneyPrinterV2MetricsRefresh",
     [ValidateSet("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")]
     [string]$DayOfWeek = "Sunday",
@@ -45,14 +49,20 @@ if ($Register) {
         schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
     }
 
-    $dayCode = $DayOfWeek.Substring(0, 3).ToUpper()
-    schtasks /Create /TN $TaskName /TR $action /SC WEEKLY /D $dayCode /ST $Time /RL LIMITED /F
+    if ($Daily) {
+        schtasks /Create /TN $TaskName /TR $action /SC DAILY /ST $Time /RL LIMITED /F
+        $schedule = "daily"
+    } else {
+        $dayCode = $DayOfWeek.Substring(0, 3).ToUpper()
+        schtasks /Create /TN $TaskName /TR $action /SC WEEKLY /D $dayCode /ST $Time /RL LIMITED /F
+        $schedule = "weekly ($DayOfWeek)"
+    }
     $createCode = $LASTEXITCODE
     $ErrorActionPreference = $prevEap
     if ($createCode -ne 0) {
         Write-Error "Failed to create scheduled task '$TaskName'. Try running PowerShell as Administrator."
     }
-    Write-Host "Registered weekly task '$TaskName' - $DayOfWeek at $Time (local time)."
+    Write-Host "Registered $schedule task '$TaskName' at $Time (local time)."
     Write-Host "  Action: $action"
     Write-Host "  Log:    $LogFile"
     Write-Host "  Remove: schtasks /Delete /TN $TaskName /F"
@@ -70,7 +80,9 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 Add-Content -Path $LogFile -Value "[$stamp] Starting metrics refresh" -Encoding utf8
 
-& $Python $Script *>&1 | Tee-Object -FilePath $LogFile -Append
+# Not Tee-Object: under Windows PowerShell 5.1 (the scheduled-task host) it
+# appends UTF-16, garbling a log whose stamps are written as utf8.
+& $Python $Script *>&1 | ForEach-Object { $_; Add-Content -Path $LogFile -Value "$_" -Encoding utf8 }
 $code = $LASTEXITCODE
 
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"

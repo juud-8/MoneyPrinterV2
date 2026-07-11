@@ -26,6 +26,8 @@ class TTS:
     def __init__(self) -> None:
         self._provider = get_tts_provider()
         self._voice = get_tts_voice()
+        self.last_provider_used = ""
+        self.last_model_used = ""
         self._kitten = None
         if self._provider == "kittentts":
             self._kitten = KittenModel(KITTEN_MODEL)
@@ -61,6 +63,8 @@ class TTS:
         mp3_path = output_file if output_file.endswith(".mp3") else output_file.replace(".wav", ".mp3")
         with open(mp3_path, "wb") as f:
             f.write(response.content)
+        self.last_provider_used = "elevenlabs"
+        self.last_model_used = get_elevenlabs_model()
         return mp3_path
 
     def _synthesize_fishaudio(self, text: str, output_file: str) -> str:
@@ -91,6 +95,8 @@ class TTS:
         mp3_path = output_file if output_file.endswith(".mp3") else output_file.replace(".wav", ".mp3")
         with open(mp3_path, "wb") as f:
             f.write(response.content)
+        self.last_provider_used = "fishaudio"
+        self.last_model_used = get_fishaudio_model()
         return mp3_path
 
     def _synthesize_kitten(self, text: str, output_file: str) -> str:
@@ -98,6 +104,8 @@ class TTS:
             self._kitten = KittenModel(KITTEN_MODEL)
         audio = self._kitten.generate(text, voice=self._voice)
         sf.write(output_file, audio, KITTEN_SAMPLE_RATE)
+        self.last_provider_used = "kittentts"
+        self.last_model_used = KITTEN_MODEL
         return output_file
 
     def synthesize(self, text, output_file=os.path.join(ROOT_DIR, ".mp", "audio.wav")):
