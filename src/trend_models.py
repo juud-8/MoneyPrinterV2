@@ -8,15 +8,43 @@ the explicit ``from_dict`` validators in this module.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 from uuid import uuid4
 
 
 SCHEMA_VERSION = 1
+
+_CREDENTIAL_METADATA_KEYS = {
+    "authorization", "access_token", "refresh_token", "api_key", "key", "token",
+    "bearer", "secret", "client_secret", "password", "cookie", "session",
+}
+_PROVIDER_METADATA_ALLOWLISTS = {
+    "manual": {"fixture_case", "active_tragedy", "import", "unique_domains", "article_count"},
+    "gdelt": {"unique_domains", "article_count", "active_tragedy"},
+    "wikimedia": {"baseline_daily_views", "recent_daily_views"},
+    "youtube": {
+        "result_count", "total_public_views", "median_views_per_hour_proxy", "quota_calls",
+        "fetched_at", "refresh_due_at", "delete_or_expire_at", "retention_policy",
+        "source_provenance",
+    },
+    "x": set(),
+    "google_trends": set(),
+}
+
+
+def _is_credential_key(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
+    return normalized in _CREDENTIAL_METADATA_KEYS or any(
+        normalized.endswith(f"_{suffix}")
+        for suffix in ("authorization", "token", "bearer", "secret", "password", "cookie", "session", "key")
+    )
 
 ALLOWED_RISK_FLAGS = {
     "active_tragedy",
@@ -111,6 +139,45 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _clean_metadata_value(value: Any, name: str, *, depth: int = 0) -> Any:
+    if depth > 3:
+        raise ValidationError(f"{name} exceeds maximum nesting depth")
+    if value is None or type(value) in {bool, int, float}:
+        return value
+    if isinstance(value, str):
+        cleaned = "".join(character for character in value if unicodedata.category(character) != "Cc")
+        if len(cleaned) > 1000:
+            raise ValidationError(f"{name} contains an oversized string")
+        return cleaned
+    if isinstance(value, list):
+        if len(value) > 50:
+            raise ValidationError(f"{name} contains too many list items")
+        return [_clean_metadata_value(item, name, depth=depth + 1) for item in value]
+    if isinstance(value, dict):
+        if len(value) > 50:
+            raise ValidationError(f"{name} contains too many fields")
+        result = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValidationError(f"{name} contains a non-string key")
+            normalized = re.sub(r"[^a-z0-9]+", "_", key.casefold()).strip("_")
+            if _is_credential_key(normalized):
+                continue
+            result[normalized] = _clean_metadata_value(item, name, depth=depth + 1)
+        return result
+    raise ValidationError(f"{name} contains an unsupported value type")
+
+
+def sanitize_provider_metadata(provider: str, value: Any) -> dict[str, Any]:
+    raw = _mapping(value, "raw_metadata")
+    allowlist = _PROVIDER_METADATA_ALLOWLISTS.get(provider, set())
+    filtered = {key: item for key, item in raw.items() if str(key).casefold() in allowlist}
+    cleaned = _clean_metadata_value(filtered, "raw_metadata")
+    if len(json.dumps(cleaned, ensure_ascii=False)) > 50_000:
+        raise ValidationError("raw_metadata exceeds the 50KB safety limit")
+    return cleaned
+
+
 def _number(value: Any, name: str, *, minimum: float | None = None) -> float:
     try:
         result = float(value)
@@ -153,6 +220,8 @@ def _urls(value: Any, name: str) -> list[str]:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValidationError(f"{name} contains an invalid HTTP(S) URL")
+        if any(_is_credential_key(key) for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
+            raise ValidationError(f"{name} contains credential-bearing query parameters")
     return urls
 
 
@@ -292,10 +361,8 @@ class TrendSignal:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TrendSignal":
-        raw = _mapping(data.get("raw_metadata"), "raw_metadata")
-        if len(str(raw)) > 50_000:
-            raise ValidationError("raw_metadata exceeds the 50KB safety limit")
         provider = _require_text(data.get("provider"), "provider").lower()
+        raw = sanitize_provider_metadata(provider, data.get("raw_metadata"))
         metric_type = _require_text(data.get("metric_type", "unspecified"), "metric_type")
         absolute = bool(data.get("volume_is_absolute", False))
         if provider == "google_trends" and absolute:

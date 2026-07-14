@@ -15,7 +15,7 @@ from trend_bridges import build_bridge_prompt
 from trend_entities import cluster_signals
 from trend_models import TrendSignal, ValidationError
 from trend_providers import (
-    GdeltProvider, ManualProvider, ProviderSettings, WikimediaProvider,
+    CollectionCoordinator, GdeltProvider, ManualProvider, ProviderSettings, WikimediaProvider,
     YouTubeTrendProvider, fetch_json_with_retries,
 )
 from trend_store import TrendStore
@@ -85,6 +85,39 @@ class HttpBoundaryTests(unittest.TestCase):
 
 
 class MalformedProviderTests(unittest.TestCase):
+    def test_credential_metadata_is_removed_before_sqlite_persistence(self):
+        secret = "TOP_SECRET_VALUE"
+        signal = TrendSignal.from_dict({
+            "provider": "manual", "provider_signal_id": "secret", "collected_at": NOW,
+            "term": "dance", "normalized_entity": "dance", "window_hours": 24,
+            "raw_metadata": {
+                "fixture_case": "new_story", "authorization": f"Bearer {secret}",
+                "nested": {"access_token": secret},
+            },
+        })
+        self.assertEqual(signal.raw_metadata, {"fixture_case": "new_story"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "metadata.sqlite3")
+            TrendStore(path).save_signal(signal)
+            with open(path, "rb") as database:
+                self.assertNotIn(secret.encode(), database.read())
+
+    def test_metadata_bounds_and_types_are_enforced(self):
+        with self.assertRaisesRegex(ValidationError, "oversized string"):
+            TrendSignal.from_dict({
+                "provider": "manual", "provider_signal_id": "large", "collected_at": NOW,
+                "term": "dance", "normalized_entity": "dance", "window_hours": 24,
+                "raw_metadata": {"fixture_case": "x" * 1001},
+            })
+
+    def test_credential_bearing_source_url_is_rejected(self):
+        with self.assertRaisesRegex(ValidationError, "credential-bearing"):
+            TrendSignal.from_dict({
+                "provider": "manual", "provider_signal_id": "url-secret", "collected_at": NOW,
+                "term": "dance", "normalized_entity": "dance", "window_hours": 24,
+                "source_urls": ["https://example.test/article?access_token=secret"],
+            })
+
     def test_malformed_gdelt_record_is_partial_error(self):
         result = GdeltProvider(ProviderSettings(enabled=True), fetch_json=lambda *a: {"articles": [None, {"url": "https://news.test/a", "domain": "news.test"}]}).collect(request())
         self.assertEqual(len(result.signals), 1)

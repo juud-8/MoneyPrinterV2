@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import sys
@@ -12,9 +13,9 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from tests.test_trend_pipeline import NOW, evergreen_videos, manifest, opportunity
-from trend_models import ProviderResult, TrendRequest, ValidationError
+from trend_models import ProviderError, ProviderResult, TrendRequest, ValidationError
 from trend_pipeline import approve_opportunity
-from trend_providers import CollectionCoordinator, ProviderSettings
+from trend_providers import CollectionCoordinator, ProviderNotDispatchedError, ProviderSettings
 from trend_store import TrendStore
 
 
@@ -26,6 +27,13 @@ class TransactionTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _provider_request(self):
+        return TrendRequest.from_dict(
+            {"brand_id": "archive", "terms": ["x"], "geographies": ["US"],
+             "languages": ["en"], "window_hours": 24, "max_results": 5,
+             "dry_run": False, "requested_at": NOW}
+        )
 
     def _approved_seed(self):
         item = opportunity()
@@ -205,6 +213,119 @@ class TransactionTests(unittest.TestCase):
         codes = [error.code for result in results for error in result.errors]
         self.assertEqual(len(calls), 1)
         self.assertIn("daily_quota_exceeded", codes)
+
+    def test_failure_before_dispatch_releases_reservation(self):
+        class Provider:
+            name = "before"
+            enabled = True
+            cache_ttl_minutes = 0
+            estimated_max_cost_usd = 2
+
+            def estimated_max_requests(self, request):
+                return 1
+
+            def collect(self, request):
+                raise ProviderNotDispatchedError("local validation")
+
+        settings = ProviderSettings(enabled=True, daily_request_limit=1, daily_cost_limit_usd=2)
+        coordinator = CollectionCoordinator(self.store, clock=lambda: NOW)
+        with self.assertRaises(ProviderNotDispatchedError):
+            coordinator.collect(Provider(), self._provider_request(), settings)
+        with self.store.connect() as connection:
+            status = connection.execute("SELECT status FROM provider_budget_reservations").fetchone()[0]
+        self.assertEqual(status, "released_not_dispatched")
+        with self.assertRaises(ProviderNotDispatchedError):
+            coordinator.collect(Provider(), self._provider_request(), settings)
+
+    def test_post_dispatch_exception_is_charged_at_reserved_maximum(self):
+        calls = []
+
+        class Provider:
+            name = "uncertain"
+            enabled = True
+            cache_ttl_minutes = 0
+            estimated_max_cost_usd = 3
+
+            def estimated_max_requests(self, request):
+                return 1
+
+            def collect(self, request):
+                calls.append(1)
+                raise TimeoutError("after dispatch")
+
+        settings = ProviderSettings(enabled=True, daily_request_limit=1, daily_cost_limit_usd=3)
+        coordinator = CollectionCoordinator(self.store, clock=lambda: NOW)
+        with self.assertRaises(TimeoutError):
+            coordinator.collect(Provider(), self._provider_request(), settings)
+        blocked = coordinator.collect(Provider(), self._provider_request(), settings)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(blocked.errors[0].code, "daily_quota_exceeded")
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT status, actual_requests, actual_cost_usd FROM provider_budget_reservations"
+            ).fetchone()
+            metadata = json.loads(connection.execute("SELECT metadata_json FROM provider_usage").fetchone()[0])
+        self.assertEqual(tuple(row), ("dispatched_failure_unknown", 1, 3.0))
+        self.assertTrue(metadata["usage_uncertain"])
+
+    def test_parser_failure_after_http_success_is_reconciled_as_dispatched_failure(self):
+        class Provider:
+            name = "parser"
+            enabled = True
+            cache_ttl_minutes = 0
+            estimated_max_cost_usd = 1
+
+            def estimated_max_requests(self, request):
+                return 1
+
+            def collect(self, request):
+                return ProviderResult(
+                    self.name, [], [ProviderError("malformed_response", "invalid JSON")],
+                    False, 1, 0, 1, None, request.requested_at,
+                )
+
+        settings = ProviderSettings(enabled=True, daily_request_limit=1, daily_cost_limit_usd=1)
+        result = CollectionCoordinator(self.store, clock=lambda: NOW).collect(
+            Provider(), self._provider_request(), settings
+        )
+        self.assertEqual(result.errors[0].code, "malformed_response")
+        with self.store.connect() as connection:
+            status = connection.execute("SELECT status FROM provider_budget_reservations").fetchone()[0]
+            metadata = json.loads(connection.execute("SELECT metadata_json FROM provider_usage").fetchone()[0])
+        self.assertEqual(status, "dispatched_failure")
+        self.assertFalse(metadata["usage_uncertain"])
+
+    def test_concurrent_uncertain_failures_are_each_charged(self):
+        barrier = threading.Barrier(2)
+
+        class Provider:
+            name = "uncertain-concurrent"
+            enabled = True
+            cache_ttl_minutes = 0
+            estimated_max_cost_usd = 1
+
+            def estimated_max_requests(self, request):
+                return 1
+
+            def collect(self, request):
+                barrier.wait()
+                raise ConnectionError("disconnect after dispatch")
+
+        settings = ProviderSettings(enabled=True, daily_request_limit=2, daily_cost_limit_usd=2)
+        errors = []
+        provider_request = self._provider_request()
+
+        def collect():
+            try:
+                CollectionCoordinator(self.store, clock=lambda: NOW).collect(Provider(), provider_request, settings)
+            except ConnectionError as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=collect) for _ in range(2)]
+        [thread.start() for thread in threads]
+        [thread.join() for thread in threads]
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(self.store.usage_requests_since("uncertain-concurrent", "2026-07-12T00:00:00Z"), 2)
 
 
 if __name__ == "__main__":

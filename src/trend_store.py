@@ -51,7 +51,6 @@ class TrendStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("PRAGMA journal_mode = WAL")
         try:
             # A reserved writer lock serializes backup and migration while still
             # allowing the read connection used by sqlite3.Connection.backup().
@@ -873,7 +872,10 @@ class TrendStore:
     def reconcile_provider_budget(
         self, reservation_id: str, *, request_count: int, resource_count: int,
         estimated_cost_usd: float, actual_cost_usd: float | None, metadata: dict,
+        outcome: str = "dispatched_success",
     ) -> None:
+        if outcome not in {"dispatched_success", "dispatched_failure"}:
+            raise ValidationError("invalid provider budget outcome")
         self.migrate()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -884,16 +886,55 @@ class TrendStore:
             if not row:
                 raise ValidationError("unknown or reconciled provider budget reservation")
             connection.execute(
-                "UPDATE provider_budget_reservations SET status='reconciled', actual_requests=?, actual_cost_usd=? WHERE reservation_id=?",
-                (request_count, actual_cost_usd if actual_cost_usd is not None else estimated_cost_usd, reservation_id),
+                "UPDATE provider_budget_reservations SET status=?, actual_requests=?, actual_cost_usd=? WHERE reservation_id=?",
+                (outcome, request_count, actual_cost_usd if actual_cost_usd is not None else estimated_cost_usd, reservation_id),
             )
             connection.execute(
                 """INSERT INTO provider_usage (provider, occurred_at, request_count, resource_count,
                    estimated_cost_usd, actual_cost_usd, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (row["provider"], row["reserved_at"], request_count, resource_count, estimated_cost_usd, actual_cost_usd, self._dump(metadata)),
+                (row["provider"], row["reserved_at"], request_count, resource_count, estimated_cost_usd, actual_cost_usd, self._dump({**metadata, "budget_outcome": outcome, "usage_uncertain": False})),
             )
 
-    def release_provider_budget(self, reservation_id: str) -> None:
+    def release_provider_budget(self, reservation_id: str, *, reason: str) -> None:
         self.migrate()
         with self.connect() as connection:
-            connection.execute("UPDATE provider_budget_reservations SET status='released' WHERE reservation_id=? AND status='reserved'", (reservation_id,))
+            updated = connection.execute(
+                "UPDATE provider_budget_reservations SET status='released_not_dispatched' WHERE reservation_id=? AND status='reserved'",
+                (reservation_id,),
+            )
+            if updated.rowcount != 1:
+                raise ValidationError("unknown or reconciled provider budget reservation")
+
+    def charge_uncertain_provider_budget(self, reservation_id: str, *, metadata: dict) -> None:
+        """Conservatively charge the reservation when dispatch may have occurred."""
+        self.migrate()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT provider, reserved_at, reserved_requests, reserved_cost_usd
+                   FROM provider_budget_reservations
+                   WHERE reservation_id = ? AND status = 'reserved'""",
+                (reservation_id,),
+            ).fetchone()
+            if not row:
+                raise ValidationError("unknown or reconciled provider budget reservation")
+            connection.execute(
+                """UPDATE provider_budget_reservations
+                   SET status='dispatched_failure_unknown', actual_requests=reserved_requests,
+                       actual_cost_usd=reserved_cost_usd WHERE reservation_id=?""",
+                (reservation_id,),
+            )
+            lifecycle = {
+                **metadata,
+                "budget_outcome": "dispatched_failure_unknown",
+                "usage_uncertain": True,
+                "charged_at_reserved_maximum": True,
+            }
+            connection.execute(
+                """INSERT INTO provider_usage (provider, occurred_at, request_count, resource_count,
+                   estimated_cost_usd, actual_cost_usd, metadata_json) VALUES (?, ?, ?, 0, ?, ?, ?)""",
+                (
+                    row["provider"], row["reserved_at"], row["reserved_requests"],
+                    row["reserved_cost_usd"], row["reserved_cost_usd"], self._dump(lifecycle),
+                ),
+            )

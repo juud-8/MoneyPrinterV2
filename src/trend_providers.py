@@ -127,6 +127,10 @@ class TrendProvider(Protocol):
         ...
 
 
+class ProviderNotDispatchedError(RuntimeError):
+    """A provider failure proven to have happened before external dispatch."""
+
+
 @dataclass
 class ProviderSettings:
     enabled: bool = False
@@ -571,9 +575,21 @@ class CollectionCoordinator:
             return ProviderResult(provider.name, [], [ProviderError(budget_error, messages[budget_error])], False, 0, 0, 0, None, now_text)
         try:
             result = provider.collect(request)
-        except Exception:
-            self.store.release_provider_budget(reservation_id)
+        except ProviderNotDispatchedError:
+            self.store.release_provider_budget(reservation_id, reason="provider_not_dispatched")
             raise
+        except Exception:
+            self.store.charge_uncertain_provider_budget(
+                reservation_id,
+                metadata={"error": "provider exception after dispatch status became uncertain"},
+            )
+            raise
+        if result.request_count == 0 and result.errors:
+            self.store.release_provider_budget(
+                reservation_id,
+                reason="provider_reported_not_dispatched",
+            )
+            return result
         self.store.reconcile_provider_budget(
             reservation_id,
             request_count=result.request_count,
@@ -581,6 +597,7 @@ class CollectionCoordinator:
             estimated_cost_usd=result.estimated_cost_usd,
             actual_cost_usd=result.actual_cost_usd,
             metadata={"errors": [error.code for error in result.errors]},
+            outcome="dispatched_failure" if result.errors else "dispatched_success",
         )
         if not result.errors and provider.cache_ttl_minutes > 0:
             expires = _iso(now + timedelta(minutes=provider.cache_ttl_minutes))
