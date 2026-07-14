@@ -2,6 +2,7 @@
 """Non-interactive Short generator for active or specified brand."""
 import os
 import sys
+from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
@@ -33,6 +34,10 @@ def main():
     do_upload = "--upload" in sys.argv
     episode = _parse_episode(sys.argv)
     topic = _parse_flag(sys.argv, "--topic")
+    trend_seed_id = _parse_flag(sys.argv, "--trend-seed")
+    if trend_seed_id and topic:
+        print("ERROR: --trend-seed and --topic are mutually exclusive")
+        sys.exit(2)
 
     from archived_brands import assert_brand_runnable, is_brand_archived
 
@@ -73,6 +78,18 @@ def main():
         account["niche"],
         account["language"],
     )
+    trend_store = None
+    trend_seed = None
+    if trend_seed_id:
+        from trend_store import TrendStore
+
+        trend_store = TrendStore()
+        trend_seed = trend_store.get_topic_seed(trend_seed_id)
+        if trend_seed is None:
+            print(f"ERROR: Unknown trend seed: {trend_seed_id}")
+            sys.exit(2)
+        youtube.use_topic_seed(trend_seed)
+        print(f"Trend seed: {trend_seed.seed_id} ({trend_seed.historical_event})")
     if episode:
         youtube.episode_number = episode
         print(f"Episode: {episode}")
@@ -81,6 +98,20 @@ def main():
         print(f"Topic: {youtube.subject}")
     tts = TTS()
     path = youtube.generate_video(tts, interactive=False)
+    if trend_seed is not None and trend_store is not None:
+        consumed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        trend_store.mark_seed_consumed(trend_seed.seed_id, youtube.run_id, consumed_at)
+        attribution = dict(youtube.production_metadata.get("trend_attribution") or {})
+        trend_store.save_attribution(
+            seed_id=trend_seed.seed_id,
+            opportunity_id=trend_seed.approval_record.opportunity_id,
+            brand_id=trend_seed.brand_id,
+            run_id=youtube.run_id,
+            detected_at=trend_seed.detected_at,
+            approved_at=trend_seed.approval_record.decided_at,
+            status="generated",
+            payload=attribution,
+        )
 
     print("\n=== GENERATION COMPLETE ===")
     saved = getattr(youtube, "output_video_path", None) or path
@@ -106,6 +137,20 @@ def main():
             print(f"UPLOAD: {'success' if ok else 'failed'}")
             if ok and getattr(youtube, "uploaded_video_url", None):
                 print(f"URL: {youtube.uploaded_video_url}")
+            if ok and trend_seed is not None and trend_store is not None:
+                attribution = dict(youtube.production_metadata.get("trend_attribution") or {})
+                trend_store.save_attribution(
+                    seed_id=trend_seed.seed_id,
+                    opportunity_id=trend_seed.approval_record.opportunity_id,
+                    brand_id=trend_seed.brand_id,
+                    run_id=youtube.run_id,
+                    youtube_video_id=attribution.get("youtube_video_id", ""),
+                    detected_at=trend_seed.detected_at,
+                    approved_at=trend_seed.approval_record.decided_at,
+                    publication_time=attribution.get("publication_time", ""),
+                    status="uploaded",
+                    payload=attribution,
+                )
         else:
             print("UPLOAD: skipped")
     else:

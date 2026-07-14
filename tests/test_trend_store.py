@@ -23,7 +23,7 @@ class TrendStoreTests(unittest.TestCase):
     def test_migration_is_repeatable(self):
         self.store.migrate()
         self.store.migrate()
-        self.assertEqual(self.store.schema_versions(), [1])
+        self.assertEqual(self.store.schema_versions(), [1, 2])
 
     def test_signal_round_trip(self):
         signal = TrendSignal.from_dict(

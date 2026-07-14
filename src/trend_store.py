@@ -13,7 +13,7 @@ from config import ROOT_DIR
 from trend_models import ApprovalRecord, TopicSeed, TrendCluster, TrendOpportunity, TrendSignal
 
 
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 2
 
 
 def default_store_path() -> str:
@@ -128,6 +128,29 @@ class TrendStore:
                     """
                 )
                 connection.execute("INSERT INTO schema_migrations(version) VALUES (1)")
+            if 2 not in applied:
+                connection.executescript(
+                    """
+                    CREATE TABLE trend_attribution (
+                        attribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        seed_id TEXT NOT NULL,
+                        opportunity_id TEXT NOT NULL,
+                        brand_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL DEFAULT '',
+                        youtube_video_id TEXT NOT NULL DEFAULT '',
+                        detected_at TEXT NOT NULL,
+                        approved_at TEXT NOT NULL,
+                        publication_time TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        FOREIGN KEY(seed_id) REFERENCES topic_seeds(seed_id),
+                        FOREIGN KEY(opportunity_id) REFERENCES trend_opportunities(opportunity_id)
+                    );
+                    CREATE INDEX idx_trend_attribution_brand_time
+                        ON trend_attribution(brand_id, publication_time, approved_at);
+                    """
+                )
+                connection.execute("INSERT INTO schema_migrations(version) VALUES (2)")
 
     @staticmethod
     def _dump(payload: dict) -> str:
@@ -247,6 +270,51 @@ class TrendStore:
             connection.execute(
                 "UPDATE topic_seeds SET run_id = ?, consumed_at = ? WHERE seed_id = ?",
                 (run_id, consumed_at, seed_id),
+            )
+
+    def count_approved_since(self, brand_id: str, since: str) -> int:
+        self.migrate()
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS count FROM trend_approvals
+                   WHERE brand_id = ? AND status = 'approved' AND decided_at >= ?""",
+                (brand_id, since),
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def save_attribution(
+        self,
+        *,
+        seed_id: str,
+        opportunity_id: str,
+        brand_id: str,
+        detected_at: str,
+        approved_at: str,
+        status: str,
+        payload: dict,
+        run_id: str = "",
+        youtube_video_id: str = "",
+        publication_time: str = "",
+    ) -> None:
+        self.migrate()
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO trend_attribution
+                   (seed_id, opportunity_id, brand_id, run_id, youtube_video_id,
+                    detected_at, approved_at, publication_time, status, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    seed_id,
+                    opportunity_id,
+                    brand_id,
+                    run_id,
+                    youtube_video_id,
+                    detected_at,
+                    approved_at,
+                    publication_time,
+                    status,
+                    self._dump(payload),
+                ),
             )
 
     def schema_versions(self) -> list[int]:

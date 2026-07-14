@@ -68,7 +68,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import ElementClickInterceptedException
 from moviepy.video.tools.subtitles import SubtitlesClip
 from webdriver_manager.firefox import GeckoDriverManager
-from datetime import datetime
+from datetime import datetime, timezone
 
 # MoviePy 2.x uses IMAGEMAGICK_BINARY env var (no change_settings API)
 os.environ["IMAGEMAGICK_BINARY"] = get_imagemagick_path()
@@ -126,6 +126,7 @@ class YouTube:
         self.research_brief_path = ""
         self.experiment_metadata = {}
         self.production_metadata = {}
+        self.topic_seed = None
         self.last_upload_error = None
         self.chapters = []
 
@@ -161,6 +162,16 @@ class YouTube:
             except Exception:
                 pass
             self.browser = None
+
+    def use_topic_seed(self, seed) -> None:
+        """Attach an approved seed without bypassing normal topic/research gates."""
+        from trend_models import TopicSeed
+        from trend_pipeline import validate_topic_seed_for_brand
+
+        if not isinstance(seed, TopicSeed):
+            raise ValueError("use_topic_seed requires a validated TopicSeed")
+        validate_topic_seed_for_brand(seed, load_active_brand() or {})
+        self.topic_seed = seed
 
     @property
     def niche(self) -> str:
@@ -277,6 +288,10 @@ class YouTube:
                 self._research_rejected_topics = rejected
                 self.generate_topic()
                 self.generate_research()
+                if getattr(self, "topic_seed", None) is not None:
+                    from trend_pipeline import validate_topic_seed_research
+
+                    validate_topic_seed_research(self.topic_seed, self.research_brief)
                 return
             except RuntimeError as error:
                 last_error = error
@@ -315,6 +330,26 @@ class YouTube:
         Returns:
             topic (str): The generated topic.
         """
+        if getattr(self, "topic_seed", None) is not None:
+            from trend_pipeline import validate_seed_duplicate, validate_topic_seed_for_brand
+
+            active_brand = load_active_brand() or {}
+            validate_topic_seed_for_brand(self.topic_seed, active_brand)
+            try:
+                validate_seed_duplicate(self.topic_seed, recent_topic_labels(active_brand))
+            except ValueError:
+                log_topic_rejection(
+                    candidate=self.topic_seed.historical_event,
+                    matched="trend_seed_duplicate_gate",
+                    similarity=1.0,
+                    brand_id=self.topic_seed.brand_id,
+                )
+                raise
+            self.subject = self.topic_seed.historical_event
+            if get_verbose():
+                info(f" => Using approved trend seed: {self.subject}")
+            return self.subject
+
         preset = (getattr(self, "subject", None) or "").strip()
         if preset:
             self.subject = preset
@@ -1253,6 +1288,7 @@ Return ONLY the prompt sentence.""",
                     "words): cut setup beats and adjectives, keep the punchline."
                 )
             )
+            self._validate_trend_script()
             self.generate_metadata()
             self.generate_script_to_speech(tts_instance)
             self.production_metadata["tts_provider"] = getattr(
@@ -1278,6 +1314,13 @@ Return ONLY the prompt sentence.""",
                 "uploading an over-length Short."
             )
 
+    def _validate_trend_script(self) -> None:
+        seed = getattr(self, "topic_seed", None)
+        if seed is not None:
+            from trend_pipeline import validate_topic_seed_script
+
+            validate_topic_seed_script(seed, getattr(self, "script", ""))
+
     def _generate_pipeline(self, tts_instance: TTS, interactive: bool = True) -> str:
         """Shared generation pipeline for short and long-form."""
         self.run_id = str(uuid4())
@@ -1289,9 +1332,19 @@ Return ONLY the prompt sentence.""",
         self.research_brief_path = ""
         self.production_metadata = {}
         self._research_rejected_topics = []
+        if getattr(self, "topic_seed", None) is not None:
+            self.production_metadata["trend_attribution"] = {
+                **self.topic_seed.attribution_metadata,
+                "seed_id": self.topic_seed.seed_id,
+                "detected_at": self.topic_seed.detected_at,
+                "approved_at": self.topic_seed.approval_record.decided_at,
+                "run_id": self.run_id,
+                "status": "generating",
+            }
 
         self._generate_topic_and_research(max_attempts=3)
         self.generate_script()
+        self._validate_trend_script()
         self.generate_metadata()
         self.generate_prompts()
 
@@ -1342,6 +1395,7 @@ Return ONLY the prompt sentence.""",
                     f"(target {self._short_target_duration():.0f}s). Regenerating longer script..."
                 )
                 self.generate_script()
+                self._validate_trend_script()
                 self.generate_metadata()
                 self.generate_script_to_speech(tts_instance)
                 self.production_metadata["tts_provider"] = getattr(
@@ -1366,6 +1420,8 @@ Return ONLY the prompt sentence.""",
 
         path = self.combine()
         self.video_path = os.path.abspath(path)
+        if "trend_attribution" in self.production_metadata:
+            self.production_metadata["trend_attribution"]["status"] = "generated"
 
         brand = load_active_brand()
         brand_id = brand.get("brand_id", "default")
@@ -1937,6 +1993,23 @@ Return ONLY the prompt sentence.""",
 
             url = build_url(uploaded_video_id) if uploaded_video_id else ""
             self.uploaded_video_url = url
+            trend_attribution = self.production_metadata.get("trend_attribution")
+            if trend_attribution is not None:
+                published_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                detected_at = datetime.fromisoformat(
+                    trend_attribution["detected_at"].replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+                trend_attribution.update(
+                    {
+                        "status": "uploaded",
+                        "youtube_video_id": uploaded_video_id or "",
+                        "publication_time": published_at,
+                        "trend_age_at_publication_hours": round(
+                            (datetime.now(timezone.utc) - detected_at).total_seconds() / 3600,
+                            2,
+                        ),
+                    }
+                )
 
             upload_brand = load_active_brand()
             log_video(
