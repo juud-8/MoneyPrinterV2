@@ -129,6 +129,8 @@ class TrendStore:
                 )
                 connection.execute("INSERT INTO schema_migrations(version) VALUES (1)")
             if 2 not in applied:
+                if 1 in applied:
+                    self._backup_before_migration(connection, 1)
                 connection.executescript(
                     """
                     CREATE TABLE trend_attribution (
@@ -151,6 +153,18 @@ class TrendStore:
                     """
                 )
                 connection.execute("INSERT INTO schema_migrations(version) VALUES (2)")
+
+    def _backup_before_migration(self, connection: sqlite3.Connection, version: int) -> str:
+        """Create one non-destructive SQLite backup before upgrading persisted data."""
+        backup_path = f"{self.path}.v{version}.bak"
+        if os.path.exists(backup_path):
+            return backup_path
+        destination = sqlite3.connect(backup_path)
+        try:
+            connection.backup(destination)
+        finally:
+            destination.close()
+        return backup_path
 
     @staticmethod
     def _dump(payload: dict) -> str:
@@ -198,14 +212,31 @@ class TrendStore:
         payload = self._load(row)
         return TrendCluster.from_dict(payload) if payload else None
 
+    def list_clusters(self) -> list[TrendCluster]:
+        self.migrate()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM trend_clusters ORDER BY last_seen DESC"
+            )
+            return [TrendCluster.from_dict(json.loads(row["payload_json"])) for row in rows]
+
     def save_opportunity(self, opportunity: TrendOpportunity) -> None:
         self.migrate()
         with self.connect() as connection:
             connection.execute(
-                """INSERT OR REPLACE INTO trend_opportunities
+                """INSERT INTO trend_opportunities
                    (opportunity_id, brand_id, cluster_id, recommended_action, eligible,
                     opportunity_score, expires_at, status, payload_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(opportunity_id) DO UPDATE SET
+                     brand_id=excluded.brand_id,
+                     cluster_id=excluded.cluster_id,
+                     recommended_action=excluded.recommended_action,
+                     eligible=excluded.eligible,
+                     opportunity_score=excluded.opportunity_score,
+                     expires_at=excluded.expires_at,
+                     status=excluded.status,
+                     payload_json=excluded.payload_json""",
                 (
                     opportunity.opportunity_id,
                     opportunity.brand_id,
@@ -218,6 +249,49 @@ class TrendStore:
                     self._dump(opportunity.to_dict()),
                 ),
             )
+
+    def save_decision(
+        self,
+        opportunity: TrendOpportunity,
+        approval: ApprovalRecord,
+        seed: TopicSeed | None = None,
+    ) -> None:
+        """Persist a decision and optional seed atomically."""
+        self.migrate()
+        with self.connect() as connection:
+            updated = connection.execute(
+                """UPDATE trend_opportunities SET status = ?, payload_json = ?
+                   WHERE opportunity_id = ?""",
+                (opportunity.status.value, self._dump(opportunity.to_dict()), opportunity.opportunity_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"unknown opportunity: {opportunity.opportunity_id}")
+            connection.execute(
+                """INSERT INTO trend_approvals
+                   (approval_id, opportunity_id, brand_id, status, decided_at, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    approval.approval_id,
+                    approval.opportunity_id,
+                    approval.brand_id,
+                    approval.status.value,
+                    approval.decided_at,
+                    self._dump(approval.to_dict()),
+                ),
+            )
+            if seed is not None:
+                connection.execute(
+                    """INSERT INTO topic_seeds
+                       (seed_id, opportunity_id, brand_id, created_at, payload_json)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        seed.seed_id,
+                        opportunity.opportunity_id,
+                        seed.brand_id,
+                        seed.created_at,
+                        self._dump(seed.to_dict()),
+                    ),
+                )
 
     def get_opportunity(self, opportunity_id: str) -> TrendOpportunity | None:
         self.migrate()

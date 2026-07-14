@@ -121,3 +121,7 @@ export POST_BRIDGE_API_KEY="your_post_bridge_api_key_here"
 ```
 
 See [PostBridge.md](./PostBridge.md) for the full Post Bridge setup and behavior details.
+
+## Trend intelligence
+
+Trend intelligence is configured per brand under `production.trend_strategy` and is disabled by default. Provider enablement, scoring gates, content-mix limits, offline fixture commands, and rollback steps are documented in [Trend_Intelligence.md](./Trend_Intelligence.md). Credentials remain in `config.json` or environment variables; never place them in a brand manifest.

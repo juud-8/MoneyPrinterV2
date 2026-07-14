@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import sqlite3
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 SRC = os.path.join(ROOT, "src")
@@ -40,6 +41,21 @@ class TrendStoreTests(unittest.TestCase):
         restored = self.store.list_signals("manual")
         self.assertEqual(len(restored), 1)
         self.assertEqual(restored[0].signal_id, signal.signal_id)
+
+    def test_existing_v1_database_is_backed_up_before_migration(self):
+        path = os.path.join(self.tmp.name, "legacy.sqlite3")
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT);
+            INSERT INTO schema_migrations(version, applied_at) VALUES (1, CURRENT_TIMESTAMP);
+            """
+        )
+        connection.close()
+        legacy = TrendStore(path)
+        legacy.migrate()
+        self.assertTrue(os.path.isfile(path + ".v1.bak"))
+        self.assertEqual(legacy.schema_versions(), [1, 2])
 
 
 if __name__ == "__main__":

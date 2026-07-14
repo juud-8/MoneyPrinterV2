@@ -67,6 +67,8 @@ python src/main.py
 
 All relevant documents can be found [here](docs/).
 
+- [Trend-to-Archive MVP operator guide](docs/Trend_Intelligence.md)
+
 ## Scripts
 
 For easier usage, there are some scripts in the `scripts` directory that can be used to directly access the core functionality of MPV2 without the need for user interaction.

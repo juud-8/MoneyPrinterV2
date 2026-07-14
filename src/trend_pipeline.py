@@ -210,9 +210,9 @@ def approve_opportunity(
         }
     )
     seed = create_topic_seed(opportunity, approval)
-    store.save_approval(approval)
-    store.save_topic_seed(seed, opportunity.opportunity_id)
-    store.save_opportunity(replace(opportunity, status=ApprovalStatus.APPROVED))
+    store.save_decision(
+        replace(opportunity, status=ApprovalStatus.APPROVED), approval, seed
+    )
     return approval, seed, mix
 
 
@@ -240,8 +240,7 @@ def reject_opportunity(
             "reason": reason,
         }
     )
-    store.save_approval(approval)
-    store.save_opportunity(replace(opportunity, status=ApprovalStatus.REJECTED))
+    store.save_decision(replace(opportunity, status=ApprovalStatus.REJECTED), approval)
     return approval
 
 
