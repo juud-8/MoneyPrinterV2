@@ -27,9 +27,30 @@ from brand_switcher import list_brands, load_brand
 from performance_insights import get_insights_summary
 from youtube_metrics import get_latest_channel_snapshots
 
-app = Flask(__name__, template_folder=os.path.join(SRC_DIR, "templates"))
+app = Flask(
+    __name__,
+    template_folder=os.path.join(SRC_DIR, "templates"),
+    static_folder=os.path.join(SRC_DIR, "static"),
+    static_url_path="/static",
+)
 
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _parse_days_arg(raw: str | None) -> int | None:
+    """Parse ?days= for overview. 'all' / 0 → None (all-time). Default 7."""
+    if raw is None or raw == "":
+        return 7
+    text = str(raw).strip().lower()
+    if text in ("all", "0", "none"):
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return 7
+    if value <= 0:
+        return None
+    return min(value, 3650)
 
 
 @app.get("/")
@@ -39,7 +60,7 @@ def index():
 
 @app.get("/api/overview")
 def api_overview():
-    days = int(request.args.get("days", 7))
+    days = _parse_days_arg(request.args.get("days"))
     data = get_dashboard_data(days=days)
     data["channel_snapshots"] = get_latest_channel_snapshots()
     data["insights"] = {

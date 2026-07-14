@@ -22,7 +22,13 @@ from analytics import (
     log_topic_rejection,
 )
 from brand_switcher import get_production_setting, load_active_brand
+from channel_branding import get_publishing_config
 from content_styles import get_content_style, resolve_style_name, DEFAULT_SCRIPT_RULES
+from youtube_upload_flow import (
+    radio_matches_visibility,
+    resolve_upload_visibility,
+    visibility_radios_present,
+)
 from topic_scoring import pick_best
 from content_strategy import (
     build_topic_strategy_block,
@@ -243,6 +249,65 @@ class YouTube:
             info(f" => Research notes:\n{notes[:300]}...")
         return notes
 
+    @staticmethod
+    def _is_retryable_research_error(error: BaseException) -> bool:
+        """True when a fresh topic may succeed (thin sources / quality gate)."""
+        message = str(error)
+        return (
+            "Grounded research found only" in message
+            or "Research quality gate failed" in message
+        )
+
+    def _generate_topic_and_research(self, max_attempts: int = 3) -> None:
+        """Pick a topic and ground it; retry with a new topic if research fails.
+
+        Preset subjects (self.subject already set) are attempted once — we never
+        silently replace an operator-supplied topic.
+        """
+        preset = (getattr(self, "subject", None) or "").strip()
+        attempts = 1 if preset else max(1, int(max_attempts))
+        rejected: list[str] = list(getattr(self, "_research_rejected_topics", []) or [])
+        last_error: BaseException | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                if not preset:
+                    # Clear so generate_topic() rolls a new candidate.
+                    self.subject = ""
+                self._research_rejected_topics = rejected
+                self.generate_topic()
+                self.generate_research()
+                return
+            except RuntimeError as error:
+                last_error = error
+                if preset or not self._is_retryable_research_error(error):
+                    raise
+                failed_topic = (getattr(self, "subject", None) or "").strip()
+                if failed_topic and failed_topic not in rejected:
+                    rejected.append(failed_topic)
+                    active_brand = load_active_brand() or {}
+                    log_topic_rejection(
+                        candidate=failed_topic,
+                        matched="research_gate",
+                        similarity=0.0,
+                        brand_id=active_brand.get("brand_id", ""),
+                    )
+                warning(
+                    f"Topic research failed (attempt {attempt}/{attempts}): {error}"
+                )
+                if attempt < attempts:
+                    info(" => Picking a different topic and retrying research...")
+                    self.subject = ""
+                    self.research_notes = ""
+                    self.research_brief = {}
+                    self.research_brief_path = ""
+
+        assert last_error is not None
+        raise RuntimeError(
+            f"Exhausted {attempts} topic attempts without grounded research. "
+            f"Last error: {last_error}"
+        ) from last_error
+
     def generate_topic(self) -> str:
         """
         Generates a topic based on the YouTube Channel niche.
@@ -275,6 +340,17 @@ class YouTube:
         strategy_block = build_topic_strategy_block(active_brand)
         if strategy_block:
             prompt += "\n\n" + strategy_block
+
+        rejected = [
+            t for t in (getattr(self, "_research_rejected_topics", None) or []) if t
+        ]
+        if rejected:
+            blocked = "\n".join(f"- {t}" for t in rejected[-5:])
+            prompt += (
+                "\n\nDo NOT reuse any of these rejected topics (research could not "
+                "verify them). Pick a completely different historical incident:\n"
+                f"{blocked}"
+            )
 
         # Steer topics toward what actually performed once the brand has
         # enough tracked view data (see performance_insights.py). Empty
@@ -1212,9 +1288,9 @@ Return ONLY the prompt sentence.""",
         self.research_brief = {}
         self.research_brief_path = ""
         self.production_metadata = {}
+        self._research_rejected_topics = []
 
-        self.generate_topic()
-        self.generate_research()
+        self._generate_topic_and_research(max_attempts=3)
         self.generate_script()
         self.generate_metadata()
         self.generate_prompts()
@@ -1554,6 +1630,148 @@ Return ONLY the prompt sentence.""",
         element.send_keys(Keys.BACKSPACE)
         element.send_keys(text)
 
+    def _collect_radio_label_texts(self, driver) -> list[str]:
+        labels = driver.find_elements(By.XPATH, YOUTUBE_RADIO_BUTTON_XPATH)
+        texts = []
+        for el in labels:
+            text = (el.text or "").strip()
+            if not text:
+                text = (el.get_attribute("aria-label") or "").strip()
+            texts.append(text)
+        return texts
+
+    def _on_visibility_step(self, driver) -> bool:
+        return visibility_radios_present(self._collect_radio_label_texts(driver))
+
+    def _advance_to_visibility_step(
+        self, driver, wait: WebDriverWait, max_clicks: int = 8
+    ) -> None:
+        """Click Next until Private/Unlisted/Public radios are visible.
+
+        Studio insert steps vary (Video elements / Checks). Blindly clicking
+        Next three times often lands Done on the wrong step and saves a Draft.
+        """
+        for _ in range(max_clicks):
+            if self._on_visibility_step(driver):
+                return
+            try:
+                next_button = wait.until(
+                    EC.presence_of_element_located((By.ID, YOUTUBE_NEXT_BUTTON_ID))
+                )
+            except Exception:
+                time.sleep(2)
+                continue
+            aria_disabled = (next_button.get_attribute("aria-disabled") or "").lower()
+            if aria_disabled == "true" or not next_button.is_enabled():
+                # Checks still running — wait and retry rather than force Done.
+                time.sleep(2.5)
+                continue
+            try:
+                next_button.click()
+            except ElementClickInterceptedException:
+                self._dismiss_youtube_overlays(driver)
+                time.sleep(0.5)
+                next_button.click()
+            time.sleep(1.5)
+
+        if not self._on_visibility_step(driver):
+            raise RuntimeError(
+                "Could not reach YouTube Studio visibility step "
+                "(Private/Unlisted/Public). Upload aborted to avoid leaving a Draft."
+            )
+
+    def _set_visibility(self, driver, visibility: str) -> None:
+        """Click the visibility radio by label text (not brittle index)."""
+        target = resolve_upload_visibility({"default_visibility": visibility})
+        labels = driver.find_elements(By.XPATH, YOUTUBE_RADIO_BUTTON_XPATH)
+        for el in labels:
+            text = (el.text or "").strip()
+            aria = (el.get_attribute("aria-label") or "").strip()
+            name = (el.get_attribute("name") or "").strip()
+            haystack = f"{text} {aria} {name}"
+            if radio_matches_visibility(haystack, target):
+                try:
+                    el.click()
+                except ElementClickInterceptedException:
+                    driver.execute_script("arguments[0].click();", el)
+                time.sleep(0.5)
+                return
+
+        # Fallback: paper-radio name attributes used by some Studio builds.
+        for name_attr in (target.upper(), target.lower(), target.capitalize()):
+            found = driver.find_elements(By.NAME, name_attr)
+            if found:
+                try:
+                    found[0].click()
+                except ElementClickInterceptedException:
+                    driver.execute_script("arguments[0].click();", found[0])
+                time.sleep(0.5)
+                return
+
+        raise RuntimeError(
+            f"Could not find YouTube visibility radio for {target!r}. "
+            "Studio UI may have changed — refusing to click a wrong index."
+        )
+
+    def _wait_for_done_enabled(self, driver, timeout: float = 180) -> None:
+        """Wait until Done/Publish is clickable (Checks may block it)."""
+
+        def _enabled(d):
+            buttons = d.find_elements(By.ID, YOUTUBE_DONE_BUTTON_ID)
+            if not buttons:
+                return False
+            btn = buttons[0]
+            aria_disabled = (btn.get_attribute("aria-disabled") or "").lower()
+            if aria_disabled == "true":
+                return False
+            try:
+                return btn.is_enabled() and btn.is_displayed()
+            except Exception:
+                return False
+
+        WebDriverWait(driver, timeout).until(_enabled)
+
+    def _click_done_and_confirm(self, driver) -> None:
+        """Click Done/Publish and dismiss common secondary confirmations."""
+        done_button = driver.find_element(By.ID, YOUTUBE_DONE_BUTTON_ID)
+        try:
+            done_button.click()
+        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].click();", done_button)
+
+        time.sleep(2)
+        # Public visibility sometimes shows an extra "Publish" confirm sheet.
+        confirm_xpaths = [
+            "//ytcp-button[@id='publish-button']",
+            "//*[@id='publish-button']",
+            "//*[self::button or @role='button'][normalize-space()='Publish']",
+        ]
+        for xpath in confirm_xpaths:
+            for el in driver.find_elements(By.XPATH, xpath):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    el.click()
+                    time.sleep(1)
+                    return
+                except Exception:
+                    continue
+
+    def _upload_dialog_looks_published(self, driver) -> bool:
+        """True when post-Done success copy is visible (not just the draft link)."""
+        phrases = (
+            "video published",
+            "video is being processed",
+            "finished processing",
+            "checks complete",
+            "your video is live",
+        )
+        try:
+            body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+        except Exception:
+            body = ""
+        return any(phrase in body for phrase in phrases)
+
     def upload_video(self) -> bool:
         """
         Uploads the video to YouTube.
@@ -1652,71 +1870,72 @@ Return ONLY the prompt sentence.""",
             )
             self._set_ai_disclosure(driver, bool(disclose_ai))
 
-            # Click next
+            visibility = resolve_upload_visibility(get_publishing_config())
             if verbose:
-                info("\t=> Clicking next...")
-
-            next_button = driver.find_element(By.ID, YOUTUBE_NEXT_BUTTON_ID)
-            next_button.click()
-
-            # Click next again
-            if verbose:
-                info("\t=> Clicking next again...")
-            next_button = driver.find_element(By.ID, YOUTUBE_NEXT_BUTTON_ID)
-            next_button.click()
-
-            # Wait for 2 seconds
-            time.sleep(2)
-
-            # Click next again
-            if verbose:
-                info("\t=> Clicking next again...")
-            next_button = driver.find_element(By.ID, YOUTUBE_NEXT_BUTTON_ID)
-            next_button.click()
-
-            # Set as unlisted
-            if verbose:
-                info("\t=> Setting as unlisted...")
-
-            radio_button = self._require_elements(
-                driver,
-                By.XPATH,
-                YOUTUBE_RADIO_BUTTON_XPATH,
-                minimum=3,
-                context="visibility radio buttons (private/unlisted/public)",
-            )
-            radio_button[2].click()
+                info(f"\t=> Advancing to visibility step (target: {visibility})...")
+            self._advance_to_visibility_step(driver, wait)
 
             if verbose:
-                info("\t=> Clicking done button...")
+                info(f"\t=> Setting visibility to {visibility}...")
+            self._set_visibility(driver, visibility)
 
-            # Click done button
-            done_button = driver.find_element(By.ID, YOUTUBE_DONE_BUTTON_ID)
-            done_button.click()
+            if verbose:
+                info("\t=> Waiting for Done/Publish to become enabled...")
+            self._wait_for_done_enabled(driver, timeout=180)
 
-            # Wait for 2 seconds
-            time.sleep(2)
+            if verbose:
+                info("\t=> Clicking done/publish button...")
+            self._click_done_and_confirm(driver)
 
             if verbose:
                 info("\t=> Getting video URL...")
 
-            # Last chance to read the dialog link if the earlier capture
-            # missed it (e.g. the link renders late on slow uploads).
-            if not uploaded_video_id:
+            # Prefer dialog link; give Studio time to finish the publish dialog
+            # so we do not close Firefox while the upload is still a Draft.
+            deadline = time.time() + 45
+            while time.time() < deadline and not uploaded_video_id:
                 uploaded_video_id = self._capture_upload_dialog_video_id(driver)
+                if uploaded_video_id:
+                    break
+                time.sleep(1.5)
 
-            if not uploaded_video_id:
-                # Fallback: scan the Studio video list, but only trust a row
-                # whose title matches this upload — the top row can still be
-                # an older video while the new one is processing.
-                driver.get(
-                    f"https://studio.youtube.com/channel/{self.channel_id}/videos/short"
+            publish_ok = self._upload_dialog_looks_published(driver)
+
+            # Always verify against the Shorts list when possible. Drafts get
+            # video IDs too, so a dialog link alone is not proof of publish.
+            list_video_id = ""
+            for attempt in range(4):
+                try:
+                    driver.get(
+                        f"https://studio.youtube.com/channel/{self.channel_id}/videos/short"
+                    )
+                    time.sleep(3)
+                    list_video_id = self._find_uploaded_video_id_in_list(driver) or ""
+                except Exception as list_err:
+                    warning(f"Studio Shorts list verification attempt failed: {list_err}")
+                    list_video_id = ""
+                if list_video_id:
+                    break
+                if attempt < 3:
+                    time.sleep(5)
+
+            if list_video_id:
+                uploaded_video_id = list_video_id
+                publish_ok = True
+            elif not publish_ok:
+                raise RuntimeError(
+                    "Upload wizard finished but the video was not found in Studio "
+                    "Shorts — it was likely left as a Draft. Open YouTube Studio → "
+                    "Content → Drafts, set visibility, publish, then backfill the "
+                    "URL in .mp/analytics.json."
                 )
-                time.sleep(2)
-                uploaded_video_id = self._find_uploaded_video_id_in_list(driver)
+            elif not uploaded_video_id:
+                warning(
+                    "Publish UI looked OK but no video id was captured; logging "
+                    "upload without a URL. Repair analytics after confirming in Studio."
+                )
 
             url = build_url(uploaded_video_id) if uploaded_video_id else ""
-
             self.uploaded_video_url = url
 
             upload_brand = load_active_brand()

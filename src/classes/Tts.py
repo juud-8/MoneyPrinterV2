@@ -15,6 +15,7 @@ from config import (
     get_tts_provider,
     get_tts_voice,
 )
+from brand_switcher import get_production_setting
 from status import warning
 
 KITTEN_MODEL = "KittenML/kitten-tts-mini-0.8"
@@ -108,6 +109,22 @@ class TTS:
         self.last_model_used = KITTEN_MODEL
         return output_file
 
+    def _allow_kitten_fallback(self) -> bool:
+        if os.environ.get("MPV2_ALLOW_KITTEN_TTS_FALLBACK", "").strip() == "1":
+            return True
+        if bool(get_production_setting("pilot_mode", False)):
+            return False
+        return True
+
+    def _fallback_to_kitten(self, provider: str, error: Exception, output_file: str, text: str) -> str:
+        if not self._allow_kitten_fallback():
+            raise RuntimeError(
+                f"{provider} synthesis failed during pilot mode and KittenTTS fallback is "
+                f"disabled to protect the brand voice: {error}"
+            ) from error
+        warning(f"{provider} failed ({error}); falling back to KittenTTS.")
+        return self._synthesize_kitten(text, output_file)
+
     def synthesize(self, text, output_file=os.path.join(ROOT_DIR, ".mp", "audio.wav")):
         if self._provider == "fishaudio":
             try:
@@ -118,14 +135,11 @@ class TTS:
                     try:
                         return self._synthesize_elevenlabs(text, output_file)
                     except Exception as e2:
-                        warning(f"ElevenLabs failed ({e2}); falling back to KittenTTS.")
-                        return self._synthesize_kitten(text, output_file)
-                warning(f"Fish Audio failed ({e}); falling back to KittenTTS.")
-                return self._synthesize_kitten(text, output_file)
+                        return self._fallback_to_kitten("ElevenLabs", e2, output_file, text)
+                return self._fallback_to_kitten("Fish Audio", e, output_file, text)
         if self._provider == "elevenlabs":
             try:
                 return self._synthesize_elevenlabs(text, output_file)
             except Exception as e:
-                warning(f"ElevenLabs failed ({e}); falling back to KittenTTS.")
-                return self._synthesize_kitten(text, output_file)
+                return self._fallback_to_kitten("ElevenLabs", e, output_file, text)
         return self._synthesize_kitten(text, output_file)
