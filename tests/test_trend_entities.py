@@ -54,6 +54,24 @@ class EntityTests(unittest.TestCase):
         cluster = cluster_signals(signals, now="2026-07-13T13:00:00Z")[0]
         self.assertEqual(cluster.cross_source_count, 2)
 
+    def test_reliable_multilingual_alias(self):
+        canonical, competing = resolve_entity(signal("Bisonte americano", "bisonte americano"))
+        self.assertEqual(canonical, "american bison")
+        self.assertEqual(competing, [])
+
+    def test_provider_disagreement_is_explicit(self):
+        left = signal("dance", "dance", provider="x")
+        right = signal("dance", "dance", provider="gdelt")
+        left_payload = left.to_dict()
+        right_payload = right.to_dict()
+        left_payload["velocity"] = 95
+        right_payload["velocity"] = 15
+        cluster = cluster_signals(
+            [TrendSignal.from_dict(left_payload), TrendSignal.from_dict(right_payload)],
+            now="2026-07-13T13:00:00Z",
+        )[0]
+        self.assertIn("provider velocity signals materially disagree", cluster.unknowns)
+
 
 if __name__ == "__main__":
     unittest.main()

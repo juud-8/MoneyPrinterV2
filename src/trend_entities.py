@@ -11,7 +11,13 @@ from trend_models import TrendCluster, TrendSignal, new_id
 
 
 KNOWN_ALIASES = {
-    "american bison": {"american bison", "bison", "buffalo"},
+    "american bison": {
+        "american bison",
+        "bison",
+        "buffalo",
+        "bisonte americano",
+        "bison d'amérique",
+    },
     "dance": {"dance", "dancing", "dance challenge"},
 }
 
@@ -86,6 +92,10 @@ def cluster_signals(signals: list[TrendSignal], now: str | None = None) -> list[
         if interpretations:
             unknowns.append("entity interpretation is ambiguous")
         confidence = min(1.0, 0.25 + 0.2 * len(providers) + 0.1 * sum(value is not None for value in (velocity, search_score, news_score)))
+        known_velocities = [float(signal.velocity) for signal in group_signals if signal.velocity is not None]
+        if len(known_velocities) >= 2 and max(known_velocities) - min(known_velocities) >= 50:
+            unknowns.append("provider velocity signals materially disagree")
+            confidence = max(0.0, confidence - 0.2)
         clusters.append(
             TrendCluster.from_dict(
                 {

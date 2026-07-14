@@ -17,6 +17,19 @@ from uuid import uuid4
 
 SCHEMA_VERSION = 1
 
+ALLOWED_RISK_FLAGS = {
+    "active_tragedy",
+    "living_person_allegation",
+    "exploitative_victims",
+    "unverified_breaking_claim",
+    "dangerous_misinformation",
+    "copyright_dependent",
+    "outside_brand_policy",
+    "suspected_manipulation",
+    "insufficient_lifetime",
+    "forced_connection",
+}
+
 
 class ValidationError(ValueError):
     """Raised when an external or generated payload violates its contract."""
@@ -429,6 +442,10 @@ class ArchiveBridge:
         supporting = _urls(data.get("supporting_sources"), "supporting_sources")
         current_sources = _urls(data.get("current_news_sources"), "current_news_sources")
         historical_sources = _urls(data.get("historical_sources"), "historical_sources")
+        risk_flags = _string_list(data.get("risk_flags"), "risk_flags")
+        invalid_flags = sorted(set(risk_flags) - ALLOWED_RISK_FLAGS)
+        if invalid_flags:
+            raise ValidationError(f"unknown risk flags: {', '.join(invalid_flags)}")
         return cls(
             bridge_id=_text(data.get("bridge_id")) or new_id("bridge"),
             trend_cluster_id=_require_text(data.get("trend_cluster_id"), "trend_cluster_id"),
@@ -448,7 +465,7 @@ class ArchiveBridge:
             visual_potential_score=optional_score("visual_potential_score"),
             competition_score=optional_score("competition_score"),
             duplicate_similarity=optional_score("duplicate_similarity"),
-            risk_flags=_string_list(data.get("risk_flags"), "risk_flags"),
+            risk_flags=risk_flags,
             supporting_sources=supporting,
             current_news_sources=current_sources or supporting,
             historical_sources=historical_sources,
