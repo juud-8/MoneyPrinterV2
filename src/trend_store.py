@@ -32,8 +32,8 @@ class TrendStore:
         os.makedirs(folder, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 10000")
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
         try:
             yield connection
             connection.commit()
@@ -47,13 +47,22 @@ class TrendStore:
         """Apply and verify migrations under one serialized SQLite transaction."""
         folder = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(folder, exist_ok=True)
-        self._backup_legacy_v1_if_needed()
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA journal_mode = WAL")
         try:
-            connection.execute("BEGIN EXCLUSIVE")
+            # A reserved writer lock serializes backup and migration while still
+            # allowing the read connection used by sqlite3.Connection.backup().
+            connection.execute("BEGIN IMMEDIATE")
+            source_version, has_existing_data = self._source_schema_version(connection)
+            if source_version > LATEST_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"database schema version {source_version} is newer than supported version {LATEST_SCHEMA_VERSION}"
+                )
+            if has_existing_data and source_version < LATEST_SCHEMA_VERSION:
+                self._create_upgrade_backup(source_version, LATEST_SCHEMA_VERSION)
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
             )
@@ -87,28 +96,59 @@ class TrendStore:
         finally:
             connection.close()
 
-    def _backup_legacy_v1_if_needed(self) -> None:
-        """Back up a recorded v1 database before applying later migrations."""
-        backup_path = f"{self.path}.v1.bak"
-        if not os.path.isfile(self.path) or os.path.exists(backup_path):
-            return
+    @staticmethod
+    def _source_schema_version(connection: sqlite3.Connection) -> tuple[int, bool]:
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if not tables:
+            return 0, False
+        if "schema_migrations" not in tables:
+            return 0, True
+        try:
+            versions = [int(row[0]) for row in connection.execute("SELECT version FROM schema_migrations")]
+        except sqlite3.DatabaseError as error:
+            raise RuntimeError("cannot read schema_migrations; explicit database repair is required") from error
+        return (max(versions) if versions else 0), True
+
+    def _create_upgrade_backup(self, source_version: int, target_version: int) -> str:
+        """Create, verify, and atomically publish a unique pre-upgrade backup."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = f"{self.path}.pre-v{source_version}-to-v{target_version}-{stamp}.bak"
+        if os.path.exists(backup_path):
+            backup_path = f"{backup_path}.{uuid.uuid4().hex}"
+        temporary_path = f"{backup_path}.tmp-{uuid.uuid4().hex}"
         source = sqlite3.connect(self.path, timeout=30)
         try:
-            table = source.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
-            ).fetchone()
-            if not table:
-                return
-            versions = {row[0] for row in source.execute("SELECT version FROM schema_migrations")}
-            if 1 not in versions or 2 in versions:
-                return
-            destination = sqlite3.connect(backup_path)
+            destination = sqlite3.connect(temporary_path)
             try:
                 source.backup(destination)
+                destination.commit()
             finally:
                 destination.close()
         finally:
             source.close()
+        try:
+            verification = sqlite3.connect(temporary_path)
+            try:
+                integrity = verification.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise RuntimeError("pre-upgrade backup failed SQLite integrity verification")
+                version, _ = self._source_schema_version(verification)
+                if version != source_version:
+                    raise RuntimeError(
+                        f"pre-upgrade backup version mismatch: expected {source_version}, found {version}"
+                    )
+            finally:
+                verification.close()
+            os.replace(temporary_path, backup_path)
+        except Exception:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+            raise
+        return backup_path
 
     @staticmethod
     def _migration_1(connection: sqlite3.Connection) -> None:
@@ -229,25 +269,90 @@ class TrendStore:
             if name not in present:
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
+    @classmethod
+    def _verify_schema(cls, connection: sqlite3.Connection, version: int) -> None:
+        text = ("TEXT", True, False)
+        nullable_text = ("TEXT", False, False)
+        integer = ("INTEGER", True, False)
+        real = ("REAL", True, False)
+        schemas = {
+            1: {
+                "trend_signals": ({"signal_id": ("TEXT", False, True), "provider": text, "provider_signal_id": text, "collected_at": text, "expires_at": text, "payload_json": text}, [("provider", "provider_signal_id", "collected_at")], [], {"idx_trend_signals_provider_time": ("provider", "collected_at")}),
+                "trend_clusters": ({"cluster_id": ("TEXT", False, True), "canonical_entity": text, "first_seen": text, "last_seen": text, "payload_json": text}, [], [], {}),
+                "trend_opportunities": ({"opportunity_id": ("TEXT", False, True), "brand_id": text, "cluster_id": text, "recommended_action": text, "eligible": integer, "opportunity_score": real, "expires_at": text, "status": text, "payload_json": text}, [], [], {"idx_opportunities_brand_status": ("brand_id", "status", "expires_at")}),
+                "trend_approvals": ({"approval_id": ("TEXT", False, True), "opportunity_id": text, "brand_id": text, "status": text, "decided_at": text, "payload_json": text}, [], [("opportunity_id", "trend_opportunities", "opportunity_id")], {}),
+                "topic_seeds": ({"seed_id": ("TEXT", False, True), "opportunity_id": text, "brand_id": text, "created_at": text, "consumed_at": nullable_text, "run_id": nullable_text, "payload_json": text}, [], [("opportunity_id", "trend_opportunities", "opportunity_id")], {}),
+                "provider_cache": ({"cache_key": ("TEXT", False, True), "provider": text, "stored_at": text, "expires_at": text, "payload_json": text}, [], [], {}),
+                "provider_usage": ({"usage_id": ("INTEGER", False, True), "provider": text, "occurred_at": text, "request_count": integer, "resource_count": integer, "estimated_cost_usd": real, "actual_cost_usd": ("REAL", False, False), "metadata_json": text}, [], [], {"idx_provider_usage_time": ("provider", "occurred_at")}),
+            },
+            2: {
+                "trend_attribution": ({"attribution_id": ("INTEGER", False, True), "seed_id": text, "opportunity_id": text, "brand_id": text, "run_id": text, "youtube_video_id": text, "detected_at": text, "approved_at": text, "publication_time": text, "status": text, "payload_json": text}, [], [("seed_id", "topic_seeds", "seed_id"), ("opportunity_id", "trend_opportunities", "opportunity_id")], {"idx_trend_attribution_brand_time": ("brand_id", "publication_time", "approved_at")}),
+            },
+            3: {
+                "topic_seeds": ({"claimed_at": nullable_text, "claimed_by": nullable_text, "completed_at": nullable_text, "released_at": nullable_text, "failed_at": nullable_text, "failure_reason": text}, [], [], {}),
+                "provider_budget_reservations": ({"reservation_id": ("TEXT", False, True), "provider": text, "reserved_at": text, "status": text, "reserved_requests": integer, "reserved_cost_usd": real, "actual_requests": ("INTEGER", False, False), "actual_cost_usd": ("REAL", False, False)}, [], [], {"idx_budget_reservations_provider_time": ("provider", "reserved_at", "status")}),
+            },
+        }
+        for table, (columns, unique_sets, foreign_keys, indexes) in schemas[version].items():
+            cls._verify_table(connection, version, table, columns, unique_sets, foreign_keys, indexes)
+
     @staticmethod
-    def _verify_schema(connection: sqlite3.Connection, version: int) -> None:
-        required = {
-            1: {"trend_signals", "trend_clusters", "trend_opportunities", "trend_approvals", "topic_seeds", "provider_cache", "provider_usage"},
-            2: {"trend_attribution"},
-            3: {"provider_budget_reservations"},
-        }[version]
-        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        missing = required - tables
-        if missing:
-            raise RuntimeError(f"migration {version} schema verification failed: {sorted(missing)}")
-        if version == 2:
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(trend_attribution)")}
-            if "seed_id" not in columns or "payload_json" not in columns:
-                raise RuntimeError("migration 2 column verification failed")
-        if version == 3:
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(topic_seeds)")}
-            if not {"claimed_at", "claimed_by", "completed_at"}.issubset(columns):
-                raise RuntimeError("migration 3 column verification failed")
+    def _verify_table(
+        connection: sqlite3.Connection,
+        version: int,
+        table: str,
+        expected_columns: dict[str, tuple[str, bool, bool]],
+        expected_unique_sets: list[tuple[str, ...]],
+        expected_foreign_keys: list[tuple[str, str, str]],
+        expected_indexes: dict[str, tuple[str, ...]],
+    ) -> None:
+        table_sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not table_sql_row:
+            raise RuntimeError(f"migration {version} schema verification failed: missing table {table}")
+        actual = {row[1]: row for row in connection.execute(f'PRAGMA table_info("{table}")')}
+        problems = []
+        for name, (affinity, required_not_null, primary_key) in expected_columns.items():
+            row = actual.get(name)
+            if row is None:
+                problems.append(f"missing column {name}")
+                continue
+            declared = str(row[2] or "").upper()
+            if affinity not in declared:
+                problems.append(f"column {name} has type {declared or '<none>'}, expected {affinity}")
+            if required_not_null and not bool(row[3]):
+                problems.append(f"column {name} must be NOT NULL")
+            if bool(row[5]) != primary_key:
+                problems.append(f"column {name} primary-key mismatch")
+        index_rows = list(connection.execute(f'PRAGMA index_list("{table}")'))
+        unique_columns = {
+            tuple(row[2] for row in connection.execute(f'PRAGMA index_info("{index[1]}")'))
+            for index in index_rows if bool(index[2])
+        }
+        for columns in expected_unique_sets:
+            if columns not in unique_columns:
+                problems.append(f"missing unique constraint {columns}")
+        available_indexes = {row[1] for row in index_rows}
+        for index_name, columns in expected_indexes.items():
+            if index_name not in available_indexes:
+                problems.append(f"missing index {index_name}")
+            else:
+                actual_columns = tuple(
+                    row[2] for row in connection.execute(f'PRAGMA index_info("{index_name}")')
+                )
+                if actual_columns != columns:
+                    problems.append(f"index {index_name} columns {actual_columns}, expected {columns}")
+        actual_foreign_keys = {
+            (row[3], row[2], row[4]) for row in connection.execute(f'PRAGMA foreign_key_list("{table}")')
+        }
+        for foreign_key in expected_foreign_keys:
+            if foreign_key not in actual_foreign_keys:
+                problems.append(f"missing foreign key {foreign_key}")
+        if problems:
+            raise RuntimeError(
+                f"migration {version} schema verification failed for {table}: " + "; ".join(problems)
+            )
 
     @staticmethod
     def _dump(payload: dict) -> str:

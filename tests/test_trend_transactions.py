@@ -52,10 +52,23 @@ class TransactionTests(unittest.TestCase):
                 CREATE TABLE trend_attribution (attribution_id INTEGER PRIMARY KEY);
                 """
             )
-        self.store.migrate()
+        with self.assertRaisesRegex(RuntimeError, "foreign key"):
+            self.store.migrate()
+
+    def test_recorded_v1_with_incomplete_topic_seed_table_fails_without_advancing(self):
         with closing(sqlite3.connect(self.path)) as connection:
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(trend_attribution)")}
-        self.assertIn("seed_id", columns)
+            connection.executescript(
+                """
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT);
+                INSERT INTO schema_migrations VALUES (1, CURRENT_TIMESTAMP);
+                CREATE TABLE topic_seeds (seed_id TEXT PRIMARY KEY);
+                """
+            )
+        with self.assertRaisesRegex(RuntimeError, "topic_seeds.*missing column opportunity_id"):
+            self.store.migrate()
+        with closing(sqlite3.connect(self.path)) as connection:
+            versions = [row[0] for row in connection.execute("SELECT version FROM schema_migrations")]
+        self.assertEqual(versions, [1])
 
     def test_concurrent_migrations_are_serialized(self):
         errors = []
