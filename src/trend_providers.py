@@ -413,8 +413,9 @@ class GoogleTrendsProviderStub(BaseProvider):
 
 
 class CollectionCoordinator:
-    def __init__(self, store: TrendStore):
+    def __init__(self, store: TrendStore, *, clock=utc_now):
         self.store = store
+        self.clock = clock
 
     @staticmethod
     def _cache_key(provider: TrendProvider, request: TrendRequest) -> str:
@@ -438,35 +439,43 @@ class CollectionCoordinator:
             result = ProviderResult.from_dict(cached)
             return ProviderResult(result.provider, result.signals, result.errors, True, 0, result.resource_count, 0, 0, request.requested_at)
 
-        now = _parse_time(request.requested_at)
+        now_text = self.clock()
+        now = _parse_time(now_text)
         daily_since = _iso(now - timedelta(days=1))
         monthly_since = _iso(now - timedelta(days=30))
-        daily_spend = self.store.usage_cost_since(provider.name, daily_since)
-        monthly_spend = self.store.usage_cost_since(provider.name, monthly_since)
-        daily_requests = self.store.usage_requests_since(provider.name, daily_since)
         estimate = max(float(provider.estimated_max_cost_usd), 0)
         request_estimator = getattr(provider, "estimated_max_requests", None)
         estimated_requests = int(request_estimator(request)) if request_estimator else 0
-        if settings.daily_cost_limit_usd and daily_spend + estimate > settings.daily_cost_limit_usd:
-            return ProviderResult(provider.name, [], [ProviderError("daily_budget_exceeded", "Provider daily cost ceiling reached")], False, 0, 0, 0, None, request.requested_at)
-        if settings.monthly_cost_limit_usd and monthly_spend + estimate > settings.monthly_cost_limit_usd:
-            return ProviderResult(provider.name, [], [ProviderError("monthly_budget_exceeded", "Provider monthly cost ceiling reached")], False, 0, 0, 0, None, request.requested_at)
-        if settings.daily_request_limit and daily_requests + estimated_requests > settings.daily_request_limit:
-            return ProviderResult(provider.name, [], [ProviderError("daily_quota_exceeded", "Provider daily request quota reached")], False, 0, 0, 0, None, request.requested_at)
-
-        result = provider.collect(request)
-        self.store.record_usage(
-            provider.name,
-            request.requested_at,
-            result.request_count,
-            result.resource_count,
-            result.estimated_cost_usd,
-            result.actual_cost_usd,
-            {"errors": [error.code for error in result.errors]},
+        reservation_id, budget_error = self.store.reserve_provider_budget(
+            provider.name, now_text, estimated_requests, estimate,
+            daily_since=daily_since, monthly_since=monthly_since,
+            daily_request_limit=settings.daily_request_limit,
+            daily_cost_limit_usd=settings.daily_cost_limit_usd,
+            monthly_cost_limit_usd=settings.monthly_cost_limit_usd,
+        )
+        if budget_error:
+            messages = {
+                "daily_quota_exceeded": "Provider daily request quota reached",
+                "daily_budget_exceeded": "Provider daily cost ceiling reached",
+                "monthly_budget_exceeded": "Provider monthly cost ceiling reached",
+            }
+            return ProviderResult(provider.name, [], [ProviderError(budget_error, messages[budget_error])], False, 0, 0, 0, None, now_text)
+        try:
+            result = provider.collect(request)
+        except Exception:
+            self.store.release_provider_budget(reservation_id)
+            raise
+        self.store.reconcile_provider_budget(
+            reservation_id,
+            request_count=result.request_count,
+            resource_count=result.resource_count,
+            estimated_cost_usd=result.estimated_cost_usd,
+            actual_cost_usd=result.actual_cost_usd,
+            metadata={"errors": [error.code for error in result.errors]},
         )
         if not result.errors and provider.cache_ttl_minutes > 0:
             expires = _iso(now + timedelta(minutes=provider.cache_ttl_minutes))
-            self.store.set_cache(key, provider.name, request.requested_at, expires, result.to_dict())
+            self.store.set_cache(key, provider.name, now_text, expires, result.to_dict())
         return result
 
 

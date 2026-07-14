@@ -24,7 +24,7 @@ class TrendStoreTests(unittest.TestCase):
     def test_migration_is_repeatable(self):
         self.store.migrate()
         self.store.migrate()
-        self.assertEqual(self.store.schema_versions(), [1, 2])
+        self.assertEqual(self.store.schema_versions(), [1, 2, 3])
 
     def test_signal_round_trip(self):
         signal = TrendSignal.from_dict(
@@ -55,7 +55,7 @@ class TrendStoreTests(unittest.TestCase):
         legacy = TrendStore(path)
         legacy.migrate()
         self.assertTrue(os.path.isfile(path + ".v1.bak"))
-        self.assertEqual(legacy.schema_versions(), [1, 2])
+        self.assertEqual(legacy.schema_versions(), [1, 2, 3])
 
 
 if __name__ == "__main__":

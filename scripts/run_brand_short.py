@@ -2,6 +2,7 @@
 """Non-interactive Short generator for active or specified brand."""
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,6 +81,7 @@ def main():
     )
     trend_store = None
     trend_seed = None
+    trend_claim_id = None
     if trend_seed_id:
         from trend_store import TrendStore
 
@@ -89,6 +91,11 @@ def main():
             print(f"ERROR: Unknown trend seed: {trend_seed_id}")
             sys.exit(2)
         youtube.use_topic_seed(trend_seed)
+        trend_claim_id = f"generation-{uuid.uuid4().hex}"
+        claimed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        if not trend_store.claim_topic_seed(trend_seed.seed_id, trend_claim_id, claimed_at):
+            print(f"ERROR: Trend seed is already claimed, completed, or failed: {trend_seed_id}")
+            sys.exit(2)
         print(f"Trend seed: {trend_seed.seed_id} ({trend_seed.historical_event})")
     if episode:
         youtube.episode_number = episode
@@ -97,10 +104,20 @@ def main():
         youtube.subject = topic.strip()
         print(f"Topic: {youtube.subject}")
     tts = TTS()
-    path = youtube.generate_video(tts, interactive=False)
+    try:
+        path = youtube.generate_video(tts, interactive=False)
+    except Exception as error:
+        if trend_seed is not None and trend_store is not None and trend_claim_id:
+            failed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            trend_store.fail_topic_seed(
+                trend_seed.seed_id, trend_claim_id, failed_at,
+                f"generation failed before completion: {type(error).__name__}",
+            )
+        raise
     if trend_seed is not None and trend_store is not None:
         consumed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        trend_store.mark_seed_consumed(trend_seed.seed_id, youtube.run_id, consumed_at)
+        if not trend_store.complete_topic_seed(trend_seed.seed_id, trend_claim_id, consumed_at):
+            raise RuntimeError("Trend seed claim was lost before generation completion")
         attribution = dict(youtube.production_metadata.get("trend_attribution") or {})
         trend_store.save_attribution(
             seed_id=trend_seed.seed_id,

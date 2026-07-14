@@ -553,6 +553,8 @@ class ApprovalRecord:
     reason: str
     content_mix_override: bool = False
     override_reason: str = ""
+    previous_calculated_share: float = 0.0
+    resulting_calculated_share: float = 0.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ApprovalRecord":
@@ -570,6 +572,8 @@ class ApprovalRecord:
             reason=_require_text(data.get("reason"), "reason"),
             content_mix_override=override,
             override_reason=override_reason,
+            previous_calculated_share=_number(data.get("previous_calculated_share", 0), "previous_calculated_share"),
+            resulting_calculated_share=_number(data.get("resulting_calculated_share", 0), "resulting_calculated_share"),
         )
 
     def to_dict(self) -> dict[str, Any]:

@@ -193,9 +193,22 @@ def approve_opportunity(
     decided_at = now or utc_now()
     if _parse_time(opportunity.expires_at) <= _parse_time(decided_at):
         raise ValidationError("expired opportunity cannot be approved")
-    mix = content_mix_status(brand_id, strategy, store, now=decided_at, videos=videos)
-    if mix.at_limit and not override_reason.strip():
-        raise ValidationError("trend-assisted content share would exceed its configured maximum")
+    current = _parse_time(decided_at)
+    cutoff = current - timedelta(days=strategy.recent_window_days)
+    cutoff_display = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+    if videos is None:
+        try:
+            import analytics
+            videos = analytics.dedupe_videos()
+        except Exception:
+            videos = []
+    recent = [
+        item for item in videos
+        if item.get("brand_id") == brand_id and item.get("status") == "uploaded"
+        and (item.get("date") or "") >= cutoff_display
+    ]
+    uploaded_trend = sum(1 for item in recent if (item.get("production") or {}).get("trend_attribution"))
     approval = ApprovalRecord.from_dict(
         {
             "approval_id": new_id("approval"),
@@ -210,8 +223,21 @@ def approve_opportunity(
         }
     )
     seed = create_topic_seed(opportunity, approval)
-    store.save_decision(
-        replace(opportunity, status=ApprovalStatus.APPROVED), approval, seed
+    approval, seed, mix_values = store.save_approval_with_mix(
+        replace(opportunity, status=ApprovalStatus.APPROVED), approval, seed,
+        cutoff=cutoff_iso,
+        uploaded_total=len(recent),
+        uploaded_trend=uploaded_trend,
+        maximum_share=strategy.max_trend_assisted_share,
+    )
+    total, trend_count, previous_share, resulting_share = mix_values
+    mix = ContentMixStatus(
+        recent_total=total,
+        recent_trend_assisted=trend_count,
+        current_share=previous_share,
+        projected_share=resulting_share,
+        maximum_share=strategy.max_trend_assisted_share,
+        at_limit=resulting_share > strategy.max_trend_assisted_share,
     )
     return approval, seed, mix
 
