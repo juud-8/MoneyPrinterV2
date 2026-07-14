@@ -67,6 +67,31 @@ def _entity_tokens(text: str) -> set[str]:
     }
 
 
+def _years(text: str) -> set[str]:
+    return set(re.findall(r"\b(?:1[0-9]{3}|20[0-9]{2})\b", text or ""))
+
+
+def _material_differences(bridge: ArchiveBridge, entry: CatalogEntry) -> list[str]:
+    """Return catalog-supported differences; LLM relationship labels are advisory."""
+    differences: list[str] = []
+    existing_event = str(entry.metadata.get("historical_event") or entry.subject or entry.title)
+    if existing_event and topic_similarity(bridge.historical_event, existing_event) < 0.45:
+        differences.append("historical event")
+    candidate_years = _years(bridge.historical_event) or _years(bridge.specific_number)
+    existing_years = _years(" ".join([existing_event, str(entry.metadata.get("period") or "")]))
+    if candidate_years and existing_years and candidate_years.isdisjoint(existing_years):
+        differences.append("date or period")
+    comparisons = (
+        ("consequence", bridge.absurd_contradiction, entry.metadata.get("consequence")),
+        ("payoff", bridge.central_payoff, entry.metadata.get("central_payoff")),
+        ("sourced central claim", bridge.central_payoff, entry.metadata.get("central_claim")),
+    )
+    for dimension, candidate, existing in comparisons:
+        if existing and topic_similarity(candidate, str(existing)) < 0.35:
+            differences.append(dimension)
+    return differences
+
+
 class TrendCatalog:
     def __init__(self, entries: list[CatalogEntry]):
         self.entries = entries
@@ -155,13 +180,19 @@ class TrendCatalog:
 
         if entity_entries:
             entry, similarity = max(entity_entries, key=lambda item: item[1])
-            if bridge.relationship_type.value == "alternate_angle" or similarity < 0.45:
+            differences = _material_differences(bridge, entry)
+            if len(differences) >= 2:
                 return CatalogMatch(
                     CatalogDecision.ALTERNATE_ANGLE,
                     similarity,
                     entry,
-                    "The entity exists in the catalog, but the historical event is materially different",
+                    "Catalog evidence supports material differences in: " + ", ".join(differences),
                 )
-            return CatalogMatch(CatalogDecision.SKIP, similarity, entry, "The proposed angle is not materially distinct")
+            return CatalogMatch(
+                CatalogDecision.SKIP,
+                similarity,
+                entry,
+                "Fewer than two material catalog differences are proven; human review is required",
+            )
 
         return CatalogMatch(CatalogDecision.NEW_VIDEO, best_similarity, best_entry, "No material catalog match found")

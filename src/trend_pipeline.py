@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any
 
 from research_brief import research_quality_issues
@@ -300,9 +301,49 @@ def validate_topic_seed_script(seed: TopicSeed, script: str) -> None:
     text = (script or "").strip()
     if not text:
         raise ValidationError("trend-assisted script is empty")
-    anchors = [seed.historical_event, seed.specific_number_date, seed.absurd_contradiction]
-    if not any(topic_similarity(anchor, text) >= 0.20 for anchor in anchors if anchor):
-        raise ValidationError("script does not preserve the approved historical bridge")
+    if len(text) < 180:
+        raise ValidationError("trend-assisted script is too short for semantic validation")
+
+    stop = {"about", "after", "before", "could", "from", "have", "historical", "into", "more", "people", "that", "their", "there", "these", "this", "those", "with"}
+
+    def tokens(value: str) -> set[str]:
+        result = set()
+        for token in re.findall(r"[a-z0-9]+", (value or "").lower()):
+            if token.startswith("danc"):
+                token = "dance"
+            elif len(token) > 5 and token.endswith("s"):
+                token = token[:-1]
+            if len(token) >= 4 and token not in stop:
+                result.add(token)
+        return result
+
+    script_tokens = tokens(text)
+    entity_tokens = tokens(seed.primary_entity)
+    event_tokens = tokens(seed.historical_event) - _years_as_tokens(seed.historical_event)
+    contradiction_tokens = tokens(seed.absurd_contradiction)
+    entity_agrees = bool(entity_tokens & script_tokens)
+    event_overlap = event_tokens & script_tokens
+    event_agrees = len(event_overlap) >= min(2, len(event_tokens))
+    contradiction_overlap = contradiction_tokens & script_tokens
+    contradiction_agrees = (
+        len(contradiction_overlap) >= 2
+        and len(contradiction_overlap) / max(len(contradiction_tokens), 1) >= 0.3
+    )
+    date_agrees = bool(seed.specific_number_date and seed.specific_number_date.lower() in text.lower())
+    if not entity_agrees:
+        raise ValidationError("script primary entity does not match the approved TopicSeed")
+    if not event_agrees:
+        raise ValidationError("script event does not match the approved TopicSeed")
+    if not contradiction_agrees:
+        raise ValidationError("script omits or contradicts the approved central claim")
+    if len(seed.historical_source_references) < 2:
+        raise ValidationError("approved central claim lacks adequate source backing")
+    if sum([entity_agrees, event_agrees, contradiction_agrees, date_agrees]) < 3:
+        raise ValidationError("script does not preserve multiple approved semantic anchors")
+
+
+def _years_as_tokens(value: str) -> set[str]:
+    return set(re.findall(r"\b(?:1[0-9]{3}|20[0-9]{2})\b", value or ""))
 
 
 def validate_seed_duplicate(seed: TopicSeed, recent_labels: list[str]) -> None:

@@ -69,7 +69,10 @@ def _source_domains(urls: list[str]) -> set[str]:
     return {urlparse(url).netloc.lower() for url in urls if urlparse(url).netloc}
 
 
-def build_components(cluster: TrendCluster, bridge: ArchiveBridge, expires_at: str, now: str) -> list[ScoreComponent]:
+def build_components(
+    cluster: TrendCluster, bridge: ArchiveBridge, catalog_match: CatalogMatch,
+    expires_at: str, now: str,
+) -> list[ScoreComponent]:
     provider_confidence = min(1.0, 0.35 + cluster.cross_source_count * 0.2)
     expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     current = datetime.fromisoformat(now.replace("Z", "+00:00"))
@@ -90,7 +93,7 @@ def build_components(cluster: TrendCluster, bridge: ArchiveBridge, expires_at: s
         _component("related_channel_performance", None, 0, "analytics", "no comparable package attribution"),
         _component("production_lifetime_margin", min(100.0, lifetime_hours / 24 * 100), 0.9, "expiration_and_production_estimate"),
         _component("competition", bridge.competition_score, 0.65, "youtube_competition", "competition unavailable"),
-        _component("duplicate_risk", bridge.duplicate_similarity, 0.9, "catalog_similarity", "duplicate similarity unavailable"),
+        _component("duplicate_risk", catalog_match.similarity * 100, 1.0, "catalog_similarity"),
         _component("sensitivity_risk", sensitivity, 1.0, "policy_flags"),
     ]
 
@@ -157,12 +160,13 @@ def build_opportunity(
     policy: TrendPolicy | None = None,
 ) -> TrendOpportunity:
     policy = policy or TrendPolicy()
-    components = build_components(cluster, bridge, expires_at, now)
+    components = build_components(cluster, bridge, catalog_match, expires_at, now)
     score = advisory_score(components)
     failures = eligibility_failures(cluster, bridge, catalog_match, expires_at, now, policy)
-    eligible = not failures and score >= policy.minimum_opportunity_score
+    eligible = not failures
+    advisory_warnings = []
     if score < policy.minimum_opportunity_score:
-        failures.append("advisory opportunity score below threshold")
+        advisory_warnings.append("advisory opportunity score below threshold; approval requires an explicit reason")
     action = RecommendedAction(catalog_match.decision.value)
     if failures and action in {RecommendedAction.NEW_VIDEO, RecommendedAction.ALTERNATE_ANGLE}:
         action = RecommendedAction.SKIP
@@ -179,7 +183,7 @@ def build_opportunity(
             "recommended_action": action.value,
             "existing_video_match": catalog_match.to_dict(),
             "expires_at": expires_at,
-            "reasoning": [catalog_match.reason, *failures],
+            "reasoning": [catalog_match.reason, *failures, *advisory_warnings],
             "observed_facts": [
                 f"{cluster.cross_source_count} independent provider(s) observed",
                 f"{len(_source_domains(bridge.historical_sources))} historical source domain(s)",
