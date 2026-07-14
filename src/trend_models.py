@@ -172,6 +172,85 @@ class ScoreComponent:
 
 
 @dataclass(frozen=True)
+class TrendRequest:
+    brand_id: str
+    terms: list[str]
+    geographies: list[str]
+    languages: list[str]
+    window_hours: float = 24
+    max_results: int = 10
+    dry_run: bool = True
+    requested_at: str = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TrendRequest":
+        max_results = int(data.get("max_results", 10))
+        if not 1 <= max_results <= 100:
+            raise ValidationError("max_results must be between 1 and 100")
+        return cls(
+            brand_id=_require_text(data.get("brand_id"), "brand_id"),
+            terms=_string_list(data.get("terms"), "terms"),
+            geographies=_string_list(data.get("geographies"), "geographies") or ["WORLDWIDE"],
+            languages=_string_list(data.get("languages"), "languages") or ["en"],
+            window_hours=_number(data.get("window_hours", 24), "window_hours", minimum=1),
+            max_results=max_results,
+            dry_run=bool(data.get("dry_run", True)),
+            requested_at=_timestamp(data.get("requested_at", utc_now()), "requested_at"),
+        )
+
+
+@dataclass(frozen=True)
+class ProviderError:
+    code: str
+    message: str
+    retryable: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProviderError":
+        return cls(
+            code=_require_text(data.get("code"), "provider error code"),
+            message=_require_text(data.get("message"), "provider error message"),
+            retryable=bool(data.get("retryable", False)),
+        )
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    provider: str
+    signals: list[TrendSignal]
+    errors: list[ProviderError]
+    cache_hit: bool
+    request_count: int
+    resource_count: int
+    estimated_cost_usd: float
+    actual_cost_usd: float | None
+    collected_at: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProviderResult":
+        signals = data.get("signals") or []
+        errors = data.get("errors") or []
+        if not isinstance(signals, list) or not isinstance(errors, list):
+            raise ValidationError("provider signals and errors must be lists")
+        return cls(
+            provider=_require_text(data.get("provider"), "provider"),
+            signals=[item if isinstance(item, TrendSignal) else TrendSignal.from_dict(item) for item in signals],
+            errors=[item if isinstance(item, ProviderError) else ProviderError.from_dict(item) for item in errors],
+            cache_hit=bool(data.get("cache_hit", False)),
+            request_count=int(data.get("request_count", 0)),
+            resource_count=int(data.get("resource_count", len(signals))),
+            estimated_cost_usd=_number(data.get("estimated_cost_usd", 0), "estimated_cost_usd", minimum=0),
+            actual_cost_usd=_optional_number(data.get("actual_cost_usd"), "actual_cost_usd"),
+            collected_at=_timestamp(data.get("collected_at", utc_now()), "collected_at"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["signals"] = [signal.to_dict() for signal in self.signals]
+        return payload
+
+
+@dataclass(frozen=True)
 class TrendSignal:
     provider: str
     provider_signal_id: str

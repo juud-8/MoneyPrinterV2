@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -252,3 +253,74 @@ class TrendStore:
         self.migrate()
         with self.connect() as connection:
             return [row["version"] for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
+
+    def get_cache(self, cache_key: str, now: str) -> dict | None:
+        self.migrate()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json, expires_at FROM provider_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        if not row:
+            return None
+        current = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(timezone.utc)
+        expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        return json.loads(row["payload_json"]) if current < expires else None
+
+    def set_cache(self, cache_key: str, provider: str, stored_at: str, expires_at: str, payload: dict) -> None:
+        self.migrate()
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT OR REPLACE INTO provider_cache
+                   (cache_key, provider, stored_at, expires_at, payload_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (cache_key, provider, stored_at, expires_at, self._dump(payload)),
+            )
+
+    def record_usage(
+        self,
+        provider: str,
+        occurred_at: str,
+        request_count: int,
+        resource_count: int,
+        estimated_cost_usd: float,
+        actual_cost_usd: float | None,
+        metadata: dict | None = None,
+    ) -> None:
+        self.migrate()
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO provider_usage
+                   (provider, occurred_at, request_count, resource_count,
+                    estimated_cost_usd, actual_cost_usd, metadata_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    provider,
+                    occurred_at,
+                    request_count,
+                    resource_count,
+                    estimated_cost_usd,
+                    actual_cost_usd,
+                    self._dump(metadata or {}),
+                ),
+            )
+
+    def usage_cost_since(self, provider: str, since: str) -> float:
+        self.migrate()
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS cost
+                   FROM provider_usage WHERE provider = ? AND occurred_at >= ?""",
+                (provider, since),
+            ).fetchone()
+        return float(row["cost"] or 0)
+
+    def usage_requests_since(self, provider: str, since: str) -> int:
+        self.migrate()
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT COALESCE(SUM(request_count), 0) AS requests
+                   FROM provider_usage WHERE provider = ? AND occurred_at >= ?""",
+                (provider, since),
+            ).fetchone()
+        return int(row["requests"] or 0)

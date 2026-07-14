@@ -1,0 +1,7 @@
+{
+  "provider": "x",
+  "fixture_only": true,
+  "data": [
+    {"trend_name": "#Bison", "tweet_count": 1800}
+  ]
+}
