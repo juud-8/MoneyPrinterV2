@@ -67,7 +67,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(result.signals[0].metric_type, "wikimedia_pageviews")
 
     def test_youtube_requires_dedicated_credentials(self):
-        provider = YouTubeTrendProvider(ProviderSettings(enabled=True, api_key=""))
+        provider = YouTubeTrendProvider(ProviderSettings(enabled=True, api_key="", youtube_retention_verified=True))
         result = provider.collect(request())
         self.assertEqual(result.errors[0].code, "missing_credentials")
 
@@ -112,7 +112,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_youtube_quota_ceiling_blocks_before_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings = ProviderSettings(enabled=True, api_key="dedicated", daily_request_limit=1)
+            settings = ProviderSettings(enabled=True, api_key="dedicated", daily_request_limit=1, youtube_retention_verified=True)
             provider = YouTubeTrendProvider(settings, fetch_json=lambda *args: {})
             result = CollectionCoordinator(TrendStore(os.path.join(tmp, "db.sqlite3"))).collect(
                 provider, request(), settings

@@ -109,7 +109,7 @@ class ExternalSafetyTests(unittest.TestCase):
             raise ValueError(f"401 https://example.test?q=x&key={secret}")
 
         provider = YouTubeTrendProvider(
-            ProviderSettings(enabled=True, api_key=secret), fetch_json=fail
+            ProviderSettings(enabled=True, api_key=secret, youtube_retention_verified=True), fetch_json=fail
         )
         request = TrendRequest.from_dict(
             {

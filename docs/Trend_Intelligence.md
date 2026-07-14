@@ -8,7 +8,7 @@ The Trend-to-Archive engine is a disabled-by-default suggestion system. It colle
 - Every live provider is disabled until enabled in a brand manifest, and collection is still dry-run unless the operator passes `--live`.
 - X is a fixture-only stub. No live X request is implemented.
 - Google Trends is an official-provider placeholder and manual-import path. No unofficial scraping is implemented.
-- YouTube collection accepts only `youtube_api_key` or `YOUTUBE_API_KEY`; it never falls back to a Gemini key.
+- YouTube collection accepts only `youtube_api_key` or `YOUTUBE_API_KEY`; it never falls back to a Gemini key. It also remains disabled unless `retention_policy_verified` is explicitly true after the operator re-verifies current YouTube API policy requirements.
 - Bridge generation uses the configured local Ollama model. Offline bridge JSON can be imported instead.
 - Approval creates a seed and prints a separate generation command. It never executes that command.
 - The ordinary duplicate, grounded-research, brand-policy, script, duration, review, and upload gates remain authoritative.
@@ -42,6 +42,9 @@ Add this under `production` in the private `brands/<brand_id>/manifest.json`. Ke
       },
       "youtube": {
         "enabled": false,
+        "retention_policy_verified": false,
+        "refresh_after_hours": 24,
+        "retention_days": 30,
         "cache_ttl_minutes": 180,
         "daily_request_limit": 20,
         "daily_cost_limit_usd": 0
@@ -63,6 +66,7 @@ Add this under `production` in the private `brands/<brand_id>/manifest.json`. Ke
 To permit suggestions, set only `enabled` to `true` and `mode` to `suggest`. Enable providers individually after reviewing quotas. Keep `publishing.review_before_upload` true in the brand manifest and `review_before_upload` true in `config.json`.
 
 The YouTube Data API provider uses the existing dedicated `youtube_api_key` setting or `YOUTUBE_API_KEY`. Do not put credentials in a brand manifest.
+Public YouTube trend records carry `fetched_at`, `refresh_due_at`, `delete_or_expire_at`, policy, and source provenance. Before production use, reverify the current YouTube API Services Terms and set `retention_policy_verified` deliberately; do not treat this document as permanent policy advice.
 
 ## Operator workflow
 
@@ -83,6 +87,13 @@ python src/trends.py collect --brand <brand_id> --term "american bison" --provid
 ```
 
 Without `--live`, the command reports that external calls were skipped. Provider errors are partial results; successful evidence remains usable and evergreen production is independent.
+
+Inspect refresh-due YouTube records or purge records past their recorded deletion deadline without making network calls:
+
+```powershell
+python src/trends.py retention --provider youtube
+python src/trends.py retention --provider youtube --purge
+```
 
 Generate bridge candidates locally and collect historical sources:
 
@@ -126,7 +137,7 @@ That command generates reviewable media but does not upload unless the operator 
 
 ## Persistence and rollback
 
-Trend data lives in `.mp/trends.sqlite3`; canonical records use stable IDs rather than titles. Schema migrations are repeatable and recorded in `schema_migrations`. Upgrading an existing v1 database to v2 creates `.mp/trends.sqlite3.v1.bak` before changing the schema.
+Trend data lives in `.mp/trends.sqlite3`; canonical records use stable IDs rather than titles. Schema migrations are repeatable and recorded in `schema_migrations`. Upgrading an existing v1 database creates `.mp/trends.sqlite3.v1.bak` before changing the schema.
 
 To roll back application code, switch back to the reviewed baseline branch/commit. To roll back only local trend data, stop all MoneyPrinterV2 processes, preserve the current database for investigation, and restore the versioned `.bak` file. Do not overwrite `.mp/analytics.json`; the trend database is separate.
 

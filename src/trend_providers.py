@@ -12,11 +12,12 @@ import hashlib
 import json
 import time
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 
@@ -25,13 +26,21 @@ from trend_store import TrendStore
 
 
 JsonFetcher = Callable[[str, dict[str, Any], dict[str, str], float], dict[str, Any]]
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_REDIRECTS = 3
+ALLOWED_PROVIDER_HOSTS = {
+    "api.gdeltproject.org": {"api.gdeltproject.org"},
+    "wikimedia.org": {"wikimedia.org"},
+    "www.googleapis.com": {"www.googleapis.com"},
+}
 
 _SECRET_NAME = r"(?:key|api_key|access_token|bearer|authorization|token|client_secret|xi-api-key)"
 
 
 def sanitize_provider_error(value: object) -> str:
     """Remove credentials from provider failures before they cross a boundary."""
-    text = str(value or "")
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = "".join(character for character in text if unicodedata.category(character) != "Cc")
     text = re.sub(
         rf"(?i)([?&]{_SECRET_NAME}=)[^&\s]+",
         r"\1[REDACTED]",
@@ -62,16 +71,43 @@ def fetch_json_with_retries(
     *,
     attempts: int = 3,
 ) -> dict[str, Any]:
+    parsed_initial = urlparse(url)
+    if parsed_initial.scheme != "https" or parsed_initial.hostname not in ALLOWED_PROVIDER_HOSTS:
+        raise ValueError("provider URL scheme or host is not allowlisted")
+    allowed_hosts = ALLOWED_PROVIDER_HOSTS[parsed_initial.hostname]
     last_error: Exception | None = None
     for attempt in range(attempts):
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=timeout)
+            current_url = url
+            for redirect_count in range(MAX_REDIRECTS + 1):
+                response = requests.get(
+                    current_url, params=params if redirect_count == 0 else None,
+                    headers=headers, timeout=(min(timeout, 5.0), timeout),
+                    allow_redirects=False, stream=True,
+                )
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    break
+                if redirect_count >= MAX_REDIRECTS:
+                    raise ValueError("provider response exceeded redirect limit")
+                location = response.headers.get("Location") or ""
+                current_url = urljoin(current_url, location)
+                parsed_redirect = urlparse(current_url)
+                if parsed_redirect.scheme != "https" or parsed_redirect.hostname not in allowed_hosts:
+                    raise ValueError("provider redirect target is not allowlisted")
             if response.status_code == 429 and attempt + 1 < attempts:
                 retry_after = min(float(response.headers.get("Retry-After", "1") or 1), 5.0)
                 time.sleep(max(retry_after, 0))
                 continue
             response.raise_for_status()
-            payload = response.json()
+            length = response.headers.get("Content-Length")
+            if length and int(length) > MAX_RESPONSE_BYTES:
+                raise ValueError("provider response exceeds maximum size")
+            body = bytearray()
+            for chunk in response.iter_content(chunk_size=65536):
+                body.extend(chunk)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise ValueError("provider response exceeds maximum size")
+            payload = json.loads(body.decode("utf-8"))
             return payload if isinstance(payload, dict) else {}
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
@@ -100,6 +136,9 @@ class ProviderSettings:
     monthly_cost_limit_usd: float = 0.0
     daily_request_limit: int = 0
     api_key: str = ""
+    youtube_retention_verified: bool = False
+    refresh_after_hours: int = 24
+    retention_days: int = 30
     user_agent: str = "MoneyPrinterV2/2.0 (trend intelligence; local operator)"
 
 
@@ -107,17 +146,23 @@ class BaseProvider:
     name = "base"
     estimated_max_cost_usd = 0.0
 
-    def __init__(self, settings: ProviderSettings | None = None, fetch_json: JsonFetcher = fetch_json_with_retries):
+    def __init__(
+        self, settings: ProviderSettings | None = None,
+        fetch_json: JsonFetcher = fetch_json_with_retries, *, clock=utc_now,
+    ):
         self.settings = settings or ProviderSettings()
         self.enabled = self.settings.enabled
+        if self.name == "youtube":
+            self.enabled = self.enabled and self.settings.youtube_retention_verified
         self.cache_ttl_minutes = self.settings.cache_ttl_minutes
         self.fetch_json = fetch_json
+        self.clock = clock
 
     def error_result(self, code: str, message: str, *, retryable: bool = False) -> ProviderResult:
         return ProviderResult(
             provider=self.name,
             signals=[],
-            errors=[ProviderError(code=code, message=message, retryable=retryable)],
+            errors=[ProviderError(code=code, message=sanitize_provider_error(message), retryable=retryable)],
             cache_hit=False,
             request_count=0,
             resource_count=0,
@@ -139,19 +184,32 @@ class ManualProvider(BaseProvider):
 
     def collect(self, request: TrendRequest) -> ProviderResult:
         try:
+            is_csv = self.path.suffix.lower() == ".csv"
             if self.path.suffix.lower() == ".csv":
                 with self.path.open(encoding="utf-8-sig", newline="") as file:
-                    rows = list(csv.DictReader(file))
-                payloads = [self._csv_payload(row, request) for row in rows]
+                    payloads = list(csv.DictReader(file))
             else:
                 with self.path.open(encoding="utf-8") as file:
                     raw = json.load(file)
                 payloads = raw.get("signals", []) if isinstance(raw, dict) else raw
-            signals = [TrendSignal.from_dict(item) for item in payloads]
+            if not isinstance(payloads, list):
+                raise ValueError("manual signals must be a list")
+            signals = []
+            errors = []
+            for item in payloads[: request.max_results]:
+                if not isinstance(item, dict):
+                    errors.append(ProviderError("malformed_response", "Manual record is not an object"))
+                    continue
+                try:
+                    if is_csv:
+                        item = self._csv_payload(item, request)
+                    signals.append(TrendSignal.from_dict(item))
+                except (ValueError, TypeError) as exc:
+                    errors.append(ProviderError("malformed_response", sanitize_provider_error(exc)))
             return ProviderResult(
                 provider=self.name,
                 signals=signals[: request.max_results],
-                errors=[],
+                errors=errors,
                 cache_hit=False,
                 request_count=0,
                 resource_count=min(len(signals), request.max_results),
@@ -222,9 +280,13 @@ class GdeltProvider(BaseProvider):
                 )
                 articles = payload.get("articles") or []
                 if not isinstance(articles, list):
+                    errors.append(ProviderError("malformed_response", "GDELT articles must be a list"))
                     articles = []
-                domains = {str(item.get("domain") or "").lower() for item in articles if item.get("domain")}
-                urls = [str(item.get("url")) for item in articles if item.get("url")][:10]
+                valid_articles = [item for item in articles[:100] if isinstance(item, dict)]
+                if len(valid_articles) != len(articles[:100]):
+                    errors.append(ProviderError("malformed_response", "GDELT returned malformed article records"))
+                domains = {str(item.get("domain") or "").lower() for item in valid_articles if item.get("domain")}
+                urls = [str(item.get("url")) for item in valid_articles if item.get("url")][:10]
                 signals.append(
                     TrendSignal.from_dict(
                         {
@@ -238,13 +300,13 @@ class GdeltProvider(BaseProvider):
                             "geography": request.geographies[0],
                             "language": request.languages[0],
                             "window_hours": request.window_hours,
-                            "volume": len(articles),
+                            "volume": len(valid_articles),
                             "volume_is_absolute": False,
                             "velocity": None,
                             "related_terms": [],
                             "source_urls": urls,
                             "metric_type": "gdelt_article_matches",
-                            "raw_metadata": {"unique_domains": len(domains), "article_count": len(articles)},
+                            "raw_metadata": {"unique_domains": len(domains), "article_count": len(valid_articles)},
                         }
                     )
                 )
@@ -277,7 +339,21 @@ class WikimediaProvider(BaseProvider):
                     end=end.strftime("%Y%m%d"),
                 )
                 payload = self.fetch_json(url, {}, {"User-Agent": self.settings.user_agent}, self.settings.timeout_seconds)
-                views = [int(item.get("views") or 0) for item in payload.get("items") or []]
+                raw_items = payload.get("items") or []
+                if not isinstance(raw_items, list):
+                    raw_items = []
+                    errors.append(ProviderError("malformed_response", "Wikimedia items must be a list"))
+                views = []
+                malformed = False
+                for item in raw_items[:100]:
+                    try:
+                        if not isinstance(item, dict):
+                            raise TypeError("record is not an object")
+                        views.append(int(item.get("views") or 0))
+                    except (TypeError, ValueError):
+                        malformed = True
+                if malformed:
+                    errors.append(ProviderError("malformed_response", "Wikimedia returned malformed records"))
                 if not views:
                     continue
                 recent = sum(views[-2:]) / min(2, len(views))
@@ -347,7 +423,19 @@ class YouTubeTrendProvider(BaseProvider):
                     {},
                     self.settings.timeout_seconds,
                 )
-                ids = [str((item.get("id") or {}).get("videoId") or "") for item in search.get("items") or []]
+                search_items = search.get("items") or []
+                if not isinstance(search_items, list):
+                    search_items = []
+                    errors.append(ProviderError("malformed_response", "YouTube search items must be a list"))
+                ids = []
+                malformed = False
+                for item in search_items[:100]:
+                    if not isinstance(item, dict) or not isinstance(item.get("id"), dict):
+                        malformed = True
+                        continue
+                    value = str(item["id"].get("videoId") or "")
+                    if value:
+                        ids.append(value)
                 ids = [value for value in ids if value]
                 stats_items: list[dict] = []
                 if ids:
@@ -358,15 +446,31 @@ class YouTubeTrendProvider(BaseProvider):
                         {},
                         self.settings.timeout_seconds,
                     )
-                    stats_items = stats.get("items") or []
+                    raw_stats = stats.get("items") or []
+                    if isinstance(raw_stats, list):
+                        stats_items = [item for item in raw_stats[:100] if isinstance(item, dict)]
+                        malformed = malformed or len(stats_items) != len(raw_stats[:100])
+                    else:
+                        malformed = True
+                if malformed:
+                    errors.append(ProviderError("malformed_response", "YouTube returned malformed nested records"))
                 vph_values = []
                 total_views = 0
                 for item in stats_items:
-                    published = _parse_time((item.get("snippet") or {}).get("publishedAt") or request.requested_at)
-                    hours = max((_parse_time(request.requested_at) - published).total_seconds() / 3600, 1)
-                    views = int((item.get("statistics") or {}).get("viewCount") or 0)
-                    total_views += views
-                    vph_values.append(views / hours)
+                    try:
+                        snippet = item.get("snippet") or {}
+                        statistics = item.get("statistics") or {}
+                        if not isinstance(snippet, dict) or not isinstance(statistics, dict):
+                            raise TypeError("nested record is not an object")
+                        published = _parse_time(snippet.get("publishedAt") or request.requested_at)
+                        hours = max((_parse_time(request.requested_at) - published).total_seconds() / 3600, 1)
+                        views = int(statistics.get("viewCount") or 0)
+                        total_views += views
+                        vph_values.append(views / hours)
+                    except (TypeError, ValueError):
+                        errors.append(ProviderError("malformed_response", "YouTube returned malformed statistics"))
+                fetched_at = self.clock()
+                fetched = _parse_time(fetched_at)
                 signals.append(
                     TrendSignal.from_dict(
                         {
@@ -389,6 +493,11 @@ class YouTubeTrendProvider(BaseProvider):
                                 "total_public_views": total_views,
                                 "median_views_per_hour_proxy": sorted(vph_values)[len(vph_values) // 2] if vph_values else None,
                                 "quota_calls": 2 if ids else 1,
+                                "fetched_at": fetched_at,
+                                "refresh_due_at": _iso(fetched + timedelta(hours=self.settings.refresh_after_hours)),
+                                "delete_or_expire_at": _iso(fetched + timedelta(days=self.settings.retention_days)),
+                                "retention_policy": "youtube_public_data_local_cache_v1",
+                                "source_provenance": "YouTube Data API v3 public search and statistics",
                             },
                         }
                     )

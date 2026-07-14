@@ -82,10 +82,15 @@ def _settings(manifest: dict[str, Any], name: str) -> ProviderSettings:
         monthly_cost_limit_usd=max(0.0, float(raw.get("monthly_cost_limit_usd", 0))),
         daily_request_limit=max(0, int(raw.get("daily_request_limit", 0))),
         api_key=_dedicated_youtube_key() if name == "youtube" else "",
+        youtube_retention_verified=bool(raw.get("retention_policy_verified", False)) if name == "youtube" else False,
+        refresh_after_hours=max(1, int(raw.get("refresh_after_hours", 24))),
+        retention_days=max(1, int(raw.get("retention_days", 30))),
     )
 
 
 def _request(args, terms: list[str]) -> TrendRequest:
+    if args.live and args.now:
+        raise ValidationError("--now is test/offline-only and cannot be used with --live")
     return TrendRequest.from_dict(
         {
             "brand_id": args.brand,
@@ -348,6 +353,19 @@ def _report(args, store: TrendStore) -> int:
     return 0
 
 
+def _retention(args, store: TrendStore) -> int:
+    now = args.now or utc_now()
+    due = store.list_provider_refresh_due(args.provider, now)
+    purged = store.purge_expired_provider_data(args.provider, now) if args.purge else 0
+    _print_json({
+        "provider": args.provider,
+        "refresh_due_signal_ids": [item.signal_id for item in due],
+        "purged": purged,
+        "network_calls": 0,
+    })
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", default="", help="SQLite path (defaults to .mp/trends.sqlite3)")
@@ -407,6 +425,12 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--brand", required=True)
     report.add_argument("--now", default="")
     report.set_defaults(handler=_report)
+
+    retention = sub.add_parser("retention", help="Inspect or purge provider data by recorded lifecycle")
+    retention.add_argument("--provider", choices=["youtube"], default="youtube")
+    retention.add_argument("--purge", action="store_true")
+    retention.add_argument("--now", default="")
+    retention.set_defaults(handler=_retention)
     return parser
 
 

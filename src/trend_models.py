@@ -148,6 +148,8 @@ def _timestamp(value: Any, name: str) -> str:
 def _urls(value: Any, name: str) -> list[str]:
     urls = _string_list(value, name)
     for url in urls:
+        if len(url) > 2048:
+            raise ValidationError(f"{name} contains an oversized URL")
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValidationError(f"{name} contains an invalid HTTP(S) URL")
@@ -311,14 +313,22 @@ class TrendSignal:
                 f"{provider}|{provider_signal_id}|{collected_at}".encode("utf-8")
             ).hexdigest()[:32]
             signal_id = f"sig_{digest}"
+        term = _require_text(data.get("term"), "term")
+        normalized_entity = _require_text(data.get("normalized_entity"), "normalized_entity")
+        if len(term) > 300 or len(normalized_entity) > 300:
+            raise ValidationError("trend term or normalized entity exceeds 300 characters")
+        aliases = _string_list(data.get("aliases"), "aliases")
+        related_terms = _string_list(data.get("related_terms"), "related_terms")
+        if any(len(value) > 300 for value in [*aliases, *related_terms]):
+            raise ValidationError("trend alias or related term exceeds 300 characters")
         return cls(
             signal_id=signal_id,
             provider=provider,
             provider_signal_id=provider_signal_id,
             collected_at=collected_at,
-            term=_require_text(data.get("term"), "term"),
-            normalized_entity=_require_text(data.get("normalized_entity"), "normalized_entity"),
-            aliases=_string_list(data.get("aliases"), "aliases"),
+            term=term,
+            normalized_entity=normalized_entity,
+            aliases=aliases,
             entity_type=_text(data.get("entity_type")) or "unknown",
             geography=_text(data.get("geography")) or "WORLDWIDE",
             language=_text(data.get("language")) or "und",
@@ -327,7 +337,7 @@ class TrendSignal:
             volume=_optional_number(data.get("volume"), "volume"),
             volume_is_absolute=absolute,
             velocity=_optional_number(data.get("velocity"), "velocity"),
-            related_terms=_string_list(data.get("related_terms"), "related_terms"),
+            related_terms=related_terms,
             source_urls=_urls(data.get("source_urls"), "source_urls"),
             raw_metadata=raw,
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),

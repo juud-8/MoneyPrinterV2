@@ -278,6 +278,77 @@ class TrendStore:
         with self.connect() as connection:
             return [TrendSignal.from_dict(json.loads(row["payload_json"])) for row in connection.execute(query, parameters)]
 
+    def list_provider_refresh_due(self, provider: str, now: str) -> list[TrendSignal]:
+        due = []
+        current = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(timezone.utc)
+        for signal in self.list_signals(provider):
+            value = str(signal.raw_metadata.get("refresh_due_at") or "")
+            if value and datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc) <= current:
+                due.append(signal)
+        return due
+
+    def purge_expired_provider_data(self, provider: str, now: str) -> int:
+        """Delete provider records only after their recorded retention deadline."""
+        self.migrate()
+        current = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(timezone.utc)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = list(connection.execute(
+                "SELECT signal_id, payload_json FROM trend_signals WHERE provider = ?", (provider,)
+            ))
+            expired_ids = []
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                value = str((payload.get("raw_metadata") or {}).get("delete_or_expire_at") or "")
+                if value and datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc) <= current:
+                    expired_ids.append(row["signal_id"])
+            if expired_ids:
+                expired_set = set(expired_ids)
+                cluster_ids = []
+                for cluster_row in connection.execute("SELECT cluster_id, payload_json FROM trend_clusters"):
+                    cluster_payload = json.loads(cluster_row["payload_json"])
+                    signal_ids = {
+                        str(item.get("signal_id") or "")
+                        for item in cluster_payload.get("signals", [])
+                        if isinstance(item, dict)
+                    }
+                    if signal_ids & expired_set:
+                        cluster_ids.append(cluster_row["cluster_id"])
+                if cluster_ids:
+                    placeholders = ",".join("?" for _ in cluster_ids)
+                    opportunity_ids = [
+                        row[0] for row in connection.execute(
+                            f"SELECT opportunity_id FROM trend_opportunities WHERE cluster_id IN ({placeholders})",
+                            cluster_ids,
+                        )
+                    ]
+                    if opportunity_ids:
+                        opportunity_placeholders = ",".join("?" for _ in opportunity_ids)
+                        connection.execute(
+                            f"DELETE FROM trend_attribution WHERE opportunity_id IN ({opportunity_placeholders})",
+                            opportunity_ids,
+                        )
+                        connection.execute(
+                            f"DELETE FROM topic_seeds WHERE opportunity_id IN ({opportunity_placeholders})",
+                            opportunity_ids,
+                        )
+                        connection.execute(
+                            f"DELETE FROM trend_approvals WHERE opportunity_id IN ({opportunity_placeholders})",
+                            opportunity_ids,
+                        )
+                        connection.execute(
+                            f"DELETE FROM trend_opportunities WHERE opportunity_id IN ({opportunity_placeholders})",
+                            opportunity_ids,
+                        )
+                    connection.execute(
+                        f"DELETE FROM trend_clusters WHERE cluster_id IN ({placeholders})", cluster_ids
+                    )
+                connection.executemany("DELETE FROM trend_signals WHERE signal_id = ?", [(value,) for value in expired_ids])
+            connection.execute(
+                "DELETE FROM provider_cache WHERE provider = ? AND expires_at <= ?", (provider, now)
+            )
+            return len(expired_ids)
+
     def save_cluster(self, cluster: TrendCluster) -> None:
         self.migrate()
         with self.connect() as connection:
