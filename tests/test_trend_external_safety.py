@@ -45,22 +45,53 @@ class ExternalSafetyTests(unittest.TestCase):
 
     def test_trend_seed_requires_both_review_settings(self):
         seed = self._seed()
-        for global_review, brand_review, allowed in (
-            (True, True, True),
-            (True, False, False),
-            (False, True, False),
-            (False, False, False),
-        ):
+        cases = (
+            ("key absent", object(), True, False),
+            ("publishing absent", True, object(), False),
+            ("global null", None, True, False),
+            ("brand null", True, None, False),
+            ("global false", False, True, False),
+            ("brand false", True, False, False),
+            ("global string", "true", True, False),
+            ("brand string", True, "true", False),
+            ("global integer", 1, True, False),
+            ("brand integer", True, 1, False),
+            ("malformed config", ValueError("malformed"), True, False),
+            ("both explicit true", True, True, True),
+        )
+        absent = cases[0][1]
+        for label, global_review, brand_review, allowed in cases:
             value = manifest()
-            value["publishing"]["review_before_upload"] = brand_review
-            with self.subTest(global_review=global_review, brand_review=brand_review), patch(
-                "config.get_review_before_upload", return_value=global_review
+            if brand_review is absent:
+                value.pop("publishing", None)
+            else:
+                value["publishing"]["review_before_upload"] = brand_review
+            return_value = type(global_review) is bool and global_review is True
+            with self.subTest(case=label), patch(
+                "config.get_explicit_review_before_upload",
+                return_value=return_value,
             ):
                 if allowed:
                     validate_topic_seed_for_brand(seed, value, now=NOW)
                 else:
-                    with self.assertRaisesRegex(ValidationError, "review_before_upload"):
+                    with self.assertRaisesRegex((ValidationError, ValueError), "review_before_upload|malformed"):
                         validate_topic_seed_for_brand(seed, value, now=NOW)
+
+    def test_explicit_global_review_setting_parser_fails_closed(self):
+        from config import get_explicit_review_before_upload
+
+        for label, payload, allowed in (
+            ("absent", {}, False),
+            ("null", {"review_before_upload": None}, False),
+            ("false", {"review_before_upload": False}, False),
+            ("string", {"review_before_upload": "true"}, False),
+            ("integer", {"review_before_upload": 1}, False),
+            ("true", {"review_before_upload": True}, True),
+        ):
+            with self.subTest(case=label), patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(payload))):
+                self.assertIs(get_explicit_review_before_upload(), allowed)
+        with patch("builtins.open", unittest.mock.mock_open(read_data="{")):
+            self.assertFalse(get_explicit_review_before_upload())
 
     def test_top_level_disabled_prevents_provider_construction_even_with_live(self):
         args = argparse.Namespace(
@@ -99,6 +130,26 @@ class ExternalSafetyTests(unittest.TestCase):
         )
         with patch("trends._manifest", return_value=value), patch("trends.collect_sources") as collect:
             with self.assertRaisesRegex(ValidationError, "offline"):
+                trends._bridge(args, self.store)
+            collect.assert_not_called()
+
+    def test_llm_bridge_urls_do_not_authorize_live_research(self):
+        value = manifest()
+        cluster = opportunity().trend
+        self.store.save_cluster(cluster)
+        with open(
+            os.path.join(ROOT, "tests", "fixtures", "trends", "bridge_candidates.json"),
+            encoding="utf-8",
+        ) as file:
+            raw = json.dumps(json.load(file)["bridges"])
+        args = argparse.Namespace(
+            brand="archive", cluster_id=cluster.cluster_id, bridge_file="",
+            live_research=False, now=NOW,
+        )
+        with patch("trends._manifest", return_value=value), patch(
+            "trends._local_completion", return_value=raw
+        ), patch("trends.collect_sources") as collect:
+            with self.assertRaisesRegex(ValidationError, "offline bridge"):
                 trends._bridge(args, self.store)
             collect.assert_not_called()
 

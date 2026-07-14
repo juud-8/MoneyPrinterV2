@@ -87,7 +87,7 @@ class ScriptAnchorTests(unittest.TestCase):
         self.store = TrendStore(os.path.join(self.tmp.name, "trends.sqlite3"))
         item = opportunity()
         self.store.save_opportunity(item)
-        with patch("config.get_review_before_upload", return_value=True):
+        with patch("config.get_explicit_review_before_upload", return_value=True):
             self.seed = approve_opportunity(
                 self.store, item.opportunity_id, manifest(), operator="reviewer", reason="verified",
                 now=NOW, videos=evergreen_videos(10),

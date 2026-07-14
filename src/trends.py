@@ -258,12 +258,15 @@ def _bridge(args, store: TrendStore) -> int:
     saved = []
     for candidate in candidates:
         bridge = candidate
-        if len(bridge.historical_sources) < 2 and not args.live_research:
-            raise ValidationError(
-                "offline bridge requires at least two historical sources; "
-                "pass --live-research to authorize external source collection"
-            )
-        if not fixture or len(bridge.historical_sources) < 2:
+        research_required = not fixture or len(bridge.historical_sources) < 2
+        if research_required:
+            # Authorization belongs at the external-call site. Source URLs emitted
+            # by an LLM are untrusted data and never authorize network research.
+            if not args.live_research:
+                raise ValidationError(
+                    "offline bridge requires a fixture with at least two historical sources; "
+                    "pass --live-research to explicitly authorize external source collection"
+                )
             bridge = verify_historical_sources(bridge, collect_sources)
         bridge = with_detected_risks(cluster, bridge)
         match = catalog.best_match(bridge, cluster.canonical_entity)

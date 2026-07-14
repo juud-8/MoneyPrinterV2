@@ -464,6 +464,21 @@ def get_review_before_upload() -> bool:
         return bool(json.load(file).get("review_before_upload", True))
 
 
+def get_explicit_review_before_upload() -> bool:
+    """Fail closed unless config explicitly contains boolean true."""
+    try:
+        with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, ValueError, TypeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and "review_before_upload" in payload
+        and type(payload["review_before_upload"]) is bool
+        and payload["review_before_upload"] is True
+    )
+
+
 def get_channel_config_file() -> str:
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return json.load(file).get(
