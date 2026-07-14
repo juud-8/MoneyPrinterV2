@@ -102,6 +102,7 @@ def _request(args, terms: list[str]) -> TrendRequest:
 
 def _collect(args, store: TrendStore) -> int:
     manifest = _manifest(args.brand)
+    strategy = load_trend_strategy(manifest)
     signals = []
     results = []
     initial_terms = list(dict.fromkeys(args.term))
@@ -115,6 +116,10 @@ def _collect(args, store: TrendStore) -> int:
         )
 
     selected = args.provider or list(LIVE_PROVIDERS)
+    if selected and (not strategy.enabled or strategy.mode.value == "off"):
+        if not args.manual:
+            raise ValidationError("trend collection is disabled by the top-level strategy")
+        selected = []
     coordinator = CollectionCoordinator(store)
     for name in selected:
         if name in STUB_PROVIDERS:
@@ -233,6 +238,11 @@ def _bridge(args, store: TrendStore) -> int:
     saved = []
     for candidate in candidates:
         bridge = candidate
+        if len(bridge.historical_sources) < 2 and not args.live_research:
+            raise ValidationError(
+                "offline bridge requires at least two historical sources; "
+                "pass --live-research to authorize external source collection"
+            )
         if not fixture or len(bridge.historical_sources) < 2:
             bridge = verify_historical_sources(bridge, collect_sources)
         bridge = with_detected_risks(cluster, bridge)
@@ -355,6 +365,11 @@ def build_parser() -> argparse.ArgumentParser:
     bridge.add_argument("cluster_id")
     bridge.add_argument("--brand", required=True)
     bridge.add_argument("--bridge-file", default="", help="Offline JSON bridge candidates")
+    bridge.add_argument(
+        "--live-research",
+        action="store_true",
+        help="Explicitly authorize Wikipedia/Library of Congress source collection",
+    )
     bridge.add_argument("--now", default="")
     bridge.set_defaults(handler=_bridge)
 

@@ -11,6 +11,7 @@ import csv
 import hashlib
 import json
 import time
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,25 @@ from trend_store import TrendStore
 
 
 JsonFetcher = Callable[[str, dict[str, Any], dict[str, str], float], dict[str, Any]]
+
+_SECRET_NAME = r"(?:key|api_key|access_token|bearer|authorization|token|client_secret|xi-api-key)"
+
+
+def sanitize_provider_error(value: object) -> str:
+    """Remove credentials from provider failures before they cross a boundary."""
+    text = str(value or "")
+    text = re.sub(
+        rf"(?i)([?&]{_SECRET_NAME}=)[^&\s]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        rf"(?i)\b({_SECRET_NAME})\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", text)
+    return text[:500]
 
 
 def _parse_time(value: str) -> datetime:
@@ -229,7 +249,7 @@ class GdeltProvider(BaseProvider):
                     )
                 )
             except (requests.RequestException, ValueError, TypeError) as exc:
-                errors.append(ProviderError("provider_request_failed", f"{term}: {exc}", True))
+                errors.append(ProviderError("provider_request_failed", sanitize_provider_error(f"{term}: {exc}"), True))
         return ProviderResult(self.name, signals, errors, False, requests_made, len(signals), 0, 0, request.requested_at)
 
 
@@ -286,7 +306,7 @@ class WikimediaProvider(BaseProvider):
                     )
                 )
             except (requests.RequestException, ValueError, TypeError) as exc:
-                errors.append(ProviderError("provider_request_failed", f"{term}: {exc}", True))
+                errors.append(ProviderError("provider_request_failed", sanitize_provider_error(f"{term}: {exc}"), True))
         return ProviderResult(self.name, signals, errors, False, len(request.terms[: request.max_results]), len(signals), 0, 0, request.requested_at)
 
 
@@ -374,7 +394,7 @@ class YouTubeTrendProvider(BaseProvider):
                     )
                 )
             except (requests.RequestException, ValueError, TypeError) as exc:
-                errors.append(ProviderError("provider_request_failed", f"{term}: {exc}", True))
+                errors.append(ProviderError("provider_request_failed", sanitize_provider_error(f"{term}: {exc}"), True))
         return ProviderResult(self.name, signals, errors, False, request_count, len(signals), 0, 0, request.requested_at)
 
 

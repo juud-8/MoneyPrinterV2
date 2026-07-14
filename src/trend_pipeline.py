@@ -244,12 +244,20 @@ def reject_opportunity(
     return approval
 
 
-def validate_topic_seed_for_brand(seed: TopicSeed, manifest: dict[str, Any]) -> None:
+def validate_topic_seed_for_brand(
+    seed: TopicSeed, manifest: dict[str, Any], *, now: str | None = None
+) -> None:
+    from config import get_review_before_upload
+
     if seed.brand_id != str(manifest.get("brand_id") or ""):
         raise ValidationError("TopicSeed brand does not match the active brand")
-    if _parse_time(seed.expires_at) <= datetime.now(timezone.utc):
+    current = _parse_time(now) if now else datetime.now(timezone.utc)
+    if _parse_time(seed.expires_at) <= current:
         raise ValidationError("TopicSeed has expired")
-    if not bool((manifest.get("publishing") or {}).get("review_before_upload", True)):
+    brand_review = bool(
+        (manifest.get("publishing") or {}).get("review_before_upload", True)
+    )
+    if not bool(get_review_before_upload()) or not brand_review:
         raise ValidationError("trend-assisted production requires review_before_upload")
 
 
