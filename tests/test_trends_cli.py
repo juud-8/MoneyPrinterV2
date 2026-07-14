@@ -117,6 +117,17 @@ class TrendsCliTests(unittest.TestCase):
         self.assertEqual(code, 0, error)
         fetch.assert_not_called()
 
+    def test_collecting_same_manual_fixture_twice_is_idempotent(self):
+        for _ in range(2):
+            code, output, error = self.run_cli(
+                ["collect", "--brand", "archive", "--manual", self.manual, "--now", NOW]
+            )
+            self.assertEqual(code, 0, error or output)
+        signals = self.store.list_signals("manual")
+        clusters = self.store.list_clusters()
+        self.assertEqual(len(signals), len({item.signal_id for item in signals}))
+        self.assertEqual(len(clusters), len({item.cluster_id for item in clusters}))
+
 
 if __name__ == "__main__":
     unittest.main()

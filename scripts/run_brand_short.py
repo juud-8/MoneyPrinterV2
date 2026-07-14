@@ -116,7 +116,9 @@ def main():
         raise
     if trend_seed is not None and trend_store is not None:
         consumed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        if not trend_store.complete_topic_seed(trend_seed.seed_id, trend_claim_id, consumed_at):
+        if not trend_store.complete_topic_seed(
+            trend_seed.seed_id, trend_claim_id, consumed_at, run_id=youtube.run_id
+        ):
             raise RuntimeError("Trend seed claim was lost before generation completion")
         attribution = dict(youtube.production_metadata.get("trend_attribution") or {})
         trend_store.save_attribution(

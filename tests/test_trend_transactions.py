@@ -138,6 +138,21 @@ class TransactionTests(unittest.TestCase):
         [thread.join() for thread in threads]
         self.assertEqual(sorted(outcomes), ["approved", "blocked"])
 
+    def test_content_mix_override_records_operator_reason_time_and_shares(self):
+        item = opportunity()
+        self.store.save_opportunity(item)
+        approval, seed, _ = approve_opportunity(
+            self.store, item.opportunity_id, manifest(), operator="reviewer",
+            reason="editorial exception", override_reason="documented launch exception",
+            now=NOW, videos=[],
+        )
+        self.assertEqual(approval.operator, "reviewer")
+        self.assertEqual(approval.decided_at, NOW)
+        self.assertEqual(approval.override_reason, "documented launch exception")
+        self.assertEqual(approval.previous_calculated_share, 0)
+        self.assertEqual(approval.resulting_calculated_share, 1)
+        self.assertEqual(seed.approval_record, approval)
+
     def test_concurrent_quota_reservation_has_one_winner(self):
         calls = []
         barrier = threading.Barrier(2)

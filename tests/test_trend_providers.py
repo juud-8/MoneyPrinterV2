@@ -93,6 +93,21 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(second.cache_hit)
         self.assertEqual(calls["count"], 1)
 
+    def test_expired_cache_is_not_presented_as_current(self):
+        calls = {"count": 0}
+
+        def fake(*args):
+            calls["count"] += 1
+            return {"articles": [{"url": "https://news.test/a", "domain": "news.test"}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TrendStore(os.path.join(tmp, "trends.sqlite3"))
+            settings = ProviderSettings(enabled=True, cache_ttl_minutes=60)
+            provider = GdeltProvider(settings, fetch_json=fake)
+            CollectionCoordinator(store, clock=lambda: NOW).collect(provider, request(), settings)
+            CollectionCoordinator(store, clock=lambda: "2026-07-13T14:00:00Z").collect(provider, request(), settings)
+        self.assertEqual(calls["count"], 2)
+
     def test_cost_ceiling_blocks_before_provider_call(self):
         class PaidFixtureProvider:
             name = "paid"

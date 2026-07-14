@@ -543,12 +543,12 @@ class CollectionCoordinator:
         if not provider.enabled:
             return ProviderResult(provider.name, [], [ProviderError("disabled", f"{provider.name} provider is disabled")], False, 0, 0, 0, None, request.requested_at)
         key = self._cache_key(provider, request)
-        cached = self.store.get_cache(key, request.requested_at)
+        now_text = self.clock()
+        cached = self.store.get_cache(key, now_text)
         if cached:
             result = ProviderResult.from_dict(cached)
-            return ProviderResult(result.provider, result.signals, result.errors, True, 0, result.resource_count, 0, 0, request.requested_at)
+            return ProviderResult(result.provider, result.signals, result.errors, True, 0, result.resource_count, 0, 0, now_text)
 
-        now_text = self.clock()
         now = _parse_time(now_text)
         daily_since = _iso(now - timedelta(days=1))
         monthly_since = _iso(now - timedelta(days=30))

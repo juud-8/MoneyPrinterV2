@@ -552,14 +552,6 @@ class TrendStore:
         payload = self._load(row)
         return TopicSeed.from_dict(payload) if payload else None
 
-    def mark_seed_consumed(self, seed_id: str, run_id: str, consumed_at: str) -> None:
-        self.migrate()
-        with self.connect() as connection:
-            connection.execute(
-                "UPDATE topic_seeds SET run_id = ?, consumed_at = ? WHERE seed_id = ?",
-                (run_id, consumed_at, seed_id),
-            )
-
     def claim_topic_seed(self, seed_id: str, claimed_by: str, claimed_at: str) -> bool:
         if not claimed_by.strip():
             raise ValidationError("TopicSeed claim requires a claimant")
@@ -588,14 +580,16 @@ class TrendStore:
             )
             return updated.rowcount == 1
 
-    def complete_topic_seed(self, seed_id: str, claimed_by: str, completed_at: str) -> bool:
+    def complete_topic_seed(
+        self, seed_id: str, claimed_by: str, completed_at: str, *, run_id: str | None = None,
+    ) -> bool:
         self.migrate()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             updated = connection.execute(
                 """UPDATE topic_seeds SET completed_at = ?, consumed_at = ?, run_id = ?
                    WHERE seed_id = ? AND claimed_by = ? AND completed_at IS NULL AND failed_at IS NULL""",
-                (completed_at, completed_at, claimed_by, seed_id, claimed_by),
+                (completed_at, completed_at, run_id or claimed_by, seed_id, claimed_by),
             )
             return updated.rowcount == 1
 
