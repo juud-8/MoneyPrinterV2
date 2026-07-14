@@ -7,8 +7,9 @@ the explicit ``from_dict`` validators in this module.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
@@ -298,18 +299,30 @@ class TrendSignal:
         if provider == "google_trends" and absolute:
             raise ValidationError("Google Trends interest is relative, not absolute volume")
         expires_at = _text(data.get("expires_at"))
+        collected_at = _timestamp(data.get("collected_at"), "collected_at")
+        window_hours = _number(data.get("window_hours", 0), "window_hours", minimum=0)
+        if not expires_at and window_hours > 0:
+            collected = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+            expires_at = (collected + timedelta(hours=window_hours)).isoformat().replace("+00:00", "Z")
+        provider_signal_id = _require_text(data.get("provider_signal_id"), "provider_signal_id")
+        signal_id = _text(data.get("signal_id"))
+        if not signal_id:
+            digest = hashlib.sha256(
+                f"{provider}|{provider_signal_id}|{collected_at}".encode("utf-8")
+            ).hexdigest()[:32]
+            signal_id = f"sig_{digest}"
         return cls(
-            signal_id=_text(data.get("signal_id")) or new_id("sig"),
+            signal_id=signal_id,
             provider=provider,
-            provider_signal_id=_require_text(data.get("provider_signal_id"), "provider_signal_id"),
-            collected_at=_timestamp(data.get("collected_at"), "collected_at"),
+            provider_signal_id=provider_signal_id,
+            collected_at=collected_at,
             term=_require_text(data.get("term"), "term"),
             normalized_entity=_require_text(data.get("normalized_entity"), "normalized_entity"),
             aliases=_string_list(data.get("aliases"), "aliases"),
             entity_type=_text(data.get("entity_type")) or "unknown",
             geography=_text(data.get("geography")) or "WORLDWIDE",
             language=_text(data.get("language")) or "und",
-            window_hours=_number(data.get("window_hours", 0), "window_hours", minimum=0),
+            window_hours=window_hours,
             rank=_optional_number(data.get("rank"), "rank"),
             volume=_optional_number(data.get("volume"), "volume"),
             volume_is_absolute=absolute,

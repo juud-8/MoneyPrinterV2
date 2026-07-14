@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import unicodedata
 from datetime import datetime, timezone
 from statistics import mean
 
-from trend_models import TrendCluster, TrendSignal, new_id
+from trend_models import TrendCluster, TrendSignal
 
 
 KNOWN_ALIASES = {
@@ -62,15 +64,35 @@ def _average_known(values: list[float | None]) -> float | None:
     return mean(known) if known else None
 
 
-def cluster_signals(signals: list[TrendSignal], now: str | None = None) -> list[TrendCluster]:
-    groups: dict[str, list[tuple[TrendSignal, list[dict]]]] = {}
-    for signal in signals:
-        canonical, interpretations = resolve_entity(signal)
-        groups.setdefault(canonical, []).append((signal, interpretations))
-
+def cluster_signals(
+    signals: list[TrendSignal], now: str | None = None, *, brand_id: str = "",
+) -> list[TrendCluster]:
     current = datetime.fromisoformat((now or datetime.now(timezone.utc).isoformat()).replace("Z", "+00:00"))
+    groups: dict[tuple, list[tuple[TrendSignal, list[dict]]]] = {}
+    for signal in signals:
+        if not signal.expires_at:
+            continue
+        expires = datetime.fromisoformat(signal.expires_at.replace("Z", "+00:00"))
+        if expires <= current:
+            continue
+        canonical, interpretations = resolve_entity(signal)
+        collected = datetime.fromisoformat(signal.collected_at.replace("Z", "+00:00"))
+        window_seconds = max(int(signal.window_hours * 3600), 3600)
+        bucket = int(collected.timestamp()) // window_seconds
+        interpretation_key = tuple(sorted(str(item.get("entity") or "") for item in interpretations))
+        key = (
+            canonical,
+            normalize_text(signal.geography),
+            normalize_text(signal.language),
+            window_seconds,
+            bucket,
+            interpretation_key,
+        )
+        groups.setdefault(key, []).append((signal, interpretations))
+
     clusters = []
-    for canonical, members in groups.items():
+    for group_key, members in groups.items():
+        canonical = group_key[0]
         group_signals = [item[0] for item in members]
         times = [datetime.fromisoformat(signal.collected_at.replace("Z", "+00:00")) for signal in group_signals]
         providers = {signal.provider for signal in group_signals}
@@ -99,7 +121,9 @@ def cluster_signals(signals: list[TrendSignal], now: str | None = None) -> list[
         clusters.append(
             TrendCluster.from_dict(
                 {
-                    "cluster_id": new_id("cluster"),
+                    "cluster_id": "cluster_" + hashlib.sha256(
+                        json.dumps([brand_id, *group_key], sort_keys=True).encode("utf-8")
+                    ).hexdigest()[:32],
                     "canonical_entity": canonical,
                     "aliases": list(dict.fromkeys(alias for signal in group_signals for alias in [signal.term, *signal.aliases])),
                     "entity_type": group_signals[0].entity_type,

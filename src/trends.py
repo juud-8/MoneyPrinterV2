@@ -134,7 +134,9 @@ def _collect(args, store: TrendStore) -> int:
 
     for signal in signals:
         store.save_signal(signal)
-    clusters = cluster_signals(signals, now=args.now or utc_now()) if signals else []
+    clusters = cluster_signals(
+        signals, now=args.now or utc_now(), brand_id=args.brand
+    ) if signals else []
     for cluster in clusters:
         store.save_cluster(cluster)
     _print_json(
@@ -199,10 +201,14 @@ def _local_completion(prompt: str) -> str:
 
 def _expiry(cluster, now: str) -> str:
     values = [signal.expires_at for signal in cluster.signals if signal.expires_at]
-    if values:
-        return min(values)
     current = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(timezone.utc)
-    return (current + timedelta(hours=48)).isoformat().replace("+00:00", "Z")
+    valid = [
+        value for value in values
+        if datetime.fromisoformat(value.replace("Z", "+00:00")) > current
+    ]
+    if not valid:
+        raise ValidationError("cluster has no unexpired signal with explicit expiration")
+    return min(valid)
 
 
 def _policy(manifest: dict[str, Any]) -> TrendPolicy:
@@ -224,6 +230,16 @@ def _bridge(args, store: TrendStore) -> int:
     cluster = store.get_cluster(args.cluster_id)
     if not cluster:
         raise ValidationError(f"unknown cluster: {args.cluster_id}")
+    now = args.now or utc_now()
+    refreshed = [
+        item for item in cluster_signals(cluster.signals, now=now, brand_id=args.brand)
+        if item.canonical_entity == cluster.canonical_entity
+    ]
+    if not refreshed:
+        raise ValidationError("all signals in the cluster have expired; recollect before bridging")
+    if len(refreshed) != 1:
+        raise ValidationError("stored cluster now resolves to multiple bounded contexts; recollect before bridging")
+    cluster = refreshed[0]
     if args.bridge_file:
         with open(args.bridge_file, encoding="utf-8") as file:
             raw_value = json.load(file)
@@ -234,7 +250,6 @@ def _bridge(args, store: TrendStore) -> int:
         fixture = False
     candidates = parse_bridge_candidates(raw, cluster)
     catalog = TrendCatalog.from_repository(args.brand)
-    now = args.now or utc_now()
     saved = []
     for candidate in candidates:
         bridge = candidate
