@@ -63,7 +63,7 @@ Add this under `production` in the private `brands/<brand_id>/manifest.json`. Ke
 }
 ```
 
-To permit suggestions, set only `enabled` to `true` and `mode` to `suggest`. Enable providers individually after reviewing quotas. Keep `publishing.review_before_upload` true in the brand manifest and `review_before_upload` true in `config.json`.
+To permit suggestions, set only `enabled` to `true` and `mode` to `suggest`. Enable providers individually after reviewing quotas. Trend-assisted generation fails closed unless both `publishing.review_before_upload` in the brand manifest and `review_before_upload` in `config.json` exist and are the JSON boolean `true`. Missing values, strings such as `"true"`, integers, null, malformed configuration, and false values are rejected.
 
 The YouTube Data API provider uses the existing dedicated `youtube_api_key` setting or `YOUTUBE_API_KEY`. Do not put credentials in a brand manifest.
 Public YouTube trend records carry `fetched_at`, `refresh_due_at`, `delete_or_expire_at`, policy, and source provenance. Before production use, reverify the current YouTube API Services Terms and set `retention_policy_verified` deliberately; do not treat this document as permanent policy advice.
@@ -95,14 +95,14 @@ python src/trends.py retention --provider youtube
 python src/trends.py retention --provider youtube --purge
 ```
 
-Generate bridge candidates locally and collect historical sources:
+Generate bridge candidates with the local model and explicitly authorize live historical research. This command can call Wikipedia and the Library of Congress:
 
 ```powershell
-python src/trends.py bridge <cluster_id> --brand <brand_id>
+python src/trends.py bridge <cluster_id> --brand <brand_id> --live-research
 python src/trends.py opportunities --brand <brand_id>
 ```
 
-For an entirely offline review, provide validated bridge candidates with at least two independent historical source domains:
+For an entirely offline review, provide validated fixture bridge candidates with at least two independent historical source domains. Without `--live-research`, model-emitted URLs never authorize network access and non-fixture bridge output fails explicitly:
 
 ```powershell
 python src/trends.py bridge <cluster_id> --brand <brand_id> --bridge-file tests/fixtures/trends/bridge_candidates.json
@@ -135,11 +135,27 @@ python scripts/run_brand_short.py <brand_id> --trend-seed <seed_id>
 
 That command generates reviewable media but does not upload unless the operator separately adds `--upload` and the existing review gate permits it.
 
+If a generation process exits after claiming a seed, inspect the run before explicitly releasing the active claim:
+
+```powershell
+python src/trends.py seed release <seed_id> --operator "<name>" --reason "<verified reason>"
+```
+
+Failures with uncertain external side effects are quarantined. Recovery requires an explicit elevated confirmation; completed and terminally failed seeds cannot be recovered:
+
+```powershell
+python src/trends.py seed recover <seed_id> --operator "<name>" --reason "<verification performed>" --confirm-uncertain-side-effects
+```
+
+Both commands write an audit event. There is no automatic stale-claim recovery.
+
 ## Persistence and rollback
 
-Trend data lives in `.mp/trends.sqlite3`; canonical records use stable IDs rather than titles. Schema migrations are repeatable and recorded in `schema_migrations`. Upgrading an existing v1 database creates `.mp/trends.sqlite3.v1.bak` before changing the schema.
+Trend data lives in `.mp/trends.sqlite3`; canonical records use stable IDs rather than titles. Schema migrations are repeatable and recorded in `schema_migrations`. Before every version upgrade, migration creates a unique `trends.sqlite3.pre-v<source>-to-v<target>-<UTC timestamp>.bak` through a temporary file, verifies SQLite integrity and the recorded source version, and then atomically publishes the backup. Existing backups are never silently overwritten.
 
 To roll back application code, switch back to the reviewed baseline branch/commit. To roll back only local trend data, stop all MoneyPrinterV2 processes, preserve the current database for investigation, and restore the versioned `.bak` file. Do not overwrite `.mp/analytics.json`; the trend database is separate.
+
+New analytics timestamps are stored as aware UTC ISO-8601 values. Legacy naive analytics timestamps are interpreted using the brand's explicit `publishing.timezone`; when absent, the documented fallback is UTC. Content-mix windows compare normalized UTC datetimes rather than strings.
 
 ## Known MVP limits
 

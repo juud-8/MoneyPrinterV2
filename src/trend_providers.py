@@ -85,30 +85,36 @@ def fetch_json_with_retries(
                     headers=headers, timeout=(min(timeout, 5.0), timeout),
                     allow_redirects=False, stream=True,
                 )
-                if response.status_code not in {301, 302, 303, 307, 308}:
-                    break
-                if redirect_count >= MAX_REDIRECTS:
-                    raise ValueError("provider response exceeded redirect limit")
-                location = response.headers.get("Location") or ""
-                current_url = urljoin(current_url, location)
-                parsed_redirect = urlparse(current_url)
-                if parsed_redirect.scheme != "https" or parsed_redirect.hostname not in allowed_hosts:
-                    raise ValueError("provider redirect target is not allowlisted")
-            if response.status_code == 429 and attempt + 1 < attempts:
-                retry_after = min(float(response.headers.get("Retry-After", "1") or 1), 5.0)
-                time.sleep(max(retry_after, 0))
-                continue
-            response.raise_for_status()
-            length = response.headers.get("Content-Length")
-            if length and int(length) > MAX_RESPONSE_BYTES:
-                raise ValueError("provider response exceeds maximum size")
-            body = bytearray()
-            for chunk in response.iter_content(chunk_size=65536):
-                body.extend(chunk)
-                if len(body) > MAX_RESPONSE_BYTES:
-                    raise ValueError("provider response exceeds maximum size")
-            payload = json.loads(body.decode("utf-8"))
-            return payload if isinstance(payload, dict) else {}
+                try:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        if redirect_count >= MAX_REDIRECTS:
+                            raise ValueError("provider response exceeded redirect limit")
+                        location = response.headers.get("Location") or ""
+                        current_url = urljoin(current_url, location)
+                        parsed_redirect = urlparse(current_url)
+                        if parsed_redirect.scheme != "https" or parsed_redirect.hostname not in allowed_hosts:
+                            raise ValueError("provider redirect target is not allowlisted")
+                        continue
+                    if response.status_code == 429 and attempt + 1 < attempts:
+                        retry_after = min(float(response.headers.get("Retry-After", "1") or 1), 5.0)
+                        time.sleep(max(retry_after, 0))
+                        break
+                    response.raise_for_status()
+                    length = response.headers.get("Content-Length")
+                    if length and int(length) > MAX_RESPONSE_BYTES:
+                        raise ValueError("provider response exceeds maximum size")
+                    body = bytearray()
+                    for chunk in response.iter_content(chunk_size=65536):
+                        body.extend(chunk)
+                        if len(body) > MAX_RESPONSE_BYTES:
+                            raise ValueError("provider response exceeds maximum size")
+                    payload = json.loads(body.decode("utf-8"))
+                    return payload if isinstance(payload, dict) else {}
+                finally:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
             if attempt + 1 < attempts:

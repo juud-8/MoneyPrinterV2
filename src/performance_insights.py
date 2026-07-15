@@ -17,7 +17,7 @@ Guard rails:
   a weak video the feed happened to seed harder.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import analytics
 
@@ -34,7 +34,12 @@ def _video_age_ok(entry: dict, now: datetime | None = None) -> bool:
     published = analytics._parse_date(entry.get("date", ""))
     if published is None:
         return True
-    return published <= (now or datetime.now()) - timedelta(hours=MIN_AGE_HOURS)
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    else:
+        reference = reference.astimezone(timezone.utc)
+    return published <= reference - timedelta(hours=MIN_AGE_HOURS)
 
 
 def _performance_score(entry: dict) -> float:
