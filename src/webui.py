@@ -64,12 +64,17 @@ def _read_config() -> dict:
 
 
 def _check_ollama(base_url: str) -> dict:
-    try:
-        with urllib.request.urlopen(f"{base_url.rstrip('/')}/api/version", timeout=1.5) as res:
-            version = json.loads(res.read().decode("utf-8", "replace")).get("version", "")
-            return {"ok": True, "detail": f"v{version}" if version else "reachable"}
-    except Exception as e:  # noqa: BLE001 — any failure means "down" here
-        return {"ok": False, "detail": str(e.__class__.__name__)}
+    # Two attempts: a busy Ollama (mid-generation) can miss a short timeout,
+    # and one flaky probe shouldn't paint the whole panel CRITICAL.
+    last_error = ""
+    for attempt, timeout in enumerate((1.5, 3.0)):
+        try:
+            with urllib.request.urlopen(f"{base_url.rstrip('/')}/api/version", timeout=timeout) as res:
+                version = json.loads(res.read().decode("utf-8", "replace")).get("version", "")
+                return {"ok": True, "detail": f"v{version}" if version else "reachable"}
+        except Exception as e:  # noqa: BLE001 — any failure means "down" here
+            last_error = str(e.__class__.__name__)
+    return {"ok": False, "detail": last_error}
 
 
 def _build_health() -> dict:

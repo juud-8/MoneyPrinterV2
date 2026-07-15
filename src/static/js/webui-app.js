@@ -248,14 +248,22 @@
     }
   }
 
+  let healthRetryTimer = null;
+
   async function fetchHealth(force) {
     try {
       healthCache = await api(`/api/health${force ? "?force=1" : ""}`);
       renderHealth();
+      const states = healthStates(healthCache);
+      const failing = HEALTH_ITEMS.filter((i) => states[i.key] === "bad").map((i) => i.label);
       if (force) {
-        const states = healthStates(healthCache);
-        const failing = HEALTH_ITEMS.filter((i) => states[i.key] === "bad").map((i) => i.label);
         toast(failing.length ? `Systems check: ${failing.join(" · ")} DOWN` : "Systems check: all nominal", failing.length > 0);
+      }
+      // A CRITICAL reading gets re-verified quickly instead of waiting for
+      // the normal 90s poll — transient probe failures shouldn't linger.
+      clearTimeout(healthRetryTimer);
+      if (failing.length && !document.hidden) {
+        healthRetryTimer = setTimeout(() => fetchHealth(true).catch(() => {}), 20000);
       }
     } catch (e) {
       healthCache = null;
