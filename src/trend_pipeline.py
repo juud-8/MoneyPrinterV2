@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+import hashlib
 import re
 from typing import Any
 
@@ -127,6 +128,27 @@ def create_topic_seed(opportunity: TrendOpportunity, approval: ApprovalRecord) -
     related_terms = list(
         dict.fromkeys(term for signal in trend.signals for term in signal.related_terms)
     )
+    def sourced_claim(kind: str, text: str) -> dict[str, Any]:
+        claim_id = "claim_" + hashlib.sha256(f"{kind}|{text}".encode("utf-8")).hexdigest()[:24]
+        return {
+            "claim_id": claim_id, "kind": kind, "text": text,
+            "source_urls": bridge.historical_sources,
+        }
+
+    structured_claims = {
+        "primary_entities": [trend.canonical_entity],
+        "event_identity": bridge.historical_event,
+        "period": bridge.specific_number,
+        "cause": "",
+        "official_response": bridge.absurd_contradiction,
+        "central_contradiction": bridge.absurd_contradiction,
+        "consequence": bridge.central_payoff,
+        "sourced_claims": [
+            sourced_claim("event_identity", bridge.historical_event),
+            sourced_claim("official_response", bridge.absurd_contradiction),
+            sourced_claim("consequence", bridge.central_payoff),
+        ],
+    }
     return TopicSeed.from_dict(
         {
             "seed_id": new_id("seed"),
@@ -159,8 +181,10 @@ def create_topic_seed(opportunity: TrendOpportunity, approval: ApprovalRecord) -
                 "opportunity_id": opportunity.opportunity_id,
                 "cluster_id": trend.cluster_id,
                 "trend_assisted": True,
+                "structured_claims": structured_claims,
             },
             "created_at": approval.decided_at,
+            "structured_claims": structured_claims,
         }
     )
 
@@ -308,7 +332,7 @@ def validate_topic_seed_script(seed: TopicSeed, script: str) -> None:
     if len(text) < 180:
         raise ValidationError("trend-assisted script is too short for semantic validation")
 
-    stop = {"about", "after", "before", "could", "from", "have", "historical", "into", "more", "people", "that", "their", "there", "these", "this", "those", "with"}
+    stop = {"about", "after", "before", "could", "from", "have", "historical", "into", "more", "people", "that", "their", "there", "these", "this", "those", "with", "the", "of", "and", "was", "were"}
 
     def tokens(value: str) -> set[str]:
         result = set()
@@ -321,29 +345,59 @@ def validate_topic_seed_script(seed: TopicSeed, script: str) -> None:
                 result.add(token)
         return result
 
+    def ordered_tokens(value: str) -> list[str]:
+        ordered = []
+        for raw in re.findall(r"[a-z0-9]+", (value or "").lower()):
+            if raw.startswith("danc"):
+                normalized = "dance"
+            elif raw in {"official", "officials", "authorities", "authority"}:
+                normalized = "official"
+            elif raw in {"prescribed", "ordered", "ordering", "responded", "response"}:
+                normalized = "official_action"
+            elif raw in {"stop", "stopped", "involuntary"}:
+                normalized = "involuntary"
+            else:
+                normalized = raw
+            if len(normalized) >= 4 and normalized not in stop and normalized not in _years_as_tokens(value):
+                ordered.append(normalized)
+        return ordered
+
+    sentence_tokens = [ordered_tokens(sentence) for sentence in re.split(r"[.!?]+", text) if sentence.strip()]
     script_tokens = tokens(text)
-    entity_tokens = tokens(seed.primary_entity)
-    event_tokens = tokens(seed.historical_event) - _years_as_tokens(seed.historical_event)
-    contradiction_tokens = tokens(seed.absurd_contradiction)
-    entity_agrees = bool(entity_tokens & script_tokens)
-    event_overlap = event_tokens & script_tokens
-    event_agrees = len(event_overlap) >= min(2, len(event_tokens))
-    contradiction_overlap = contradiction_tokens & script_tokens
-    contradiction_agrees = (
-        len(contradiction_overlap) >= 2
-        and len(contradiction_overlap) / max(len(contradiction_tokens), 1) >= 0.3
-    )
-    date_agrees = bool(seed.specific_number_date and seed.specific_number_date.lower() in text.lower())
-    if not entity_agrees:
+    claims = seed.structured_claims
+    entity_tokens = set().union(*(tokens(entity) for entity in claims.primary_entities))
+    if not entity_tokens & script_tokens:
         raise ValidationError("script primary entity does not match the approved TopicSeed")
-    if not event_agrees:
-        raise ValidationError("script event does not match the approved TopicSeed")
-    if not contradiction_agrees:
-        raise ValidationError("script omits or contradicts the approved central claim")
-    if len(seed.historical_source_references) < 2:
-        raise ValidationError("approved central claim lacks adequate source backing")
-    if sum([entity_agrees, event_agrees, contradiction_agrees, date_agrees]) < 3:
-        raise ValidationError("script does not preserve multiple approved semantic anchors")
+
+    event_signature = ordered_tokens(claims.event_identity)
+    event_signature = [token for token in event_signature if token not in _years_as_tokens(claims.event_identity)]
+    required_event = event_signature[: min(3, len(event_signature))]
+    event_agrees = False
+    for sentence in sentence_tokens:
+        if not set(required_event).issubset(sentence):
+            continue
+        positions = [sentence.index(token) for token in required_event]
+        if max(positions) - min(positions) <= max(3, len(required_event)):
+            event_agrees = True
+            break
+    if not required_event or not event_agrees:
+        raise ValidationError("script does not preserve the structured historical event identity")
+
+    if claims.period.casefold() not in text.casefold():
+        raise ValidationError("script omits the approved historical period")
+
+    def claim_is_present(claim_text: str, minimum: int) -> bool:
+        required = set(ordered_tokens(claim_text))
+        threshold = min(minimum, len(required))
+        return threshold > 0 and any(len(required & set(sentence)) >= threshold for sentence in sentence_tokens)
+
+    if not claim_is_present(claims.official_response, 3):
+        raise ValidationError("script omits the source-backed official response")
+    if not claim_is_present(claims.consequence, 2):
+        raise ValidationError("script omits the source-backed consequence")
+    required_claims = {"event_identity", "official_response", "consequence"}
+    if not required_claims.issubset({claim.kind for claim in claims.sourced_claims}):
+        raise ValidationError("approved structured claims lack source backing")
 
 
 def _years_as_tokens(value: str) -> set[str]:

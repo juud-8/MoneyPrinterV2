@@ -80,6 +80,7 @@ class RecommendedAction(str, Enum):
     NEW_VIDEO = "new_video"
     ALTERNATE_ANGLE = "alternate_angle"
     RESURFACE_EXISTING = "resurface_existing"
+    HUMAN_REVIEW_REQUIRED = "human_review_required"
     SKIP = "skip"
 
 
@@ -98,6 +99,7 @@ class CatalogDecision(str, Enum):
     NEW_VIDEO = "new_video"
     ALTERNATE_ANGLE = "alternate_angle"
     RESURFACE_EXISTING = "resurface_existing"
+    HUMAN_REVIEW_REQUIRED = "human_review_required"
     SKIP = "skip"
 
 
@@ -677,6 +679,77 @@ class ApprovalRecord:
 
 
 @dataclass(frozen=True)
+class SourceBackedClaim:
+    claim_id: str
+    kind: str
+    text: str
+    source_urls: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SourceBackedClaim":
+        kind = _require_text(data.get("kind"), "claim.kind")
+        text = _require_text(data.get("text"), "claim.text")
+        sources = _urls(data.get("source_urls"), "claim.source_urls")
+        if len({urlparse(url).hostname for url in sources}) < 2:
+            raise ValidationError("each required structured claim needs two source domains")
+        claim_id = _text(data.get("claim_id"))
+        if not claim_id:
+            claim_id = "claim_" + hashlib.sha256(f"{kind}|{text}".encode("utf-8")).hexdigest()[:24]
+        return cls(claim_id=claim_id, kind=kind, text=text, source_urls=sources)
+
+
+@dataclass(frozen=True)
+class StructuredEventClaims:
+    primary_entities: list[str]
+    event_identity: str
+    period: str
+    cause: str
+    official_response: str
+    central_contradiction: str
+    consequence: str
+    sourced_claims: list[SourceBackedClaim]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "StructuredEventClaims":
+        claims_raw = data.get("sourced_claims") or []
+        if not isinstance(claims_raw, list):
+            raise ValidationError("structured sourced_claims must be a list")
+        claims = [
+            item if isinstance(item, SourceBackedClaim) else SourceBackedClaim.from_dict(item)
+            for item in claims_raw
+        ]
+        required_kinds = {"event_identity", "official_response", "consequence"}
+        if not required_kinds.issubset({claim.kind for claim in claims}):
+            raise ValidationError("structured claims omit a required source-backed fact")
+        event_identity = _require_text(data.get("event_identity"), "event_identity")
+        official_response = _require_text(data.get("official_response"), "official_response")
+        consequence = _require_text(data.get("consequence"), "consequence")
+        expected = {
+            "event_identity": event_identity,
+            "official_response": official_response,
+            "consequence": consequence,
+        }
+        for kind, text in expected.items():
+            if not any(claim.kind == kind and claim.text == text for claim in claims):
+                raise ValidationError(f"structured {kind} does not match its source-backed claim")
+        return cls(
+            primary_entities=_string_list(data.get("primary_entities"), "primary_entities", required=True),
+            event_identity=event_identity,
+            period=_require_text(data.get("period"), "period"),
+            cause=_text(data.get("cause")),
+            official_response=official_response,
+            central_contradiction=_require_text(data.get("central_contradiction"), "central_contradiction"),
+            consequence=consequence,
+            sourced_claims=claims,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["sourced_claims"] = [asdict(claim) for claim in self.sourced_claims]
+        return payload
+
+
+@dataclass(frozen=True)
 class TopicSeed:
     seed_id: str
     brand_id: str
@@ -706,6 +779,7 @@ class TopicSeed:
     approval_record: ApprovalRecord
     attribution_metadata: dict[str, Any]
     created_at: str
+    structured_claims: StructuredEventClaims
     schema_version: int = SCHEMA_VERSION
 
     @classmethod
@@ -729,6 +803,14 @@ class TopicSeed:
         components = data.get("component_scores") or []
         if not isinstance(components, list):
             raise ValidationError("component_scores must be a list")
+        historical_sources = _urls(data.get("historical_source_references"), "historical_source_references")
+        structured_raw = data.get("structured_claims")
+        if not structured_raw:
+            structured_raw = _legacy_structured_claims(data, historical_sources)
+        structured = (
+            structured_raw if isinstance(structured_raw, StructuredEventClaims)
+            else StructuredEventClaims.from_dict(structured_raw)
+        )
         return cls(
             seed_id=_text(data.get("seed_id")) or new_id("seed"),
             brand_id=brand_id,
@@ -742,7 +824,7 @@ class TopicSeed:
             detected_at=_timestamp(data.get("detected_at"), "detected_at"),
             expires_at=_timestamp(data.get("expires_at"), "expires_at"),
             historical_event=_require_text(data.get("historical_event"), "historical_event"),
-            historical_source_references=_urls(data.get("historical_source_references"), "historical_source_references"),
+            historical_source_references=historical_sources,
             relationship_type=_enum(RelationshipType, data.get("relationship_type"), "relationship_type"),
             relationship_explanation=_require_text(data.get("relationship_explanation"), "relationship_explanation"),
             specific_number_date=_require_text(data.get("specific_number_date"), "specific_number_date"),
@@ -758,6 +840,7 @@ class TopicSeed:
             approval_record=approval,
             attribution_metadata=_mapping(data.get("attribution_metadata"), "attribution_metadata"),
             created_at=_timestamp(data.get("created_at"), "created_at"),
+            structured_claims=structured,
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
         )
 
@@ -766,4 +849,30 @@ class TopicSeed:
         payload["relationship_type"] = self.relationship_type.value
         payload["catalog_decision"] = self.catalog_decision.value
         payload["approval_record"] = self.approval_record.to_dict()
+        payload["structured_claims"] = self.structured_claims.to_dict()
         return payload
+
+
+def _legacy_structured_claims(data: dict[str, Any], sources: list[str]) -> dict[str, Any]:
+    def claim(kind: str, text: str) -> dict[str, Any]:
+        return {"kind": kind, "text": text, "source_urls": sources}
+
+    event = _require_text(data.get("historical_event"), "historical_event")
+    response = _require_text(data.get("absurd_contradiction"), "absurd_contradiction")
+    consequence = _require_text(
+        data.get("central_payoff") or data.get("description_context_sentence"), "structured consequence"
+    )
+    return {
+        "primary_entities": [_require_text(data.get("primary_entity"), "primary_entity")],
+        "event_identity": event,
+        "period": _require_text(data.get("specific_number_date"), "specific_number_date"),
+        "cause": "",
+        "official_response": response,
+        "central_contradiction": response,
+        "consequence": consequence,
+        "sourced_claims": [
+            claim("event_identity", event),
+            claim("official_response", response),
+            claim("consequence", consequence),
+        ],
+    }

@@ -171,7 +171,7 @@ def eligibility_failures(
     expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     if (expiry - current).total_seconds() / 3600 <= policy.estimated_production_hours:
         failures.append("trend expires before production can complete")
-    if catalog_match.decision.value in {"skip", "resurface_existing"}:
+    if catalog_match.decision.value in {"skip", "resurface_existing", "human_review_required"}:
         failures.append("catalog decision does not permit new production")
     return failures
 

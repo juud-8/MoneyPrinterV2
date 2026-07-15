@@ -26,7 +26,13 @@ class CatalogAuthorityTests(unittest.TestCase):
             catalog_id="existing", brand_id="archive",
             title="How the 1905 Bison Herd Preserved the Species",
             subject="The 1905 bison preservation herd", status="uploaded",
-            entities=["american bison"], metadata=metadata,
+            entities=["american bison"],
+            event_identity=str(metadata.pop("historical_event", "The 1905 bison preservation herd")),
+            period=str(metadata.pop("period", "1905")),
+            consequence=str(metadata.pop("consequence", "A private herd became preservation stock.")),
+            central_claim=str(metadata.pop("central_claim", "A private herd helped rescue a national symbol.")),
+            source_claim_ids=list(metadata.pop("source_claim_ids", ["claim-event", "claim-consequence"])),
+            metadata=metadata,
         )])
 
     def test_light_rewrite_cannot_be_alternate_angle(self):
@@ -45,15 +51,15 @@ class CatalogAuthorityTests(unittest.TestCase):
             "absurd_contradiction": "Animals once confined privately became the core of a federal herd.",
         })
         match = self._catalog(
-            central_payoff="A private herd became preservation stock.",
             consequence="The private herd preserved breeding stock locally.",
+            central_claim="A private collection remained local preservation stock.",
         ).best_match(candidate, "american bison")
         self.assertEqual(match.decision, CatalogDecision.ALTERNATE_ANGLE)
 
     def test_uncertain_distinction_requires_review(self):
         candidate = catalog_bridge("The role of private bison collections in conservation policy", "alternate_angle")
         match = self._catalog().best_match(candidate, "american bison")
-        self.assertEqual(match.decision, CatalogDecision.SKIP)
+        self.assertEqual(match.decision, CatalogDecision.HUMAN_REVIEW_REQUIRED)
         self.assertIn("human review", match.reason.lower())
 
 
@@ -99,6 +105,16 @@ class ScriptAnchorTests(unittest.TestCase):
     def test_unrelated_1518_cooking_story_fails(self):
         script = ("In 1518 a palace kitchen prepared an enormous royal feast. "
                   "Cooks measured flour, tended ovens, served nobles, and recorded recipes. " * 4)
+        with self.assertRaises(ValidationError):
+            validate_topic_seed_script(self.seed, script)
+
+    def test_token_stuffed_cooking_story_still_fails(self):
+        script = (
+            "In 1518 a palace kitchen prepared a feast while rumors of plague reached the market. "
+            "A dance entertained the guests, and officials prescribed a pause to stop the noise. "
+            "Cooks measured flour, tended ovens, served nobles, catalogued spices, and recorded recipes. "
+            "Nothing in this account describes a historical outbreak or a civic attempted cure. " * 2
+        )
         with self.assertRaises(ValidationError):
             validate_topic_seed_script(self.seed, script)
 

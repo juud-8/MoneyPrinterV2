@@ -106,7 +106,9 @@ class TrendModelTests(unittest.TestCase):
                 "detected_at": NOW,
                 "expires_at": LATER,
                 "historical_event": "The dancing plague of 1518",
-                "historical_source_references": ["https://example.test/history"],
+                "historical_source_references": [
+                    "https://example.test/history", "https://archive.test/history"
+                ],
                 "relationship_type": "exact_entity",
                 "relationship_explanation": "Both concern sustained public dancing, separated by five centuries.",
                 "specific_number_date": "1518",

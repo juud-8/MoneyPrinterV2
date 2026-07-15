@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 SRC = os.path.join(ROOT, "src")
@@ -50,6 +51,11 @@ class CatalogTests(unittest.TestCase):
                     status="uploaded",
                     youtube_video_id="bison1905",
                     entities=["american bison"],
+                    event_identity="The 1905 bison preservation herd",
+                    period="1905",
+                    consequence="A private herd became preservation stock.",
+                    central_claim="A private herd helped rescue a national symbol.",
+                    source_claim_ids=["claim-event", "claim-consequence"],
                 )
             ]
         )
@@ -59,15 +65,59 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(match.decision.value, "resurface_existing")
 
     def test_materially_different_bison_story_is_alternate_angle(self):
-        match = self.catalog.best_match(
-            bridge("The 1886 Smithsonian expedition that collected bison specimens", "alternate_angle"),
-            "american bison",
-        )
+        candidate = bridge("The 1886 Smithsonian expedition that collected bison specimens", "alternate_angle")
+        candidate = ArchiveBridge.from_dict({
+            **candidate.to_dict(),
+            "central_payoff": "The specimens created the Smithsonian's reference collection.",
+            "absurd_contradiction": "Conservation history preserved animals by first collecting dead specimens.",
+        })
+        match = self.catalog.best_match(candidate, "american bison")
         self.assertEqual(match.decision.value, "alternate_angle")
 
     def test_new_entity_is_new_video(self):
         match = self.catalog.best_match(bridge("The dancing plague of 1518"), "dance")
         self.assertEqual(match.decision.value, "new_video")
+
+    def test_real_catalog_loader_supports_genuine_alternate_angle(self):
+        video = {
+            "brand_id": "archive", "title": "The 1905 Bison Preservation Herd",
+            "subject": "The 1905 bison preservation herd", "status": "uploaded",
+            "historical_entities": ["american bison"], "url": "https://youtu.be/bison1905",
+            "production": {"trend_attribution": {"structured_claims": {
+                "primary_entities": ["american bison"],
+                "event_identity": "The 1905 bison preservation herd", "period": "1905",
+                "cause": "Private conservation breeding",
+                "official_response": "Officials transferred animals to a federal reserve.",
+                "consequence": "A private herd became preservation stock.",
+                "central_contradiction": "A private herd helped rescue a national symbol.",
+                "sourced_claims": [
+                    {"claim_id": "event-1905", "kind": "event_identity", "text": "The 1905 bison preservation herd", "source_urls": ["https://history.test/event", "https://archive.test/event"]},
+                    {"claim_id": "response-1905", "kind": "official_response", "text": "Officials transferred animals to a federal reserve.", "source_urls": ["https://history.test/response", "https://archive.test/response"]},
+                    {"claim_id": "claim-preservation", "kind": "consequence", "text": "A private herd became preservation stock.", "source_urls": ["https://history.test/consequence", "https://archive.test/consequence"]},
+                ],
+            }}},
+        }
+        with patch("analytics.dedupe_videos", return_value=[video]), patch(
+            "analytics._load", return_value={"topic_rejections": []}
+        ):
+            catalog = TrendCatalog.from_repository("archive")
+        candidate = bridge("The 1905 transfer of bison to a federal reserve", "alternate_angle")
+        candidate = ArchiveBridge.from_dict({
+            **candidate.to_dict(),
+            "central_payoff": "The transfer established a federal breeding population.",
+            "absurd_contradiction": "Privately confined animals became the core of a federal herd.",
+        })
+        self.assertEqual(
+            catalog.best_match(candidate, "american bison").decision.value,
+            "alternate_angle",
+        )
+
+    def test_shifted_date_alone_never_creates_alternate_angle(self):
+        candidate = bridge("The 1906 bison preservation herd", "alternate_angle")
+        self.assertNotEqual(
+            self.catalog.best_match(candidate, "american bison").decision.value,
+            "alternate_angle",
+        )
 
 
 if __name__ == "__main__":

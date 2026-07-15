@@ -11,7 +11,7 @@ from typing import Any
 
 from config import ROOT_DIR
 from topic_similarity import topic_similarity
-from trend_models import ArchiveBridge, CatalogDecision
+from trend_models import ArchiveBridge, CatalogDecision, StructuredEventClaims, ValidationError
 
 
 @dataclass(frozen=True)
@@ -24,13 +24,18 @@ class CatalogEntry:
     youtube_video_id: str = ""
     entities: list[str] = field(default_factory=list)
     research_topic: str = ""
+    event_identity: str = ""
+    period: str = ""
+    consequence: str = ""
+    central_claim: str = ""
+    source_claim_ids: list[str] = field(default_factory=list)
     source: str = "analytics"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def searchable_text(self) -> str:
         return " ".join(
-            value for value in [self.title, self.subject, self.research_topic, *self.entities] if value
+            value for value in [self.title, self.subject, self.research_topic, self.event_identity, *self.entities] if value
         )
 
 
@@ -49,6 +54,11 @@ class CatalogMatch:
             "youtube_video_id": self.entry.youtube_video_id,
             "title": self.entry.title,
             "subject": self.entry.subject,
+            "event_identity": self.entry.event_identity,
+            "period": self.entry.period,
+            "consequence": self.entry.consequence,
+            "central_claim": self.entry.central_claim,
+            "source_claim_ids": self.entry.source_claim_ids,
             "similarity": round(self.similarity, 4),
             "reason": self.reason,
         }
@@ -67,29 +77,42 @@ def _entity_tokens(text: str) -> set[str]:
     }
 
 
-def _years(text: str) -> set[str]:
-    return set(re.findall(r"\b(?:1[0-9]{3}|20[0-9]{2})\b", text or ""))
+def _without_years(text: str) -> str:
+    return re.sub(r"\b(?:1[0-9]{3}|20[0-9]{2})\b", " ", text or "").strip()
 
 
 def _material_differences(bridge: ArchiveBridge, entry: CatalogEntry) -> list[str]:
-    """Return catalog-supported differences; LLM relationship labels are advisory."""
+    """Return differences supported by persisted structured catalog fields."""
     differences: list[str] = []
-    existing_event = str(entry.metadata.get("historical_event") or entry.subject or entry.title)
-    if existing_event and topic_similarity(bridge.historical_event, existing_event) < 0.45:
+    existing_event = entry.event_identity
+    if existing_event and topic_similarity(
+        _without_years(bridge.historical_event), _without_years(existing_event)
+    ) < 0.45:
         differences.append("historical event")
-    candidate_years = _years(bridge.historical_event) or _years(bridge.specific_number)
-    existing_years = _years(" ".join([existing_event, str(entry.metadata.get("period") or "")]))
-    if candidate_years and existing_years and candidate_years.isdisjoint(existing_years):
-        differences.append("date or period")
     comparisons = (
-        ("consequence", bridge.absurd_contradiction, entry.metadata.get("consequence")),
-        ("payoff", bridge.central_payoff, entry.metadata.get("central_payoff")),
-        ("sourced central claim", bridge.central_payoff, entry.metadata.get("central_claim")),
+        ("consequence", bridge.central_payoff, entry.consequence),
+        ("sourced central claim", bridge.absurd_contradiction, entry.central_claim),
     )
     for dimension, candidate, existing in comparisons:
         if existing and topic_similarity(candidate, str(existing)) < 0.35:
             differences.append(dimension)
     return differences
+
+
+def _structured_claims_from_video(video: dict[str, Any]) -> dict[str, Any]:
+    production = video.get("production") or {}
+    attribution = (production.get("trend_attribution") or {}) if isinstance(production, dict) else {}
+    claims = attribution.get("structured_claims") or video.get("structured_claims") or {}
+    return _validated_structured_claims(claims)
+
+
+def _validated_structured_claims(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    try:
+        return StructuredEventClaims.from_dict(value).to_dict()
+    except (ValidationError, TypeError, ValueError):
+        return {}
 
 
 class TrendCatalog:
@@ -105,6 +128,8 @@ class TrendCatalog:
             for index, video in enumerate(analytics.dedupe_videos()):
                 if video.get("brand_id") != brand_id:
                     continue
+                claims = _structured_claims_from_video(video)
+                sourced = claims.get("sourced_claims") or []
                 entries.append(
                     CatalogEntry(
                         catalog_id=f"video:{_youtube_id(video.get('url', '')) or index}",
@@ -113,7 +138,15 @@ class TrendCatalog:
                         subject=str(video.get("subject") or ""),
                         status=str(video.get("status") or "generated"),
                         youtube_video_id=_youtube_id(video.get("url", "")),
-                        entities=list(video.get("historical_entities") or []),
+                        entities=list(video.get("historical_entities") or claims.get("primary_entities") or []),
+                        event_identity=str(claims.get("event_identity") or ""),
+                        period=str(claims.get("period") or ""),
+                        consequence=str(claims.get("consequence") or ""),
+                        central_claim=str(claims.get("central_contradiction") or ""),
+                        source_claim_ids=[
+                            str(item.get("claim_id")) for item in sourced
+                            if isinstance(item, dict) and item.get("claim_id")
+                        ],
                         source="analytics",
                         metadata={"url": video.get("url", ""), "date": video.get("date", "")},
                     )
@@ -142,6 +175,8 @@ class TrendCatalog:
                 with open(path, encoding="utf-8") as file:
                     brief = json.load(file)
                 topic = str(brief.get("topic") or "")
+                claims = _validated_structured_claims(brief.get("structured_claims") or {})
+                sourced = claims.get("sourced_claims") or []
                 entries.append(
                     CatalogEntry(
                         catalog_id=f"research:{os.path.basename(path)}",
@@ -150,6 +185,15 @@ class TrendCatalog:
                         subject=topic,
                         status="researched",
                         research_topic=topic,
+                        entities=list(claims.get("primary_entities") or []),
+                        event_identity=str(claims.get("event_identity") or ""),
+                        period=str(claims.get("period") or ""),
+                        consequence=str(claims.get("consequence") or ""),
+                        central_claim=str(claims.get("central_contradiction") or ""),
+                        source_claim_ids=[
+                            str(item.get("claim_id")) for item in sourced
+                            if isinstance(item, dict) and item.get("claim_id")
+                        ],
                         source="research_brief",
                         metadata={"brief_path": path},
                     )
@@ -174,12 +218,17 @@ class TrendCatalog:
             if entity_tokens and entity_tokens & _entity_tokens(text):
                 entity_entries.append((entry, similarity))
 
-        if best_entry and best_similarity >= 0.62:
-            decision = CatalogDecision.RESURFACE_EXISTING if best_entry.status == "uploaded" else CatalogDecision.SKIP
-            return CatalogMatch(decision, best_similarity, best_entry, "The same historical story is already in the catalog")
-
         if entity_entries:
             entry, similarity = max(entity_entries, key=lambda item: item[1])
+            if not entry.event_identity or not entry.source_claim_ids or not (
+                entry.consequence and entry.central_claim
+            ):
+                return CatalogMatch(
+                    CatalogDecision.HUMAN_REVIEW_REQUIRED,
+                    similarity,
+                    entry,
+                    "Structured catalog evidence is incomplete; human review is required",
+                )
             differences = _material_differences(bridge, entry)
             if len(differences) >= 2:
                 return CatalogMatch(
@@ -188,11 +237,27 @@ class TrendCatalog:
                     entry,
                     "Catalog evidence supports material differences in: " + ", ".join(differences),
                 )
+            same_event = topic_similarity(
+                _without_years(bridge.historical_event), _without_years(entry.event_identity)
+            ) >= 0.62
+            same_consequence = topic_similarity(bridge.central_payoff, entry.consequence) >= 0.45
+            same_claim = topic_similarity(bridge.absurd_contradiction, entry.central_claim) >= 0.45
+            if same_event and same_consequence and same_claim and entry.status == "uploaded":
+                return CatalogMatch(
+                    CatalogDecision.RESURFACE_EXISTING,
+                    similarity,
+                    entry,
+                    "Structured event and consequence match an uploaded story",
+                )
             return CatalogMatch(
-                CatalogDecision.SKIP,
+                CatalogDecision.HUMAN_REVIEW_REQUIRED,
                 similarity,
                 entry,
-                "Fewer than two material catalog differences are proven; human review is required",
+                "Fewer than two reliable structured differences are proven; human review is required",
             )
+
+        if best_entry and best_similarity >= 0.62:
+            decision = CatalogDecision.RESURFACE_EXISTING if best_entry.status == "uploaded" else CatalogDecision.SKIP
+            return CatalogMatch(decision, best_similarity, best_entry, "The same historical story is already in the catalog")
 
         return CatalogMatch(CatalogDecision.NEW_VIDEO, best_similarity, best_entry, "No material catalog match found")
