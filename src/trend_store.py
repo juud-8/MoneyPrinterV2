@@ -494,7 +494,8 @@ class TrendStore:
                      opportunity_score=excluded.opportunity_score,
                      expires_at=excluded.expires_at,
                      status=excluded.status,
-                     payload_json=excluded.payload_json""",
+                     payload_json=excluded.payload_json
+                   WHERE trend_opportunities.status = 'pending'""",
                 (
                     opportunity.opportunity_id,
                     opportunity.brand_id,

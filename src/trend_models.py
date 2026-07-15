@@ -433,6 +433,7 @@ class TrendCluster:
     news_confirmation_score: float | None
     freshness_score: float | None
     confidence: float
+    collection_horizon_hours: float = 24
     competing_interpretations: list[dict[str, Any]] = field(default_factory=list)
     unknowns: list[str] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
@@ -481,6 +482,9 @@ class TrendCluster:
             news_confirmation_score=optional_score("news_confirmation_score"),
             freshness_score=optional_score("freshness_score"),
             confidence=confidence,
+            collection_horizon_hours=_number(
+                data.get("collection_horizon_hours", 24), "collection_horizon_hours", minimum=1
+            ),
             competing_interpretations=[dict(item) for item in interpretations if isinstance(item, dict)],
             unknowns=_string_list(data.get("unknowns"), "unknowns"),
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),

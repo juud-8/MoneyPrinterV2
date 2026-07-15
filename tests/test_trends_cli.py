@@ -128,6 +128,20 @@ class TrendsCliTests(unittest.TestCase):
         self.assertEqual(len(signals), len({item.signal_id for item in signals}))
         self.assertEqual(len(clusters), len({item.cluster_id for item in clusters}))
 
+    def test_bridging_same_fixture_twice_creates_one_opportunity(self):
+        self.run_cli(["collect", "--brand", "archive", "--manual", self.manual, "--now", NOW])
+        dance = next(item for item in self.store.list_clusters() if item.canonical_entity == "dance")
+        command = [
+            "bridge", dance.cluster_id, "--brand", "archive",
+            "--bridge-file", self.bridges, "--now", NOW,
+        ]
+        self.assertEqual(self.run_cli(command)[0], 0)
+        first_count = len(self.store.list_opportunities("archive"))
+        self.assertEqual(self.run_cli(command)[0], 0)
+        opportunities = self.store.list_opportunities("archive")
+        self.assertEqual(len(opportunities), first_count)
+        self.assertEqual(len(opportunities), len({item.opportunity_id for item in opportunities}))
+
 
 if __name__ == "__main__":
     unittest.main()

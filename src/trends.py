@@ -140,7 +140,8 @@ def _collect(args, store: TrendStore) -> int:
     for signal in signals:
         store.save_signal(signal)
     clusters = cluster_signals(
-        signals, now=args.now or utc_now(), brand_id=args.brand
+        signals, now=args.now or utc_now(), brand_id=args.brand,
+        collection_horizon_hours=args.window_hours,
     ) if signals else []
     for cluster in clusters:
         store.save_cluster(cluster)
@@ -237,7 +238,10 @@ def _bridge(args, store: TrendStore) -> int:
         raise ValidationError(f"unknown cluster: {args.cluster_id}")
     now = args.now or utc_now()
     refreshed = [
-        item for item in cluster_signals(cluster.signals, now=now, brand_id=args.brand)
+        item for item in cluster_signals(
+            cluster.signals, now=now, brand_id=args.brand,
+            collection_horizon_hours=cluster.collection_horizon_hours,
+        )
         if item.canonical_entity == cluster.canonical_entity
     ]
     if not refreshed:

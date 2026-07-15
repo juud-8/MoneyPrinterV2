@@ -54,6 +54,19 @@ class EntityTests(unittest.TestCase):
         cluster = cluster_signals(signals, now="2026-07-13T13:00:00Z")[0]
         self.assertEqual(cluster.cross_source_count, 2)
 
+    def test_provider_metric_windows_share_collection_horizon(self):
+        gdelt = signal("dance", "dance", provider="gdelt")
+        wikimedia_payload = signal("dance", "dance", provider="wikimedia").to_dict()
+        wikimedia_payload["window_hours"] = 48
+        wikimedia = TrendSignal.from_dict(wikimedia_payload)
+        clusters = cluster_signals(
+            [gdelt, wikimedia], now="2026-07-13T13:00:00Z",
+            brand_id="archive", collection_horizon_hours=24,
+        )
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0].cross_source_count, 2)
+        self.assertEqual({item.window_hours for item in clusters[0].signals}, {24, 48})
+
     def test_reliable_multilingual_alias(self):
         canonical, competing = resolve_entity(signal("Bisonte americano", "bisonte americano"))
         self.assertEqual(canonical, "american bison")

@@ -11,6 +11,7 @@ if SRC not in sys.path:
 
 from trend_entities import cluster_signals
 from trend_models import TrendSignal
+from tests.test_trend_pipeline import opportunity
 from trend_store import TrendStore
 
 NOW = "2026-07-13T12:00:00Z"
@@ -101,6 +102,33 @@ class IdentityAndExpirationTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(self.store.list_signals()), 1)
         self.assertEqual(len(self.store.list_clusters()), 1)
+
+    def test_repeated_semantic_opportunity_upsert_is_idempotent(self):
+        first = opportunity()
+        rebuilt = opportunity()
+        self.assertEqual(first.opportunity_id, rebuilt.opportunity_id)
+        self.store.save_opportunity(first)
+        self.store.save_opportunity(rebuilt)
+        self.assertEqual(len(self.store.list_opportunities(first.brand_id)), 1)
+
+    def test_concurrent_semantic_opportunity_upsert_is_idempotent(self):
+        items = [opportunity(), opportunity(), opportunity()]
+        self.assertEqual(len({item.opportunity_id for item in items}), 1)
+        barrier = threading.Barrier(len(items))
+        errors = []
+
+        def save(item):
+            try:
+                barrier.wait()
+                self.store.save_opportunity(item)
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=save, args=(item,)) for item in items]
+        [thread.start() for thread in threads]
+        [thread.join() for thread in threads]
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.store.list_opportunities(items[0].brand_id)), 1)
 
 
 if __name__ == "__main__":

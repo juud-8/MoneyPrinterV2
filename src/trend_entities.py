@@ -66,8 +66,10 @@ def _average_known(values: list[float | None]) -> float | None:
 
 def cluster_signals(
     signals: list[TrendSignal], now: str | None = None, *, brand_id: str = "",
+    collection_horizon_hours: float = 24,
 ) -> list[TrendCluster]:
     current = datetime.fromisoformat((now or datetime.now(timezone.utc).isoformat()).replace("Z", "+00:00"))
+    horizon_seconds = max(int(collection_horizon_hours * 3600), 3600)
     groups: dict[tuple, list[tuple[TrendSignal, list[dict]]]] = {}
     for signal in signals:
         if not signal.expires_at:
@@ -77,14 +79,13 @@ def cluster_signals(
             continue
         canonical, interpretations = resolve_entity(signal)
         collected = datetime.fromisoformat(signal.collected_at.replace("Z", "+00:00"))
-        window_seconds = max(int(signal.window_hours * 3600), 3600)
-        bucket = int(collected.timestamp()) // window_seconds
+        bucket = int(collected.timestamp()) // horizon_seconds
         interpretation_key = tuple(sorted(str(item.get("entity") or "") for item in interpretations))
         key = (
             canonical,
             normalize_text(signal.geography),
             normalize_text(signal.language),
-            window_seconds,
+            horizon_seconds,
             bucket,
             interpretation_key,
         )
@@ -102,7 +103,7 @@ def cluster_signals(
         news_signals = [signal for signal in group_signals if signal.provider == "gdelt"]
         news_score = min(100.0, sum(float(signal.raw_metadata.get("unique_domains") or 0) for signal in news_signals) * 15) if news_signals else None
         age_hours = max((current - max(times)).total_seconds() / 3600, 0)
-        freshness = max(0.0, 100.0 - (age_hours / max(group_signals[0].window_hours, 1) * 100))
+        freshness = max(0.0, 100.0 - (age_hours / max(collection_horizon_hours, 1) * 100))
         interpretations = [value for _, values in members for value in values]
         unknowns = []
         if velocity is None:
@@ -138,6 +139,7 @@ def cluster_signals(
                     "news_confirmation_score": news_score,
                     "freshness_score": freshness,
                     "confidence": confidence,
+                    "collection_horizon_hours": collection_horizon_hours,
                     "competing_interpretations": interpretations,
                     "unknowns": unknowns,
                 }

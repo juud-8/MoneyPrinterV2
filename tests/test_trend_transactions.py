@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import closing
+from dataclasses import replace
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 SRC = os.path.join(ROOT, "src")
@@ -131,13 +132,16 @@ class TransactionTests(unittest.TestCase):
 
     def test_concurrent_content_mix_approval_has_one_winner(self):
         videos = evergreen_videos(9)
-        first = opportunity()
+        first = replace(opportunity(), opportunity_id="opp-mix-initial")
         self.store.save_opportunity(first)
         approve_opportunity(
             self.store, first.opportunity_id, manifest(), operator="a",
             reason="a", now=NOW, videos=videos
         )
-        items = [opportunity(), opportunity()]
+        items = [
+            replace(opportunity(), opportunity_id="opp-mix-candidate-1"),
+            replace(opportunity(), opportunity_id="opp-mix-candidate-2"),
+        ]
         for item in items:
             self.store.save_opportunity(item)
         barrier = threading.Barrier(2)

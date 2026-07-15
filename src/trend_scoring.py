@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -57,6 +61,28 @@ HARD_RISKS = {
     "insufficient_lifetime",
     "forced_connection",
 }
+
+
+def _identity_text(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text)).strip()
+
+
+def opportunity_identity(
+    cluster: TrendCluster, bridge: ArchiveBridge, brand_id: str, catalog_match: CatalogMatch,
+) -> str:
+    """Stable identity for one semantic bridge decision within a trend cluster."""
+    payload = {
+        "brand_id": brand_id,
+        "cluster_id": cluster.cluster_id,
+        "historical_event": _identity_text(bridge.historical_event),
+        "relationship_type": bridge.relationship_type.value,
+        "central_payoff": _identity_text(bridge.central_payoff),
+        "central_claim": _identity_text(bridge.absurd_contradiction),
+        "catalog_target": catalog_match.entry.catalog_id if catalog_match.entry else "",
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:32]
+    return f"opp_{digest}"
 
 
 def _component(name: str, score: float | None, confidence: float, source: str, unknown: str = "") -> ScoreComponent:
@@ -177,6 +203,7 @@ def build_opportunity(
     ]))
     return TrendOpportunity.from_dict(
         {
+            "opportunity_id": opportunity_identity(cluster, bridge, brand_id, catalog_match),
             "trend": cluster,
             "bridge": bridge,
             "opportunity_score": score,
