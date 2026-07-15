@@ -1,6 +1,16 @@
-# Dashboard Guide — MoneyPrinterV2 Control Panel
+# Dashboard Guide — EL JEFE Mission Control (MoneyPrinterV2)
 
 Operator walkthrough for the local analytics + production UI.
+
+> The control panel's on-screen identity is **EL JEFE // Mission Control**.
+> Beyond the theme it adds: a header **systems-check LED strip** (`/api/health`:
+> Ollama, API keys, ImageMagick, Firefox profiles, metrics freshness, disk),
+> a **Today's Ops** brief (posts vs `shorts_per_day` target, next publish-window
+> countdown), an **Attention feed** (silent upload failures = uploaded rows with
+> no URL, stale metrics, duration aborts, failed jobs, spend threshold),
+> a **Ctrl+K command palette**, keyboard shortcuts (`1–6`, `R`, `M`, `/`, `?`),
+> per-brand **Open folder** buttons backed by `/api/open-output/<brand>`, and
+> **job history that survives restarts** (`.mp/logs/webui/jobs.json`).
 
 ## What is the “dashboard”?
 

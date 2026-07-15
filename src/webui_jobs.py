@@ -2,13 +2,16 @@
 
 Runs pipeline commands (generate, generate+upload, metrics refresh) as
 subprocesses with output captured to per-job log files under
-`.mp/logs/webui/`, so the UI can stream progress live.
+`.mp/logs/webui/`, so the UI can stream progress live. A small index in
+`.mp/logs/webui/jobs.json` keeps job history (and their logs) visible
+across control-panel restarts.
 
 Generation jobs are serialized globally: `switch_brand()` writes the shared
 `.mp/active_brand.json` and generation grabs a Firefox profile, so two
 concurrent runs would trample each other.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +21,8 @@ from datetime import datetime
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(ROOT_DIR, ".mp", "logs", "webui")
+INDEX_PATH = os.path.join(LOG_DIR, "jobs.json")
+HISTORY_LIMIT = 100
 
 _jobs: dict[str, dict] = {}
 _processes: dict[str, subprocess.Popen] = {}
@@ -26,6 +31,41 @@ _lock = threading.Lock()
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _persist_locked() -> None:
+    """Write the job index. Caller must hold _lock."""
+    jobs = sorted(_jobs.values(), key=lambda j: j["started_at"], reverse=True)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(INDEX_PATH, "w", encoding="utf-8") as f:
+            json.dump(jobs[:HISTORY_LIMIT], f, indent=2)
+    except OSError:
+        pass  # history is best-effort; never fail a job over it
+
+
+def _load_history() -> None:
+    """Load prior sessions' jobs. Anything still 'running' was orphaned by
+    a server restart — its subprocess is no longer ours to track."""
+    if not os.path.isfile(INDEX_PATH):
+        return
+    try:
+        with open(INDEX_PATH, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(saved, list):
+        return
+    with _lock:
+        for job in saved:
+            if not isinstance(job, dict) or not job.get("id"):
+                continue
+            if job.get("status") == "running":
+                job["status"] = "interrupted"
+            _jobs.setdefault(job["id"], job)
+
+
+_load_history()
 
 
 def has_running_generation() -> bool:
@@ -87,6 +127,7 @@ def start_job(
     with _lock:
         _jobs[job_id] = job
         _processes[job_id] = process
+        _persist_locked()
 
     def _wait() -> None:
         returncode = process.wait()
@@ -97,6 +138,7 @@ def start_job(
             if job["status"] != "cancelled":
                 job["status"] = "succeeded" if returncode == 0 else "failed"
             _processes.pop(job_id, None)
+            _persist_locked()
 
     threading.Thread(target=_wait, daemon=True).start()
     return dict(job)
@@ -109,6 +151,7 @@ def cancel_job(job_id: str) -> bool:
         if not process or not job:
             return False
         job["status"] = "cancelled"
+        _persist_locked()
     process.terminate()
     return True
 
