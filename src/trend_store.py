@@ -683,6 +683,13 @@ class TrendStore:
                    AND completed_at IS NULL AND failed_at IS NULL""",
                 (released_at, reason, seed_id, claimed_by),
             )
+            if updated.rowcount == 1:
+                row = connection.execute(
+                    "SELECT * FROM topic_seeds WHERE seed_id = ?", (seed_id,)
+                ).fetchone()
+                self._record_seed_event(
+                    connection, row, "seed_released_retryable", claimed_by, reason, released_at,
+                )
             return updated.rowcount == 1
 
     def complete_topic_seed(
@@ -709,6 +716,94 @@ class TrendStore:
                 (failed_at, reason, seed_id, claimed_by),
             )
             return updated.rowcount == 1
+
+    def operator_release_topic_seed(
+        self, seed_id: str, *, operator: str, reason: str, released_at: str,
+    ) -> None:
+        if not operator.strip() or not reason.strip():
+            raise ValidationError("operator release requires operator and reason")
+        self.migrate()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM topic_seeds WHERE seed_id = ?", (seed_id,)).fetchone()
+            if not row:
+                raise ValidationError("unknown TopicSeed")
+            if row["completed_at"]:
+                raise ValidationError("completed TopicSeed cannot be released")
+            if row["failed_at"]:
+                raise ValidationError("failed TopicSeed requires the recover command")
+            if not row["claimed_at"] or not row["claimed_by"]:
+                raise ValidationError("TopicSeed has no active claim")
+            previous_claimant = row["claimed_by"]
+            connection.execute(
+                """UPDATE topic_seeds SET claimed_at=NULL, claimed_by=NULL, released_at=?, failure_reason=?
+                   WHERE seed_id=? AND claimed_by=? AND completed_at IS NULL AND failed_at IS NULL""",
+                (released_at, f"operator release: {reason}", seed_id, previous_claimant),
+            )
+            row = connection.execute("SELECT * FROM topic_seeds WHERE seed_id = ?", (seed_id,)).fetchone()
+            self._record_seed_event(
+                connection, row, "seed_released_by_operator", operator, reason, released_at,
+                {"previous_claimant": previous_claimant},
+            )
+
+    def recover_topic_seed(
+        self, seed_id: str, *, operator: str, reason: str, recovered_at: str,
+        confirm_uncertain_side_effects: bool = False,
+    ) -> None:
+        if not operator.strip() or not reason.strip():
+            raise ValidationError("TopicSeed recovery requires operator and reason")
+        self.migrate()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM topic_seeds WHERE seed_id = ?", (seed_id,)).fetchone()
+            if not row:
+                raise ValidationError("unknown TopicSeed")
+            if row["completed_at"]:
+                raise ValidationError("completed TopicSeed cannot be recovered")
+            if not row["failed_at"]:
+                raise ValidationError("only a failed TopicSeed can be recovered")
+            failure_reason = str(row["failure_reason"] or "")
+            if failure_reason.startswith("terminal:"):
+                raise ValidationError("terminal TopicSeed failure cannot be recovered")
+            uncertain = failure_reason.startswith("uncertain_external_side_effect:")
+            if uncertain and not confirm_uncertain_side_effects:
+                raise ValidationError(
+                    "uncertain external side effects require elevated confirmation"
+                )
+            connection.execute(
+                """UPDATE topic_seeds SET claimed_at=NULL, claimed_by=NULL, failed_at=NULL,
+                   released_at=?, failure_reason=? WHERE seed_id=? AND completed_at IS NULL""",
+                (recovered_at, f"operator recovery: {reason}", seed_id),
+            )
+            row = connection.execute("SELECT * FROM topic_seeds WHERE seed_id = ?", (seed_id,)).fetchone()
+            self._record_seed_event(
+                connection, row, "seed_recovered", operator, reason, recovered_at,
+                {"previous_failure": failure_reason, "uncertain_side_effects_confirmed": uncertain},
+            )
+
+    def _record_seed_event(
+        self, connection: sqlite3.Connection, row: sqlite3.Row, status: str,
+        operator: str, reason: str, occurred_at: str, details: dict | None = None,
+    ) -> None:
+        seed = TopicSeed.from_dict(json.loads(row["payload_json"]))
+        payload = {
+            "seed_id": seed.seed_id,
+            "status": status,
+            "operator": operator,
+            "reason": reason,
+            **(details or {}),
+        }
+        connection.execute(
+            """INSERT INTO trend_attribution
+               (seed_id, opportunity_id, brand_id, run_id, youtube_video_id,
+                detected_at, approved_at, publication_time, status, payload_json)
+               VALUES (?, ?, ?, ?, '', ?, ?, '', ?, ?)""",
+            (
+                seed.seed_id, seed.approval_record.opportunity_id, seed.brand_id,
+                str(row["run_id"] or row["claimed_by"] or ""), seed.detected_at,
+                seed.approval_record.decided_at, status, self._dump(payload),
+            ),
+        )
 
     def count_approved_since(self, brand_id: str, since: str) -> int:
         self.migrate()

@@ -12,6 +12,8 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 import trends
+from tests.test_trend_pipeline import evergreen_videos, opportunity
+from trend_pipeline import approve_opportunity
 from trend_store import TrendStore
 
 
@@ -141,6 +143,22 @@ class TrendsCliTests(unittest.TestCase):
         opportunities = self.store.list_opportunities("archive")
         self.assertEqual(len(opportunities), first_count)
         self.assertEqual(len(opportunities), len({item.opportunity_id for item in opportunities}))
+
+    def test_seed_release_command_is_explicit_and_audited(self):
+        item = opportunity()
+        self.store.save_opportunity(item)
+        seed = approve_opportunity(
+            self.store, item.opportunity_id, manifest(), operator="reviewer",
+            reason="verified", now=NOW, videos=evergreen_videos(10),
+        )[1]
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "crashed-run", NOW))
+        code, output, error = self.run_cli([
+            "seed", "release", seed.seed_id, "--operator", "reviewer",
+            "--reason", "confirmed local process crash", "--now", NOW,
+        ])
+        self.assertEqual(code, 0, error)
+        self.assertIn('"status": "released"', output)
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "new-run", NOW))
 
 
 if __name__ == "__main__":

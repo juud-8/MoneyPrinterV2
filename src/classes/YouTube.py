@@ -1323,6 +1323,7 @@ Return ONLY the prompt sentence.""",
 
     def _generate_pipeline(self, tts_instance: TTS, interactive: bool = True) -> str:
         """Shared generation pipeline for short and long-form."""
+        self.trend_generation_stage = "pre_production"
         self.run_id = str(uuid4())
         self.images = []
         self.asset_modalities = []
@@ -1342,6 +1343,9 @@ Return ONLY the prompt sentence.""",
                 "status": "generating",
             }
 
+        # Research, model, TTS, and asset calls may consume quota or money from
+        # this point onward. Failures after this marker require explicit review.
+        self.trend_generation_stage = "external_generation_started"
         self._generate_topic_and_research(max_attempts=3)
         self.generate_script()
         self._validate_trend_script()

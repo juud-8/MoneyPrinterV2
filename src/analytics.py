@@ -3,7 +3,7 @@
 import json
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,7 +51,10 @@ def _normalize_title(title: str) -> str:
 
 def _parse_date(value: str) -> datetime | None:
     try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError):
         return None
 
@@ -164,7 +167,7 @@ def log_video(
     data = _load()
     data["videos"].append(
         {
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "title": title,
             "format": format_type,
             "niche": niche,
@@ -236,7 +239,7 @@ def log_asset_spend(
     data = _load()
     data["asset_spend"].append(
         {
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "video_title": video_title,
             "brand_id": brand_id,
             "role": role,
@@ -259,7 +262,7 @@ def log_topic_rejection(
     data = _load()
     data.setdefault("topic_rejections", []).append(
         {
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "candidate": candidate[:300],
             "matched": matched[:300],
             "similarity": round(float(similarity), 3),
@@ -286,7 +289,7 @@ def log_duration_rejection(
     data = _load()
     data.setdefault("duration_rejections", []).append(
         {
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "video_subject": video_subject,
             "brand_id": brand_id,
             "audio_seconds": round(float(audio_seconds), 1),
@@ -301,7 +304,7 @@ def log_duration_rejection(
 def _spend_in_window(entries: list[dict], days: int | None = None) -> list[dict]:
     if days is None:
         return entries
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     recent = []
     for entry in entries:
         entry_date = _parse_date(entry.get("date", ""))
@@ -541,7 +544,7 @@ def get_dashboard_data(days: int | None = 7) -> dict:
     }
 
     return {
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "window_days": window_days,
         "brands": brands,
         "videos": videos,

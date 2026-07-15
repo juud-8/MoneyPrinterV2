@@ -14,6 +14,31 @@ from config import get_ollama_model
 from brand_switcher import switch_brand, resolve_youtube_account, load_active_brand
 from classes.Tts import TTS
 from classes.YouTube import YouTube
+from trend_models import ValidationError
+
+
+def _handle_trend_generation_failure(
+    store, seed, claim_id: str, error: Exception, failed_at: str, *, stage: str = "pre_production",
+) -> str:
+    """Release proven local failures; quarantine failures with uncertain side effects."""
+    classification = str(getattr(error, "trend_failure_class", "")).lower()
+    retryable_local = stage == "pre_production" and (
+        classification == "pre_production" or isinstance(
+            error, (ValidationError, FileNotFoundError, ModuleNotFoundError, ImportError)
+        )
+    )
+    if retryable_local:
+        reason = f"retryable_pre_production: {type(error).__name__}"
+        if not store.release_topic_seed(seed.seed_id, claim_id, failed_at, reason):
+            raise RuntimeError("Trend seed claim was lost before retryable release") from error
+        return "released_retryable"
+    if classification == "terminal":
+        reason = f"terminal: {type(error).__name__}"
+    else:
+        reason = f"uncertain_external_side_effect: {type(error).__name__}"
+    if not store.fail_topic_seed(seed.seed_id, claim_id, failed_at, reason):
+        raise RuntimeError("Trend seed claim was lost before failure quarantine") from error
+    return "failed_terminal" if classification == "terminal" else "failed_uncertain"
 
 
 def _parse_flag(argv: list[str], flag: str) -> str | None:
@@ -103,15 +128,15 @@ def main():
     if topic:
         youtube.subject = topic.strip()
         print(f"Topic: {youtube.subject}")
-    tts = TTS()
     try:
+        tts = TTS()
         path = youtube.generate_video(tts, interactive=False)
     except Exception as error:
         if trend_seed is not None and trend_store is not None and trend_claim_id:
             failed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            trend_store.fail_topic_seed(
-                trend_seed.seed_id, trend_claim_id, failed_at,
-                f"generation failed before completion: {type(error).__name__}",
+            _handle_trend_generation_failure(
+                trend_store, trend_seed, trend_claim_id, error, failed_at,
+                stage=str(getattr(youtube, "trend_generation_stage", "pre_production")),
             )
         raise
     if trend_seed is not None and trend_store is not None:

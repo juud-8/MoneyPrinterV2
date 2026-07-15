@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import re
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from research_brief import research_quality_issues
 from topic_similarity import find_near_duplicate, topic_similarity
@@ -37,6 +38,7 @@ class TrendStrategy:
     recent_window_days: int = 30
     evergreen_target_share: float = 0.70
     experiment_target_share: float = 0.10
+    legacy_analytics_timezone: str = "UTC"
 
 
 @dataclass(frozen=True)
@@ -70,7 +72,48 @@ def load_trend_strategy(manifest: dict[str, Any]) -> TrendStrategy:
         recent_window_days=max(1, int(raw.get("recent_window_days", 30))),
         evergreen_target_share=float(raw.get("evergreen_target_share", 0.70)),
         experiment_target_share=float(raw.get("experiment_target_share", 0.10)),
+        legacy_analytics_timezone=str(
+            (manifest.get("publishing") or {}).get("timezone") or "UTC"
+        ),
     )
+
+
+def _analytics_timestamp(value: object, legacy_timezone: str) -> datetime | None:
+    """Normalize aware ISO records and documented legacy local timestamps to UTC."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        try:
+            source_timezone = ZoneInfo(legacy_timezone)
+        except ZoneInfoNotFoundError:
+            # Windows Python distributions may not bundle the IANA database;
+            # python-dateutil is already present through the media stack.
+            try:
+                from dateutil.tz import gettz
+                source_timezone = gettz(legacy_timezone)
+            except ImportError:
+                source_timezone = None
+            if source_timezone is None:
+                raise ValidationError(f"unknown legacy analytics timezone: {legacy_timezone}")
+        parsed = parsed.replace(tzinfo=source_timezone)
+    return parsed.astimezone(timezone.utc)
+
+
+def _recent_uploaded_videos(
+    videos: list[dict], brand_id: str, cutoff: datetime, legacy_timezone: str,
+) -> list[dict]:
+    return [
+        item for item in videos
+        if item.get("brand_id") == brand_id
+        and item.get("status") == "uploaded"
+        and (timestamp := _analytics_timestamp(item.get("date"), legacy_timezone)) is not None
+        and timestamp >= cutoff
+    ]
 
 
 def content_mix_status(
@@ -83,7 +126,6 @@ def content_mix_status(
 ) -> ContentMixStatus:
     current = _parse_time(now or utc_now())
     cutoff = current - timedelta(days=strategy.recent_window_days)
-    cutoff_display = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
     if videos is None:
         try:
@@ -92,13 +134,9 @@ def content_mix_status(
             videos = analytics.dedupe_videos()
         except Exception:
             videos = []
-    recent = [
-        item
-        for item in videos
-        if item.get("brand_id") == brand_id
-        and item.get("status") == "uploaded"
-        and (item.get("date") or "") >= cutoff_display
-    ]
+    recent = _recent_uploaded_videos(
+        videos, brand_id, cutoff, strategy.legacy_analytics_timezone
+    )
     uploaded_trend = sum(
         1 for item in recent if (item.get("production") or {}).get("trend_attribution")
     )
@@ -220,7 +258,6 @@ def approve_opportunity(
         raise ValidationError("expired opportunity cannot be approved")
     current = _parse_time(decided_at)
     cutoff = current - timedelta(days=strategy.recent_window_days)
-    cutoff_display = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
     if videos is None:
         try:
@@ -228,11 +265,9 @@ def approve_opportunity(
             videos = analytics.dedupe_videos()
         except Exception:
             videos = []
-    recent = [
-        item for item in videos
-        if item.get("brand_id") == brand_id and item.get("status") == "uploaded"
-        and (item.get("date") or "") >= cutoff_display
-    ]
+    recent = _recent_uploaded_videos(
+        videos, brand_id, cutoff, strategy.legacy_analytics_timezone
+    )
     uploaded_trend = sum(1 for item in recent if (item.get("production") or {}).get("trend_attribution"))
     approval = ApprovalRecord.from_dict(
         {

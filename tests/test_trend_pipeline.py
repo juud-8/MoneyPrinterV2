@@ -13,7 +13,9 @@ from classes.YouTube import YouTube
 from trend_catalog import CatalogMatch
 from trend_entities import cluster_signals
 from trend_models import ArchiveBridge, CatalogDecision, TrendRequest, TrendSignal, ValidationError
-from trend_pipeline import approve_opportunity, load_trend_strategy
+from trend_pipeline import (
+    TrendStrategy, approve_opportunity, content_mix_status, load_trend_strategy,
+)
 from trend_providers import GdeltProvider, ProviderSettings
 from trend_scoring import TrendPolicy, build_opportunity
 from trend_store import TrendStore
@@ -263,6 +265,46 @@ class TrendPipelineTests(unittest.TestCase):
         youtube.topic_seed = None
         youtube.subject = "An evergreen historical story"
         self.assertEqual(youtube.generate_topic(), "An evergreen historical story")
+
+    def test_legacy_new_york_timestamp_at_exact_utc_cutoff_is_included(self):
+        strategy = TrendStrategy(
+            recent_window_days=30, legacy_analytics_timezone="America/New_York"
+        )
+        videos = [{
+            "brand_id": "archive", "status": "uploaded",
+            "date": "2026-07-02 08:00:00", "production": {},
+        }]
+        status = content_mix_status(
+            "archive", strategy, self.store, now="2026-08-01T12:00:00Z", videos=videos
+        )
+        self.assertEqual(status.recent_total, 1)
+
+    def test_dst_boundary_uses_historical_new_york_offset(self):
+        strategy = TrendStrategy(
+            recent_window_days=1, legacy_analytics_timezone="America/New_York"
+        )
+        videos = [
+            {"brand_id": "archive", "status": "uploaded", "date": "2026-03-08 01:30:00", "production": {}},
+            {"brand_id": "archive", "status": "uploaded", "date": "2026-03-08 01:29:59", "production": {}},
+        ]
+        status = content_mix_status(
+            "archive", strategy, self.store, now="2026-03-09T06:30:00Z", videos=videos
+        )
+        self.assertEqual(status.recent_total, 1)
+
+    def test_mixed_aware_and_legacy_timestamps_share_one_utc_window(self):
+        strategy = TrendStrategy(
+            recent_window_days=30, legacy_analytics_timezone="America/New_York"
+        )
+        videos = [
+            {"brand_id": "archive", "status": "uploaded", "date": "2026-07-02T12:00:00Z", "production": {}},
+            {"brand_id": "archive", "status": "uploaded", "date": "2026-07-02 08:00:00", "production": {}},
+            {"brand_id": "archive", "status": "uploaded", "date": "2026-07-02 07:59:59", "production": {}},
+        ]
+        status = content_mix_status(
+            "archive", strategy, self.store, now="2026-08-01T12:00:00Z", videos=videos
+        )
+        self.assertEqual(status.recent_total, 2)
 
 
 if __name__ == "__main__":

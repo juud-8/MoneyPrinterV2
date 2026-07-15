@@ -373,6 +373,24 @@ def _retention(args, store: TrendStore) -> int:
     return 0
 
 
+def _seed_release(args, store: TrendStore) -> int:
+    store.operator_release_topic_seed(
+        args.seed_id, operator=args.operator, reason=args.reason, released_at=args.now or utc_now()
+    )
+    _print_json({"seed_id": args.seed_id, "status": "released", "operator": args.operator})
+    return 0
+
+
+def _seed_recover(args, store: TrendStore) -> int:
+    store.recover_topic_seed(
+        args.seed_id, operator=args.operator, reason=args.reason,
+        recovered_at=args.now or utc_now(),
+        confirm_uncertain_side_effects=args.confirm_uncertain_side_effects,
+    )
+    _print_json({"seed_id": args.seed_id, "status": "recovered", "operator": args.operator})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", default="", help="SQLite path (defaults to .mp/trends.sqlite3)")
@@ -438,6 +456,22 @@ def build_parser() -> argparse.ArgumentParser:
     retention.add_argument("--purge", action="store_true")
     retention.add_argument("--now", default="")
     retention.set_defaults(handler=_retention)
+
+    seed = sub.add_parser("seed", help="Explicitly release or recover a TopicSeed")
+    seed_actions = seed.add_subparsers(dest="seed_action", required=True)
+    release = seed_actions.add_parser("release", help="Release an active claim after operator review")
+    recover = seed_actions.add_parser("recover", help="Recover a failed seed after operator review")
+    for command in (release, recover):
+        command.add_argument("seed_id")
+        command.add_argument("--operator", required=True)
+        command.add_argument("--reason", required=True)
+        command.add_argument("--now", default="")
+    release.set_defaults(handler=_seed_release)
+    recover.add_argument(
+        "--confirm-uncertain-side-effects", action="store_true",
+        help="Elevated confirmation that uncertain external effects were reviewed",
+    )
+    recover.set_defaults(handler=_seed_recover)
     return parser
 
 

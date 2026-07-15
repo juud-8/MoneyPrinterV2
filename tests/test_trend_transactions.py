@@ -18,6 +18,7 @@ from trend_models import ProviderError, ProviderResult, TrendRequest, Validation
 from trend_pipeline import approve_opportunity
 from trend_providers import CollectionCoordinator, ProviderNotDispatchedError, ProviderSettings
 from trend_store import TrendStore
+from scripts import run_brand_short
 
 
 class TransactionTests(unittest.TestCase):
@@ -115,6 +116,89 @@ class TransactionTests(unittest.TestCase):
         self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "run-2", NOW))
         self.assertTrue(self.store.complete_topic_seed(seed.seed_id, "run-2", NOW))
         self.assertFalse(self.store.claim_topic_seed(seed.seed_id, "run-3", NOW))
+
+    def test_retryable_local_generation_failure_releases_for_reclaim(self):
+        seed = self._approved_seed()
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "run-local", NOW))
+        outcome = run_brand_short._handle_trend_generation_failure(
+            self.store, seed, "run-local", FileNotFoundError("renderer missing"), NOW
+        )
+        self.assertEqual(outcome, "released_retryable")
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "run-retry", NOW))
+
+    def test_local_exception_after_external_stage_is_quarantined(self):
+        seed = self._approved_seed()
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "run-late", NOW))
+        outcome = run_brand_short._handle_trend_generation_failure(
+            self.store, seed, "run-late", FileNotFoundError("late renderer file"), NOW,
+            stage="external_generation_started",
+        )
+        self.assertEqual(outcome, "failed_uncertain")
+        self.assertFalse(self.store.claim_topic_seed(seed.seed_id, "unsafe", NOW))
+
+    def test_process_crash_claim_requires_audited_operator_release(self):
+        seed = self._approved_seed()
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "crashed-process", NOW))
+        self.store.operator_release_topic_seed(
+            seed.seed_id, operator="reviewer", reason="confirmed process exited before upload",
+            released_at=NOW,
+        )
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "replacement", NOW))
+        with self.store.connect() as connection:
+            event = connection.execute(
+                "SELECT status, payload_json FROM trend_attribution WHERE seed_id=?",
+                (seed.seed_id,),
+            ).fetchone()
+        self.assertEqual(event["status"], "seed_released_by_operator")
+        self.assertEqual(json.loads(event["payload_json"])["operator"], "reviewer")
+
+    def test_uncertain_generation_failure_requires_elevated_recovery(self):
+        seed = self._approved_seed()
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "run-network", NOW))
+        outcome = run_brand_short._handle_trend_generation_failure(
+            self.store, seed, "run-network", TimeoutError("provider disconnected"), NOW
+        )
+        self.assertEqual(outcome, "failed_uncertain")
+        self.assertFalse(self.store.claim_topic_seed(seed.seed_id, "unsafe-replay", NOW))
+        with self.assertRaisesRegex(ValidationError, "elevated confirmation"):
+            self.store.recover_topic_seed(
+                seed.seed_id, operator="reviewer", reason="checked provider dashboard",
+                recovered_at=NOW,
+            )
+        self.store.recover_topic_seed(
+            seed.seed_id, operator="reviewer", reason="confirmed no external publication",
+            recovered_at=NOW, confirm_uncertain_side_effects=True,
+        )
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "reviewed-replay", NOW))
+
+    def test_terminal_generation_failure_cannot_be_recovered(self):
+        class TerminalFailure(RuntimeError):
+            trend_failure_class = "terminal"
+
+        seed = self._approved_seed()
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "run-terminal", NOW))
+        outcome = run_brand_short._handle_trend_generation_failure(
+            self.store, seed, "run-terminal", TerminalFailure("invalid seed"), NOW
+        )
+        self.assertEqual(outcome, "failed_terminal")
+        with self.assertRaisesRegex(ValidationError, "terminal"):
+            self.store.recover_topic_seed(
+                seed.seed_id, operator="reviewer", reason="must remain terminal",
+                recovered_at=NOW, confirm_uncertain_side_effects=True,
+            )
+
+    def test_completed_seed_rejects_operator_release_and_recovery(self):
+        seed = self._approved_seed()
+        self.assertTrue(self.store.claim_topic_seed(seed.seed_id, "run-complete", NOW))
+        self.assertTrue(self.store.complete_topic_seed(seed.seed_id, "run-complete", NOW))
+        with self.assertRaisesRegex(ValidationError, "completed"):
+            self.store.operator_release_topic_seed(
+                seed.seed_id, operator="reviewer", reason="must fail", released_at=NOW,
+            )
+        with self.assertRaisesRegex(ValidationError, "completed"):
+            self.store.recover_topic_seed(
+                seed.seed_id, operator="reviewer", reason="must fail", recovered_at=NOW,
+            )
 
     def test_concurrent_seed_claim_has_one_winner(self):
         seed = self._approved_seed()
