@@ -57,6 +57,21 @@ All your configurations will be in a file in the root directory, called `config.
 - `fishaudio_api_key`: `string` - Fish Audio API key, used when `tts_provider` is `fishaudio` (~$15 per 1M characters — roughly 90% cheaper than ElevenLabs). If empty, MPV2 falls back to the `FISH_AUDIO_API_KEY` environment variable.
 - `fishaudio_voice_id`: `string` - Fish Audio voice model reference id (create/clone a voice at [fish.audio](https://fish.audio)). Brands can override via `production.fishaudio_voice_id`.
 - `fishaudio_model`: `string` - Fish Audio TTS model (default: `s2-pro`). On failure, MPV2 falls back to ElevenLabs (if configured) and then KittenTTS.
+- `archive_song`: `object` - Optional defaults for Archive Song mode (manual Suno handoff). Brands may override via `production.archive_song` in their manifest. See [ArchiveSong.md](ArchiveSong.md). Key fields:
+    * `target_duration_seconds` / `min_duration_seconds` / `max_duration_seconds` - song length window
+    * `duration_tolerance_seconds` - allowed mismatch between shot totals and production audio
+    * `lyric_min_words` / `lyric_max_words` - target lyric length for package generation
+    * `default_musical_direction` / `default_vocal_direction` - brand defaults injected into the song package prompt
+    * `bpm_min` / `bpm_max` - preferred tempo guidance
+    * `caption_style` - `lyric_highlight` (default) or `phrase_only`
+    * `hook_repetition` - `none`, `prefer_repeated_hook`, or `require_repeated_hook`
+    * `visual_pacing` - `beat_map` (default) or `equal_lyric_fallback`
+    * `fullscreen_emphasis` - `on_screen_text`, `hook_phrases`, or `off`
+    * `audio_filenames` - accepted import names in the episode directory
+    * `min_shot_seconds` / `max_shot_seconds` - beat merge/split thresholds
+    * `embed_source_in_visual_prompts` - include source/confidence in image prompts only (not on-screen)
+    * `show_source_on_screen` - when true, may render source metadata in full-screen text moments
+    * `enforce_duration` - hard-fail outside the duration window (CLI `--skip-song-validation` forces false)
 
 ## Example
 

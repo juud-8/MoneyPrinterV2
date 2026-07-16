@@ -67,6 +67,9 @@ python src/main.py
 
 All relevant documents can be found [here](docs/).
 
+- [Archive Song episodes](docs/ArchiveSong.md) — optional manual Suno handoff,
+  factual packages, local audio validation, and resumable rendering.
+
 ## Scripts
 
 For easier usage, there are some scripts in the `scripts` directory that can be used to directly access the core functionality of MPV2 without the need for user interaction.

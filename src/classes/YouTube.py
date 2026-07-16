@@ -2,6 +2,7 @@ import re
 import json
 import time
 import os
+import shutil
 import assemblyai as aai
 
 from utils import *
@@ -14,7 +15,45 @@ from content_funnel import build_description
 from asset_gen import AssetResult, generate_image as gen_image, generate_asset_with_fallback
 from asset_strategy import shot_role_for_index, tier_for_shot_role
 from video_effects import apply_ken_burns, apply_crossfade
-from video_captions import composite_captions_on_video
+from video_captions import (
+    _parse_srt,
+    composite_captions_on_video,
+    composite_lyric_captions_on_video,
+)
+from archive_song import (
+    AUDIO_MODE_ARCHIVE_SONG,
+    AUDIO_MODE_NARRATION,
+    ArchiveSongError,
+    ArchiveSongState,
+    AwaitingSongAudio,
+    SongPackage,
+    build_lyric_alignment,
+    build_song_package_prompt,
+    compute_file_identity,
+    copy_checkpoint_asset,
+    discover_song_audio,
+    ensure_episode_directory,
+    extract_json_object,
+    identities_match,
+    invalidate_audio_dependent_outputs,
+    load_state,
+    lyrics_content_hash,
+    normalize_audio_mode,
+    prepare_timed_beat_maps,
+    save_state,
+    snap_durations_to_frames,
+    validate_and_normalize_audio,
+    write_song_package_files,
+)
+from archive_song_settings import (
+    ArchiveSongSettings,
+    load_resolved_archive_song_settings,
+)
+from archive_song_visuals import (
+    ArchiveShotPlan,
+    build_archive_shot_plan,
+    equal_duration_fallback_plan,
+)
 from analytics import (
     log_video,
     log_asset_spend,
@@ -128,6 +167,19 @@ class YouTube:
         self.production_metadata = {}
         self.last_upload_error = None
         self.chapters = []
+        self.audio_mode = AUDIO_MODE_NARRATION
+        self.archive_song_resume = False
+        self.archive_song_episode_id = ""
+        self.archive_song_audio_path = ""
+        self.regenerate_song_package = False
+        self.skip_song_validation = False
+        self.archive_song_state = None
+        self.archive_song_episode_dir = ""
+        self.archive_subtitles_path = ""
+        self.archive_timed_beat_map_path = ""
+        self.shot_durations = []
+        self.archive_song_settings = None
+        self.archive_caption_options = {}
 
         # Initialize the Firefox profile
         self.options: Options = Options()
@@ -1033,7 +1085,21 @@ Return ONLY the prompt sentence.""",
         threads = get_threads()
         tts_clip = AudioFileClip(self.tts_path)
         max_duration = tts_clip.duration
-        req_dur = max_duration / len(self.images)
+        shot_durations = list(getattr(self, "shot_durations", None) or [])
+        use_explicit_shots = (
+            len(shot_durations) == len(self.images)
+            and len(self.images) > 0
+            and all(float(value) > 0 for value in shot_durations)
+        )
+        if use_explicit_shots:
+            shot_durations = snap_durations_to_frames(
+                [float(value) for value in shot_durations],
+                total_seconds=max_duration,
+                fps=30.0,
+            )
+            default_req_dur = max_duration / len(self.images)
+        else:
+            default_req_dur = max_duration / max(len(self.images), 1)
 
         # Make a generator that returns a TextClip when called with consecutive
         generator = lambda txt: TextClip(
@@ -1053,19 +1119,59 @@ Return ONLY the prompt sentence.""",
         tot_dur = 0
         ken_burns = get_ken_burns_enabled()
         idx = 0
-        while tot_dur < max_duration:
-            for slot, image_path in enumerate(self.images):
+        image_cycle = list(enumerate(self.images))
+        if not use_explicit_shots:
+            # Narration and lyric-fallback keep the historical fill-to-audio loop.
+            while tot_dur < max_duration:
+                for slot, image_path in image_cycle:
+                    req_dur = default_req_dur
+                    modality = (
+                        self.asset_modalities[slot]
+                        if slot < len(self.asset_modalities)
+                        else "image"
+                    )
+                    if modality == "video_clip":
+                        clip = self._build_video_clip_shot(image_path, req_dur)
+                    else:
+                        clip = ImageClip(image_path, duration=req_dur).with_fps(30)
+                        if round((clip.w / clip.h), 4) < 0.5625:
+                            if get_verbose():
+                                info(f" => Resizing Image: {image_path} to 1080x1920")
+                            clip = clip.cropped(
+                                width=clip.w,
+                                height=round(clip.w / 0.5625),
+                                x_center=clip.w / 2,
+                                y_center=clip.h / 2,
+                            )
+                        else:
+                            if get_verbose():
+                                info(f" => Resizing Image: {image_path} to 1920x1080")
+                            clip = clip.cropped(
+                                width=round(0.5625 * clip.h),
+                                height=clip.h,
+                                x_center=clip.w / 2,
+                                y_center=clip.h / 2,
+                            )
+                        clip = clip.resized(new_size=(1080, 1920))
+                        if ken_burns:
+                            clip = apply_ken_burns(clip, req_dur, index=idx)
+                            idx += 1
+                    clips.append(clip)
+                    tot_dur += clip.duration
+                    if tot_dur >= max_duration:
+                        break
+        else:
+            for slot, image_path in image_cycle:
+                req_dur = float(shot_durations[slot])
                 modality = (
                     self.asset_modalities[slot]
                     if slot < len(self.asset_modalities)
                     else "image"
                 )
-
                 if modality == "video_clip":
                     clip = self._build_video_clip_shot(image_path, req_dur)
                 else:
                     clip = ImageClip(image_path, duration=req_dur).with_fps(30)
-
                     if round((clip.w / clip.h), 4) < 0.5625:
                         if get_verbose():
                             info(f" => Resizing Image: {image_path} to 1080x1920")
@@ -1085,11 +1191,9 @@ Return ONLY the prompt sentence.""",
                             y_center=clip.h / 2,
                         )
                     clip = clip.resized(new_size=(1080, 1920))
-
                     if ken_burns:
                         clip = apply_ken_burns(clip, req_dur, index=idx)
                         idx += 1
-
                 clips.append(clip)
                 tot_dur += clip.duration
 
@@ -1097,30 +1201,41 @@ Return ONLY the prompt sentence.""",
             clips = apply_crossfade(clips, fade_duration=get_crossfade_duration())
 
         final_clip = concatenate_videoclips(clips, method="compose").with_fps(30)
-        random_song = choose_random_song(
-            prefer_keywords=get_content_style()["music_keywords"]
-        )
-
         subtitles = None
-        subtitles_path = None
-        try:
-            subtitles_path = self.generate_subtitles(self.tts_path)
-            equalize_subtitles(subtitles_path, 8)
-        except Exception as e:
-            warning(f"Failed to generate subtitles: {e}")
+        subtitles_path = getattr(self, "archive_subtitles_path", "") or None
+        if not subtitles_path:
+            try:
+                subtitles_path = self.generate_subtitles(self.tts_path)
+                equalize_subtitles(subtitles_path, 8)
+            except Exception as e:
+                warning(f"Failed to generate subtitles: {e}")
 
-        random_song_clip = AudioFileClip(random_song).with_fps(44100)
-
-        # Turn down volume
-        random_song_clip = random_song_clip.with_effects([afx.MultiplyVolume(0.1)])
-        comp_audio = CompositeAudioClip([tts_clip.with_fps(44100), random_song_clip])
+        if normalize_audio_mode(getattr(self, "audio_mode", None)) == AUDIO_MODE_ARCHIVE_SONG:
+            # The imported track is the complete musical mix. Adding the normal
+            # background library track would double the music and damage clarity.
+            comp_audio = tts_clip.with_fps(44100)
+        else:
+            random_song = choose_random_song(
+                prefer_keywords=get_content_style()["music_keywords"]
+            )
+            random_song_clip = AudioFileClip(random_song).with_fps(44100)
+            random_song_clip = random_song_clip.with_effects([afx.MultiplyVolume(0.1)])
+            comp_audio = CompositeAudioClip([tts_clip.with_fps(44100), random_song_clip])
 
         final_clip = final_clip.with_audio(comp_audio)
         final_clip = final_clip.with_duration(tts_clip.duration)
 
         if subtitles_path and get_word_captions_enabled():
             try:
-                final_clip = composite_captions_on_video(final_clip, subtitles_path)
+                if normalize_audio_mode(getattr(self, "audio_mode", None)) == AUDIO_MODE_ARCHIVE_SONG:
+                    final_clip = composite_lyric_captions_on_video(
+                        final_clip,
+                        subtitles_path,
+                        getattr(self, "archive_timed_beat_map_path", ""),
+                        caption_options=getattr(self, "archive_caption_options", None),
+                    )
+                else:
+                    final_clip = composite_captions_on_video(final_clip, subtitles_path)
             except Exception as e:
                 warning(f"Word captions failed, falling back to block subtitles: {e}")
                 subtitles = SubtitlesClip(subtitles_path, make_textclip=generator)
@@ -1278,8 +1393,598 @@ Return ONLY the prompt sentence.""",
                 "uploading an over-length Short."
             )
 
+    def _archive_resume_command(self, brand_id: str, episode_id: str) -> str:
+        return (
+            f"python scripts/run_brand_short.py {brand_id} --audio-mode archive-song "
+            f'--episode "{episode_id}" --resume'
+        )
+
+    def _hydrate_archive_song_state(self, state: ArchiveSongState) -> None:
+        self.archive_song_state = state
+        self.subject = state.subject
+        self.script = state.script
+        self.metadata = dict(state.metadata)
+        self.research_brief = dict(state.research_brief)
+        self.research_notes = render_research_notes(self.research_brief)
+        self.research_brief_path = os.path.join(
+            self.archive_song_episode_dir, "research_brief.json"
+        )
+        self.image_prompts = list(state.image_prompts)
+        self.shot_durations = [float(value) for value in (state.shot_durations or [])]
+        self.archive_timed_beat_map_path = state.timed_beat_map_path or ""
+        self.archive_subtitles_path = state.subtitles_path or ""
+
+    def _resolve_archive_song_settings(
+        self, episode_package: SongPackage | dict | None = None
+    ) -> ArchiveSongSettings:
+        brand = load_active_brand() or {}
+        settings = load_resolved_archive_song_settings(
+            brand=brand,
+            episode_package=episode_package,
+            cli_overrides={
+                "skip_song_validation": bool(
+                    getattr(self, "skip_song_validation", False)
+                )
+            },
+        )
+        self.archive_song_settings = settings
+        self.archive_caption_options = {
+            "caption_style": settings.caption_style,
+            "fullscreen_emphasis": settings.fullscreen_emphasis,
+            "fullscreen_max_seconds": settings.fullscreen_max_seconds,
+            "show_source_on_screen": settings.show_source_on_screen,
+        }
+        return settings
+
+    def _generate_archive_song_package(
+        self, target_duration: float, settings: ArchiveSongSettings
+    ) -> SongPackage:
+        prompt = build_song_package_prompt(
+            self.subject,
+            self.script,
+            self.research_brief,
+            target_duration_seconds=target_duration,
+            settings=settings,
+        )
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                raw = self.generate_response(prompt, quality=True)
+                return SongPackage.from_dict(
+                    extract_json_object(raw),
+                    self.research_brief,
+                    settings=settings,
+                )
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                last_error = exc
+                warning(
+                    f"Invalid Archive Song package (attempt {attempt}/3): {exc}"
+                )
+        raise ArchiveSongError(
+            f"LLM did not return a valid source-backed song package: {last_error}"
+        )
+
+    def _save_archive_research_files(self) -> None:
+        with open(
+            os.path.join(self.archive_song_episode_dir, "research_brief.json"),
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(self.research_brief, file, ensure_ascii=False, indent=2)
+        with open(
+            os.path.join(self.archive_song_episode_dir, "approved_script.txt"),
+            "w",
+            encoding="utf-8",
+        ) as file:
+            file.write(self.script.rstrip() + "\n")
+
+    def _restore_archive_assets(self, state: ArchiveSongState) -> bool:
+        if not state.assets or not all(
+            os.path.isfile(str(item.get("path") or "")) for item in state.assets
+        ):
+            return False
+        self.asset_results = [
+            AssetResult(
+                path=str(item["path"]),
+                modality=str(item.get("modality") or "image"),
+                tier=str(item.get("tier") or "standard"),
+                provider=str(item.get("provider") or "checkpoint"),
+                cost_usd=float(item.get("cost_usd") or 0.0),
+            )
+            for item in state.assets
+        ]
+        self.images = [item.path for item in self.asset_results]
+        self.asset_modalities = [item.modality for item in self.asset_results]
+        self.image_prompts = list(state.image_prompts or [])
+        self.shot_durations = [float(value) for value in (state.shot_durations or [])]
+        return (
+            bool(state.image_prompts)
+            and len(self.asset_results) >= len(state.image_prompts)
+            and (
+                not state.shot_durations
+                or len(state.shot_durations) == len(state.image_prompts)
+            )
+        )
+
+    def _build_archive_shot_plan(
+        self,
+        state: ArchiveSongState,
+        package: SongPackage,
+        audio_duration: float,
+        settings: ArchiveSongSettings,
+    ) -> ArchiveShotPlan:
+        style_suffix = get_production_setting("image_style_suffix", "") or (
+            "cinematic documentary illustration style, high contrast, dramatic lighting, "
+            "no text in images, 9:16 vertical"
+        )
+        plan = build_archive_shot_plan(
+            audio_duration=audio_duration,
+            timed_beat_map_path=state.timed_beat_map_path
+            or getattr(self, "archive_timed_beat_map_path", ""),
+            package_beats=package.visual_beat_map,
+            subject=self.subject,
+            historical_topic=package.historical_topic,
+            style_suffix=style_suffix,
+            settings=settings,
+            fallback_prompts=list(state.image_prompts or []),
+        )
+        if plan.used_fallback:
+            warning(
+                "Archive Song visual fallback: "
+                f"{plan.fallback_reason or 'equal-duration lyric prompts'}"
+            )
+            if not plan.shots:
+                self.images = []
+                self.asset_modalities = []
+                self.asset_results = []
+                self.generate_prompts()
+                plan = equal_duration_fallback_plan(
+                    list(self.image_prompts),
+                    audio_duration,
+                    plan.fallback_reason
+                    or "equal-duration lyric prompts after beat-map failure",
+                )
+        else:
+            info(
+                f" => Using timed visual beat map for {len(plan.shots)} Archive Song shots "
+                f"(total {plan.total_duration_seconds:.2f}s / audio {audio_duration:.2f}s)."
+            )
+        return plan
+
+    def _generate_archive_assets(
+        self,
+        state: ArchiveSongState,
+        package: SongPackage,
+        settings: ArchiveSongSettings,
+    ) -> None:
+        audio_clip = AudioFileClip(self.tts_path)
+        try:
+            audio_duration = float(audio_clip.duration)
+        finally:
+            audio_clip.close()
+
+        assets_complete = self._restore_archive_assets(state)
+        durations_ok = (
+            bool(state.shot_durations)
+            and len(state.shot_durations) == len(state.image_prompts or [])
+            and abs(sum(float(value) for value in state.shot_durations) - audio_duration)
+            <= max(0.05, float(settings.duration_tolerance_seconds))
+        )
+        if assets_complete and durations_ok:
+            info(f" => Reusing {len(self.images)} checkpointed Archive Song assets.")
+            return
+        if assets_complete and not durations_ok:
+            warning(
+                "Checkpointed Archive Song shot durations no longer match production "
+                "audio length; rebuilding the shot plan while keeping durable assets "
+                "only when counts still align."
+            )
+            # Force plan rebuild; keep only a durable asset prefix if counts match.
+            if len(self.asset_results) != len(state.image_prompts or []):
+                self.images = []
+                self.asset_modalities = []
+                self.asset_results = []
+                state.assets = []
+            state.image_prompts = []
+            state.shot_durations = []
+            state.shot_plan = {}
+
+        if (
+            state.image_prompts
+            and state.shot_durations
+            and len(state.image_prompts) == len(state.shot_durations)
+            and durations_ok
+            and not state.shot_plan.get("used_fallback", False)
+        ):
+            self.image_prompts = list(state.image_prompts)
+            self.shot_durations = snap_durations_to_frames(
+                [float(value) for value in state.shot_durations],
+                total_seconds=audio_duration,
+                fps=30.0,
+            )
+            plan_source = "checkpoint"
+        else:
+            plan = self._build_archive_shot_plan(
+                state, package, audio_duration, settings
+            )
+            self.image_prompts = [shot.prompt for shot in plan.shots]
+            self.shot_durations = snap_durations_to_frames(
+                [shot.duration_seconds for shot in plan.shots],
+                total_seconds=audio_duration,
+                fps=30.0,
+            )
+            state.image_prompts = list(self.image_prompts)
+            state.shot_durations = list(self.shot_durations)
+            state.shot_plan = plan.to_dict()
+            plan_source = plan.source
+            # Asset count must match the rebuilt plan.
+            if len(self.asset_results) != len(self.image_prompts):
+                self.images = []
+                self.asset_modalities = []
+                self.asset_results = []
+                state.assets = []
+            save_state(self.archive_song_episode_dir, state)
+            info(f" => Archive Song shot plan source: {plan_source}")
+
+        # A prior process may have stopped after any individual asset. Reuse the
+        # durable prefix and continue at the first missing shot.
+        if not self.asset_results:
+            self.images = []
+            self.asset_modalities = []
+            self.asset_results = []
+            state.assets = []
+
+        for index, prompt in enumerate(
+            self.image_prompts[len(self.asset_results) :],
+            start=len(self.asset_results),
+        ):
+            role = shot_role_for_index(index)
+            tier = tier_for_shot_role(role)
+            per_shot_seconds = (
+                float(self.shot_durations[index])
+                if index < len(self.shot_durations)
+                else audio_duration / max(len(self.image_prompts), 1)
+            )
+            result = self._generate_shot_asset(
+                prompt, tier, per_shot_seconds=per_shot_seconds
+            )
+            durable_path = copy_checkpoint_asset(
+                result.path, self.archive_song_episode_dir, index
+            )
+            result = AssetResult(
+                path=durable_path,
+                modality=result.modality,
+                tier=result.tier,
+                provider=result.provider,
+                cost_usd=result.cost_usd,
+            )
+            self.images.append(result.path)
+            self.asset_modalities.append(result.modality)
+            self.asset_results.append(result)
+            state.assets.append(
+                {
+                    "path": result.path,
+                    "modality": result.modality,
+                    "tier": result.tier,
+                    "provider": result.provider,
+                    "cost_usd": result.cost_usd,
+                }
+            )
+            save_state(self.archive_song_episode_dir, state)
+
+            if result.tier != "standard":
+                log_asset_spend(
+                    video_title=self.subject,
+                    role=role,
+                    tier=result.tier,
+                    modality=result.modality,
+                    provider=result.provider,
+                    cost_usd=result.cost_usd,
+                    brand_id=state.brand_id,
+                )
+
+    def _generate_archive_song_pipeline(self) -> str:
+        if self.format_type != "short":
+            raise ArchiveSongError("Archive Song mode currently supports Shorts only.")
+
+        brand = load_active_brand() or {}
+        brand_id = str(brand.get("brand_id") or "default")
+        episode_id = (
+            str(getattr(self, "archive_song_episode_id", "") or "").strip()
+            or str(getattr(self, "episode_number", "") or "").strip()
+            or re.sub(
+                r"[^a-z0-9]+",
+                "-",
+                str(getattr(self, "subject", "") or "").lower(),
+            ).strip("-")[:60]
+            or datetime.now().strftime("%Y%m%d-%H%M%S")
+        )
+        self.archive_song_episode_id = episode_id
+        self.archive_song_episode_dir = ensure_episode_directory(brand_id, episode_id)
+        resume_command = self._archive_resume_command(brand_id, episode_id)
+        existing_state_path = os.path.join(
+            self.archive_song_episode_dir, "archive_song_state.json"
+        )
+
+        state = None
+        if os.path.isfile(existing_state_path):
+            state = load_state(self.archive_song_episode_dir)
+            if state.brand_id != brand_id:
+                raise ArchiveSongError(
+                    f"Episode state belongs to brand {state.brand_id!r}, not {brand_id!r}."
+                )
+            requested_subject = str(getattr(self, "subject", "") or "").strip()
+            if (
+                requested_subject
+                and state.subject
+                and requested_subject.casefold() != state.subject.casefold()
+            ):
+                raise ArchiveSongError(
+                    f"Episode {episode_id!r} is checkpointed for {state.subject!r}; "
+                    f"refusing to reuse it for {requested_subject!r}. Choose a new --episode id."
+                )
+            self._hydrate_archive_song_state(state)
+
+        if state is None:
+            self.run_id = str(uuid4())
+            self.images = []
+            self.asset_modalities = []
+            self.asset_results = []
+            self.research_notes = ""
+            self.research_brief = {}
+            self.research_brief_path = ""
+            self.production_metadata = {"audio_mode": AUDIO_MODE_ARCHIVE_SONG}
+            self._research_rejected_topics = []
+            self._generate_topic_and_research(max_attempts=3)
+            self.generate_script()
+            self._save_archive_research_files()
+            state = ArchiveSongState(
+                episode_id=episode_id,
+                brand_id=brand_id,
+                subject=self.subject,
+                script=self.script,
+                research_brief=self.research_brief,
+            )
+
+        settings = self._resolve_archive_song_settings(
+            state.song_package if state.song_package else None
+        )
+        target_duration = float(settings.target_duration_seconds)
+        if not state.song_package or self.regenerate_song_package:
+            # Regeneration reuses the approved script and research; it never
+            # discards imported audio, but downstream timing/visuals must be
+            # rebuilt because lyrics and beat guidance may have changed.
+            if self.regenerate_song_package:
+                invalidate_audio_dependent_outputs(state)
+                state.package_lyrics_hash = ""
+            approved_script = state.script
+            self.script = approved_script
+            # Brand/config settings guide generation before an episode package exists.
+            settings = self._resolve_archive_song_settings(None)
+            package = self._generate_archive_song_package(target_duration, settings)
+            # Episode package values now override brand defaults for this run.
+            settings = self._resolve_archive_song_settings(package)
+            state.song_package = package.to_dict()
+            state.package_lyrics_hash = lyrics_content_hash(package.lyrics.text)
+            state.settings = settings.to_dict()
+            state.metadata = {
+                "title": package.suggested_youtube_title,
+                "description": build_description(
+                    package.suggested_description,
+                    subject=self.subject,
+                    format_type="short",
+                    include_affiliate=True,
+                )
+                + ("\n\n" + " ".join(package.suggested_hashtags) if package.suggested_hashtags else ""),
+            }
+            self.metadata = dict(state.metadata)
+            with open(
+                os.path.join(self.archive_song_episode_dir, "metadata.json"),
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(self.metadata, file, ensure_ascii=False, indent=2)
+            state.status = "awaiting_song_audio"
+            save_state(self.archive_song_episode_dir, state)
+            write_song_package_files(
+                self.archive_song_episode_dir,
+                package,
+                self.research_brief,
+                resume_command,
+            )
+        else:
+            package = SongPackage.from_dict(
+                state.song_package, state.research_brief, settings=settings
+            )
+            settings = self._resolve_archive_song_settings(package)
+            state.settings = settings.to_dict()
+            state.package_lyrics_hash = state.package_lyrics_hash or lyrics_content_hash(
+                package.lyrics.text
+            )
+            self.metadata = dict(state.metadata)
+            # Repair companion files if state survived but artifacts were deleted.
+            lyrics_path = os.path.join(self.archive_song_episode_dir, "lyrics.txt")
+            if not os.path.isfile(lyrics_path):
+                write_song_package_files(
+                    self.archive_song_episode_dir,
+                    package,
+                    self.research_brief,
+                    resume_command,
+                )
+
+        self.archive_song_state = state
+        if not self.archive_song_resume:
+            state.status = "awaiting_song_audio"
+            save_state(self.archive_song_episode_dir, state)
+            raise AwaitingSongAudio(self.archive_song_episode_dir, resume_command)
+
+        imported = discover_song_audio(
+            self.archive_song_episode_dir,
+            getattr(self, "archive_song_audio_path", "") or None,
+            filenames=settings.audio_filenames,
+        )
+        if not imported:
+            state.status = "awaiting_song_audio"
+            save_state(self.archive_song_episode_dir, state)
+            raise AwaitingSongAudio(self.archive_song_episode_dir, resume_command)
+
+        # Never overwrite the operator's export. Normalize from the discovered
+        # path (or --song-audio) and keep that path as the import identity.
+        imported = os.path.abspath(imported)
+        current_identity = compute_file_identity(imported)
+        if not identities_match(current_identity, state.imported_audio_identity):
+            if state.imported_audio_identity:
+                warning(
+                    "Imported Archive Song audio changed; invalidating timed map, "
+                    "alignment, assets, and prior render."
+                )
+            invalidate_audio_dependent_outputs(state)
+            state.imported_audio_identity = current_identity
+
+        if (
+            not self.regenerate_song_package
+            and state.status == "rendered"
+            and state.rendered_video_path
+            and os.path.isfile(state.rendered_video_path)
+            and identities_match(current_identity, state.imported_audio_identity)
+            and state.normalized_audio_path
+            and os.path.isfile(state.normalized_audio_path)
+        ):
+            self.video_path = state.rendered_video_path
+            self.output_video_path = state.rendered_video_path
+            self.tts_path = state.normalized_audio_path
+            self.metadata = dict(state.metadata)
+            info(f" => Reusing completed Archive Song render: {state.rendered_video_path}")
+            return state.rendered_video_path
+
+        validation = validate_and_normalize_audio(
+            imported,
+            self.archive_song_episode_dir,
+            target_duration_seconds=package.target_duration_seconds,
+            min_duration_seconds=float(settings.min_duration_seconds),
+            max_duration_seconds=float(settings.max_duration_seconds),
+            enforce_duration=bool(settings.enforce_duration),
+        )
+        state.imported_audio_path = imported
+        state.imported_audio_identity = current_identity
+        state.audio_validation = validation.to_dict()
+        if not validation.valid:
+            state.status = "invalid_song_audio"
+            state.errors = list(validation.errors)
+            save_state(self.archive_song_episode_dir, state)
+            raise ArchiveSongError(
+                "Archive Song audio validation failed: " + "; ".join(validation.errors)
+            )
+
+        state.errors = []
+        state.normalized_audio_path = validation.normalized_path
+        self.tts_path = validation.normalized_path
+        self.production_metadata = {
+            "audio_mode": AUDIO_MODE_ARCHIVE_SONG,
+            "audio_validation": validation.to_dict(),
+            "imported_audio_identity": current_identity,
+            "tts_provider": "manual_suno_handoff",
+            "tts_model": "",
+            "archive_song_settings": settings.to_dict(),
+        }
+        if not (
+            state.timed_beat_map_path
+            and os.path.isfile(state.timed_beat_map_path)
+        ):
+            _raw_path, normalized_map_path = prepare_timed_beat_maps(
+                self.archive_song_episode_dir,
+                package.visual_beat_map,
+                validation.duration_seconds,
+                settings,
+            )
+            state.timed_beat_map_path = normalized_map_path
+        self.archive_timed_beat_map_path = state.timed_beat_map_path
+
+        lyrics_hash = lyrics_content_hash(package.lyrics.text)
+        alignment_reusable = (
+            state.caption_alignment_path
+            and state.subtitles_path
+            and os.path.isfile(state.caption_alignment_path)
+            and os.path.isfile(state.subtitles_path)
+            and state.package_lyrics_hash == lyrics_hash
+        )
+        if alignment_reusable:
+            self.archive_subtitles_path = state.subtitles_path
+            info(" => Reusing checkpointed Archive Song lyric alignment.")
+        else:
+            if state.caption_alignment_path or state.subtitles_path:
+                info(
+                    " => Rebuilding lyric alignment "
+                    "(lyrics changed, audio changed, or alignment files were missing)."
+                )
+            detected_entries = []
+            try:
+                detected_srt = self.generate_subtitles_local_whisper(self.tts_path)
+                detected_entries = _parse_srt(detected_srt)
+            except Exception as exc:
+                warning(
+                    f"Sung-lyric transcription unavailable; using editable phrase timing fallback: {exc}"
+                )
+            alignment_path, subtitles_path = build_lyric_alignment(
+                self.archive_song_episode_dir,
+                package.lyrics.text,
+                validation.duration_seconds,
+                detected_entries,
+            )
+            state.caption_alignment_path = alignment_path
+            state.subtitles_path = subtitles_path
+            state.package_lyrics_hash = lyrics_hash
+            self.archive_subtitles_path = subtitles_path
+        state.status = "audio_ready"
+        save_state(self.archive_song_episode_dir, state)
+
+        # Lyrics become the visual/caption script only after the approved source
+        # narration and research have been safely checkpointed in state.
+        self.script = package.lyrics.text
+        self._generate_archive_assets(state, package, settings)
+        state.status = "assets_ready"
+        save_state(self.archive_song_episode_dir, state)
+
+        path = self.combine()
+        self.video_path = os.path.abspath(path)
+        durable_video = os.path.join(self.archive_song_episode_dir, "final_video.mp4")
+        shutil.copy2(self.video_path, durable_video)
+        self.output_video_path = os.path.abspath(durable_video)
+        state.rendered_video_path = self.output_video_path
+        state.status = "rendered"
+        state.metadata = dict(self.metadata)
+        save_state(self.archive_song_episode_dir, state)
+
+        self.production_metadata.update(
+            {
+                "asset_count": len(self.asset_results),
+                "asset_modalities": [result.modality for result in self.asset_results],
+                "asset_tiers": [result.tier for result in self.asset_results],
+                "asset_providers": [result.provider for result in self.asset_results],
+                "target_duration_seconds": package.target_duration_seconds,
+                "episode_dir": self.archive_song_episode_dir,
+            }
+        )
+        log_video(
+            title=self.metadata.get("title", ""),
+            format_type=self.format_type,
+            niche=self.niche,
+            video_path=self.output_video_path,
+            subject=self.subject,
+            brand_id=brand_id,
+            status="generated",
+            experiment=self._build_experiment_metadata(),
+            research=self._research_metadata(),
+            production=self.production_metadata,
+        )
+        return self.output_video_path
+
     def _generate_pipeline(self, tts_instance: TTS, interactive: bool = True) -> str:
         """Shared generation pipeline for short and long-form."""
+        self.audio_mode = normalize_audio_mode(getattr(self, "audio_mode", None))
+        if self.audio_mode == AUDIO_MODE_ARCHIVE_SONG:
+            return self._generate_archive_song_pipeline()
+
         self.run_id = str(uuid4())
         self.images = []
         self.asset_modalities = []

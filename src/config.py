@@ -656,3 +656,22 @@ def get_asset_spend_alert_threshold_usd() -> float:
     surface a warning. Purely informational — does not block generation."""
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return float(json.load(file).get("asset_spend_alert_threshold_usd", 25))
+
+
+def get_archive_song_config() -> dict:
+    """Return local/manual Archive Song settings with conservative defaults."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("archive_song", {})
+    return value if isinstance(value, dict) else {}
+
+
+def get_archive_song_target_duration_seconds() -> float:
+    return float(get_archive_song_config().get("target_duration_seconds", 60))
+
+
+def get_archive_song_min_duration_seconds() -> float:
+    return float(get_archive_song_config().get("min_duration_seconds", 55))
+
+
+def get_archive_song_max_duration_seconds() -> float:
+    return float(get_archive_song_config().get("max_duration_seconds", 65))

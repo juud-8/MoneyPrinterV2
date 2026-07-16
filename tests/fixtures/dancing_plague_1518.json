@@ -1,0 +1,166 @@
+{
+  "example_only": true,
+  "audio_mode": "archive_song",
+  "episode_id": "dancing-plague-1518",
+  "research_brief": {
+    "topic": "The Dancing Plague of 1518",
+    "summary": "A weeks-long dancing outbreak in Strasbourg remains historically documented but medically unresolved.",
+    "claims": [
+      {
+        "text": "The outbreak began in Strasbourg in July 1518.",
+        "source_ids": ["S1", "S2"]
+      },
+      {
+        "text": "Accounts identify a woman commonly called Frau Troffea among the first people to dance.",
+        "source_ids": ["S1"]
+      },
+      {
+        "text": "Civic authorities at one stage arranged musicians and spaces for the dancers.",
+        "source_ids": ["S1", "S2"]
+      },
+      {
+        "text": "The episode lasted for weeks and involved many residents.",
+        "source_ids": ["S1", "S2"]
+      }
+    ],
+    "disputed_points": [
+      "The cause and exact number of participants or deaths remain disputed."
+    ],
+    "sources": [
+      {
+        "id": "S1",
+        "provider": "encyclopedia",
+        "title": "Dancing plague of 1518",
+        "url": "https://www.britannica.com/event/dancing-plague-of-1518",
+        "excerpt": "Reference lead for the Strasbourg chronology; verify the current article before publication."
+      },
+      {
+        "id": "S2",
+        "provider": "museum",
+        "title": "The dancing plague of 1518",
+        "url": "https://www.historytoday.com/archive/months-past/dancing-plague-1518",
+        "excerpt": "Secondary reference lead for civic response and duration; verify before publication."
+      }
+    ],
+    "cited_source_ids": ["S1", "S2"]
+  },
+  "song_package": {
+    "episode_title": "The Dancing Plague of 1518",
+    "historical_topic": "The Dancing Plague of 1518 in Strasbourg",
+    "factual_summary": "In July 1518, a dancing outbreak spread through Strasbourg; authorities tried music and designated spaces, but its cause remains disputed.",
+    "song_title": "Dance Until the Records Fade",
+    "lyrics": "Strasbourg woke to dancing feet,\nJuly burned beneath the street.\nFrau Troffea turned alone,\nthen the fever found the town.\n\nDance, dance, nobody knows,\nwhy the city could not close.\nDance, dance, drums in the square,\nhundreds moving through the air.\n\nCouncillors called the pipers in,\nbuilt a stage to cure the spin.\nWeeks went by; the records blur,\nsaints and sickness, heat and fear.\n\nDance, dance, nobody knows,\nwhere the final footstep goes.\nFive long centuries ask us why—\nwhat made Strasbourg dance, not die?",
+    "suno_style_prompt": "Dark medieval folk cabaret, 96 BPM, minor mode, hurdy-gurdy, frame drum and bowed strings, immediate clear vocal entrance, lean theatrical arrangement, crisp consonants, recurring chant hook, haunting unresolved final chord.",
+    "exclusions": [
+      "no spoken intro",
+      "no artist imitation",
+      "no modern electronic dance drop",
+      "no screamed or unintelligible vocals",
+      "no invented dialogue"
+    ],
+    "target_duration_seconds": 60,
+    "estimated_bpm": 96,
+    "suggested_key_or_mood": "D minor; tense, processional, uncanny",
+    "vocal_direction": "Enter on beat one; articulate Strasbourg and Troffea clearly; verses narrate, hook becomes a restrained communal chant.",
+    "pronunciations": [
+      {
+        "term": "Strasbourg",
+        "pronunciation": "STRAHZ-boorg",
+        "note": "Keep both syllables distinct."
+      },
+      {
+        "term": "Troffea",
+        "pronunciation": "TROH-fay-ah",
+        "note": "Historical spelling varies."
+      }
+    ],
+    "visual_beat_map": [
+      {
+        "progress_start": 0.0,
+        "progress_end": 0.1,
+        "lyric_phrase": "Strasbourg woke to dancing feet",
+        "historical_fact": "The outbreak began in Strasbourg in July 1518.",
+        "suggested_visual": "1518 Strasbourg street rendered as a restrained woodcut, one moving figure",
+        "camera_motion": "Fast push from city map into the street",
+        "on_screen_text": "STRASBOURG · JULY 1518",
+        "source_ids": ["S1", "S2"],
+        "confidence": "high"
+      },
+      {
+        "progress_start": 0.1,
+        "progress_end": 0.25,
+        "lyric_phrase": "Frau Troffea turned alone",
+        "historical_fact": "Accounts name Frau Troffea among the first dancers.",
+        "suggested_visual": "Single dancer isolated against watching townspeople, no sensational distress",
+        "camera_motion": "Slow circular parallax",
+        "on_screen_text": "ONE DANCER",
+        "source_ids": ["S1"],
+        "confidence": "medium"
+      },
+      {
+        "progress_start": 0.25,
+        "progress_end": 0.45,
+        "lyric_phrase": "then the fever found the town",
+        "historical_fact": "The episode involved many Strasbourg residents over subsequent weeks.",
+        "suggested_visual": "Crowd silhouettes multiply across an archival street plan",
+        "camera_motion": "Layered lateral tracking",
+        "on_screen_text": "THEN MORE JOINED",
+        "source_ids": ["S1", "S2"],
+        "confidence": "high"
+      },
+      {
+        "progress_start": 0.45,
+        "progress_end": 0.65,
+        "lyric_phrase": "Councillors called the pipers in",
+        "historical_fact": "Authorities arranged musicians and spaces for dancers during part of the response.",
+        "suggested_visual": "Council chamber dissolves into hired pipers beside a timber platform",
+        "camera_motion": "Hard cut followed by a measured push-in",
+        "on_screen_text": "THE CITY ADDED MUSIC",
+        "source_ids": ["S1", "S2"],
+        "confidence": "high"
+      },
+      {
+        "progress_start": 0.65,
+        "progress_end": 0.85,
+        "lyric_phrase": "Weeks went by; the records blur",
+        "historical_fact": "The outbreak persisted for weeks, while reported totals vary.",
+        "suggested_visual": "Calendar pages and municipal manuscript fragments fading into shadow",
+        "camera_motion": "Overhead drift with gentle crossfade",
+        "on_screen_text": "THE NUMBERS ARE DISPUTED",
+        "source_ids": ["S1", "S2"],
+        "confidence": "disputed"
+      },
+      {
+        "progress_start": 0.85,
+        "progress_end": 1.0,
+        "lyric_phrase": "Five long centuries ask us why",
+        "historical_fact": "No single explanation for the outbreak is established.",
+        "suggested_visual": "Empty Strasbourg square at dusk with one abandoned shoe",
+        "camera_motion": "Slow pull back to black",
+        "on_screen_text": "WHAT MADE THEM DANCE?",
+        "source_ids": ["S1", "S2"],
+        "confidence": "disputed"
+      }
+    ],
+    "fact_traceability": [
+      {
+        "lyric_excerpt": "Strasbourg woke to dancing feet, July burned beneath the street",
+        "claim": "The outbreak began in Strasbourg in July 1518.",
+        "source_ids": ["S1", "S2"]
+      },
+      {
+        "lyric_excerpt": "Councillors called the pipers in, built a stage",
+        "claim": "Civic authorities at one stage arranged musicians and spaces for the dancers.",
+        "source_ids": ["S1", "S2"]
+      }
+    ],
+    "disputed_claim_warnings": [
+      "The cause and exact number of participants or deaths remain disputed."
+    ],
+    "suggested_youtube_title": "Why Strasbourg Couldn’t Stop Dancing in 1518",
+    "suggested_description": "In July 1518, Strasbourg residents began dancing for weeks. City leaders even brought in musicians—but the cause remains disputed. This Archive Song follows only source-mapped claims and keeps uncertain details labeled.",
+    "suggested_hashtags": ["#History", "#DancingPlague", "#ArchiveSong"],
+    "suggested_thumbnail_text": "THEY COULDN'T STOP",
+    "suggested_opening_frame_text": "STRASBOURG · 1518"
+  }
+}
