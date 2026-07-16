@@ -52,17 +52,17 @@ explicitly deferred.
 ## Repository checkpoint plan
 
 - Checkpoint date: 2026-07-15
-- Implementation commit: pending creation, message
+- Implementation commit:
+  `cc0e03e9670ce294a0c8cf06215511d9f4405873` —
   `Add Archive Song and local media provider foundation`.
 - Commit structure: one combined implementation commit is required because
   `src/archive_song.py` imports shared SHA-256 helpers from
   `src/media_providers`. Splitting the completed phases without a broken
   intermediate commit would require fragile partial staging of that untracked
   module.
-- Ledger finalization: a ledger-only follow-up commit will record the exact
-  implementation hash and final status. A commit cannot include its own hash,
-  so the ledger finalization hash is reported by Git after creation rather than
-  self-recorded in this file.
+- Ledger finalization: this file is finalized in a ledger-only follow-up commit.
+  A commit cannot include its own hash, so that follow-up hash is reported by
+  Git after creation rather than self-recorded in this file.
 - Excluded generated artifact:
   `02234b91-2b7c-470d-9481-0b3bc8bf4b34TEMP_MPY_wvf_snd.mp3`. It belongs to an
   active render and must not be staged, deleted, or modified.
@@ -190,9 +190,11 @@ All test commands use `venv\Scripts\python.exe` with
   crash with `PermissionError` when another MoneyPrinter render owns a `.mp`
   artifact. This pre-existing concurrency limitation blocked only the
   interactive CLI smoke; the brand-runner parser smoke passed.
-- Checkpoint status before staging is dirty only with the reviewed Archive Song
-  and provider-foundation boundary plus the excluded generated MoviePy audio
-  artifact. Update this statement after commits are created.
+- Checkpoint status after the implementation commit has no tracked changes.
+  The only remaining worktree item is the preserved untracked generated
+  `02234b91-2b7c-470d-9481-0b3bc8bf4b34TEMP_MPY_wvf_snd.mp3`, which belongs to
+  the still-active render. The repository is clean with respect to source,
+  documentation, configuration examples, and tests; Phase 2 is next.
 
 ## Deferred work
 
