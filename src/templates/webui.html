@@ -4,7 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>EL JEFE — Mission Control</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23060d16'/%3E%3Cpath d='M32 6 55 19v26L32 58 9 45V19z' fill='none' stroke='%2346d7ff' stroke-width='2.5' opacity='.85'/%3E%3Ctext x='32' y='43' font-family='Consolas,monospace' font-size='30' font-weight='700' fill='%23f5b950' text-anchor='middle'%3E%24%3C/text%3E%3C/svg%3E">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%2307090c'/%3E%3Crect x='8' y='8' width='48' height='48' rx='4' fill='none' stroke='%23c9a227' stroke-width='2.5'/%3E%3Ctext x='32' y='42' font-family='Georgia,serif' font-size='22' font-weight='700' fill='%23e8e2d6' text-anchor='middle'%3EEJ%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/css/fonts.css">
   <link rel="stylesheet" href="/static/css/webui.css">
   <script src="/static/vendor/chartjs/chart.umd.min.js"></script>
   <script src="/static/vendor/three/three.min.js"></script>
@@ -16,8 +17,8 @@
     <div class="topbar-inner">
       <div class="brand-block" title="MoneyPrinterV2 control panel">
         <svg class="brand-sigil" viewBox="0 0 64 64" aria-hidden="true">
-          <path d="M32 6 55 19v26L32 58 9 45V19z" fill="none" stroke="currentColor" stroke-width="3"/>
-          <text x="32" y="43" font-size="30" font-weight="700" text-anchor="middle" fill="var(--gold)" font-family="inherit">$</text>
+          <rect x="6" y="6" width="52" height="52" rx="6" fill="none" stroke="currentColor" stroke-width="3"/>
+          <text x="32" y="43" font-size="22" font-weight="700" text-anchor="middle" fill="var(--chalk)" font-family="Georgia, serif">EJ</text>
         </svg>
         <div class="brand-text">
           <h1 class="brand-title">EL JEFE</h1>
@@ -31,11 +32,12 @@
         <button type="button" data-section="performance">Performance<kbd>3</kbd></button>
         <button type="button" data-section="spend">Spend<kbd>4</kbd></button>
         <button type="button" data-section="pipeline">Pipeline<kbd>5</kbd></button>
-        <button type="button" data-section="help">Help<kbd>6</kbd></button>
+        <button type="button" data-section="review">Review<kbd>6</kbd></button>
+        <button type="button" data-section="help">Help<kbd>7</kbd></button>
       </nav>
 
       <div class="top-actions">
-        <div class="health-strip" id="health-strip" role="status" title="Systems check — click to re-run">
+        <div class="health-strip" id="health-strip" role="status" aria-live="polite" title="Systems check — click for details &amp; fixes">
           <span class="health-label" id="health-label">SYSTEMS…</span>
           <span class="leds" id="health-leds"></span>
         </div>
@@ -43,13 +45,6 @@
           <span class="clock-time" id="clock-time">--:--:--</span>
           <span class="clock-date" id="clock-date"></span>
         </div>
-        <div class="days-picker" title="Analytics window">
-          <button type="button" class="active" data-days="7">7d</button>
-          <button type="button" data-days="14">14d</button>
-          <button type="button" data-days="30">30d</button>
-          <button type="button" data-days="all">All</button>
-        </div>
-        <button id="refresh-metrics" class="primary" title="Pull views/likes/subs from the YouTube Data API">⟳ Metrics</button>
         <button id="cmdk-btn" class="ghost" title="Command palette (Ctrl+K)">Ctrl·K</button>
       </div>
     </div>
@@ -61,58 +56,80 @@
 
     <!-- ———— OVERVIEW ———— -->
     <section class="panel-section active" data-section="overview" id="section-overview">
-      <div class="ops-row">
-        <div class="card ops-card">
-          <div class="card-head">
-            <h3>Today's Ops</h3>
-            <span class="muted small" id="ops-date"></span>
+      <div class="command-deck">
+        <div class="band-label">Command Deck</div>
+        <div class="deck-toolbar">
+          <div class="days-picker" title="Analytics window" id="days-picker">
+            <button type="button" class="active" data-days="7">7d</button>
+            <button type="button" data-days="14">14d</button>
+            <button type="button" data-days="30">30d</button>
+            <button type="button" data-days="all">All</button>
           </div>
-          <div id="ops-brief" class="ops-brief"></div>
+          <button id="refresh-metrics" class="primary" title="Pull views/likes/subs from the YouTube Data API">⟳ Metrics</button>
+          <button id="resync-btn" class="ghost" title="Re-sync dashboard data (R)">⟲ Sync</button>
+          <span class="muted small" id="sync-label">syncing…</span>
         </div>
-        <div class="card ops-card">
-          <div class="card-head">
-            <h3>Attention</h3>
-            <span class="muted small" id="sync-label">syncing…</span>
+        <div class="ops-row">
+          <div class="card ops-card">
+            <div class="card-head">
+              <h3>Today's Ops</h3>
+              <span class="muted small" id="ops-date"></span>
+            </div>
+            <div id="ops-brief" class="ops-brief"><div class="skeleton"></div></div>
           </div>
-          <div id="ops-alerts" class="ops-alerts"></div>
-        </div>
-      </div>
-
-      <div class="totals" id="totals"></div>
-
-      <div class="hero-card big">
-        <div class="hero-hud">
-          <div class="hud-corner tl">
-            <h3>GROWTH TERRAIN</h3>
-            <span class="muted small">subscribers over time · hover a ribbon, click to focus</span>
-          </div>
-          <div class="hud-corner tr" id="hero-legend"></div>
-          <div class="hud-corner bl muted small" id="hero-meta"></div>
-          <div class="hud-corner br">
-            <span class="muted small" id="brand-filter-label">TRACKING: ALL BRANDS</span>
-            <button type="button" id="clear-filter" class="small ghost">Clear</button>
+          <div class="card ops-card">
+            <div class="card-head">
+              <h3>Attention</h3>
+              <span class="muted small" id="generated-at"></span>
+            </div>
+            <div id="ops-alerts" class="ops-alerts"><div class="skeleton"></div></div>
           </div>
         </div>
-        <div id="growthTerrain" class="hero-scene"></div>
-        <div class="hero-fallback">Loading 3D scene…</div>
+        <div class="deck-ctas" id="deck-ctas"></div>
+        <div id="insights-cta" class="deck-ctas" hidden></div>
+        <div id="review-bay-overview" class="review-bay"></div>
+        <div id="song-bay" class="song-bay"></div>
       </div>
 
-      <div class="grid charts-grid">
-        <div class="card chart-card"><div class="card-head"><h3>Posts per day</h3><span class="muted small">stacked by brand</span></div><div class="chart-box"><canvas id="timelineChart"></canvas></div></div>
-        <div class="card chart-card"><div class="card-head"><h3>Channel growth</h3><span class="muted small">subscribers</span></div><div class="chart-box"><canvas id="growthChart"></canvas></div></div>
-        <div class="card chart-card"><div class="card-head"><h3>Output mix</h3><span class="muted small">uploaded vs generated</span></div><div class="chart-box"><canvas id="statusChart"></canvas></div></div>
-        <div class="card chart-card"><div class="card-head"><h3>Top videos</h3><span class="muted small">by views in window</span></div><div id="top-videos" class="top-videos"></div></div>
-      </div>
+      <div class="telemetry">
+        <div class="band-label">Telemetry</div>
+        <div class="totals" id="totals"><div class="skeleton"></div></div>
 
-      <div class="section-head"><h2>Recent posts</h2></div>
-      <div class="card" id="recent-posts"></div>
+        <div class="hero-card big" id="hero-card">
+          <div class="hero-hud">
+            <div class="hud-corner tl">
+              <h3>GROWTH TERRAIN</h3>
+              <span class="muted small">subscribers over time · hover a ribbon, click to focus</span>
+            </div>
+            <div class="hud-corner tr" id="hero-legend"></div>
+            <div class="hud-corner bl muted small" id="hero-meta"></div>
+            <div class="hud-corner br">
+              <span class="muted small" id="brand-filter-label">TRACKING: ALL BRANDS</span>
+              <button type="button" id="clear-filter" class="small ghost">Clear</button>
+              <button type="button" id="toggle-terrain" class="small ghost" title="Collapse Growth Terrain">Collapse</button>
+            </div>
+          </div>
+          <div id="growthTerrain" class="hero-scene"></div>
+          <div class="hero-fallback">No channel snapshots yet — hit ⟳ Metrics to start the terrain.<br><code>python src/youtube_metrics.py</code></div>
+        </div>
+
+        <div class="grid charts-grid">
+          <div class="card chart-card"><div class="card-head"><h3>Posts per day</h3><span class="muted small">stacked by brand</span></div><div class="chart-box"><canvas id="timelineChart"></canvas></div></div>
+          <div class="card chart-card"><div class="card-head"><h3>Channel growth</h3><span class="muted small">subscribers</span></div><div class="chart-box"><canvas id="growthChart"></canvas></div></div>
+          <div class="card chart-card"><div class="card-head"><h3>Output mix</h3><span class="muted small">uploaded vs generated</span></div><div class="chart-box"><canvas id="statusChart"></canvas></div></div>
+          <div class="card chart-card"><div class="card-head"><h3>Top videos</h3><span class="muted small">by views in window</span></div><div id="top-videos" class="top-videos"></div></div>
+        </div>
+
+        <div class="section-head"><h2>Recent posts</h2></div>
+        <div class="card" id="recent-posts"></div>
+      </div>
     </section>
 
     <!-- ———— BRANDS ———— -->
     <section class="panel-section" data-section="brands" id="section-brands">
       <div class="section-head">
         <h2>Brands</h2>
-        <span class="muted small">generate · publish windows · funnels · insights</span>
+        <span class="muted small">generate · review bay · publish windows · insights</span>
       </div>
       <div class="grid brands-grid" id="brands"></div>
     </section>
@@ -121,7 +138,7 @@
     <section class="panel-section" data-section="performance" id="section-performance">
       <div class="section-head">
         <h2>Performance</h2>
-        <span class="muted small">YouTube Data API · retention % is manual Studio entry</span>
+        <span class="muted small">YouTube Data API · set retention % inline from Studio</span>
       </div>
       <div class="perf-controls" id="perf-controls">
         <div class="chip-row" id="perf-brand-chips"></div>
@@ -130,9 +147,9 @@
           <option value="uploaded">Uploaded</option>
           <option value="generated">Generated</option>
         </select>
-        <input type="search" id="perf-search" placeholder="Search titles…  ( / )">
+        <input type="search" id="perf-search" placeholder="Search titles…  ( / )" autocomplete="off">
       </div>
-      <div class="table-wrap">
+      <div class="table-wrap" id="perf-wrap">
         <table class="perf-table">
           <thead>
             <tr>
@@ -145,15 +162,12 @@
               <th data-sort="likes" class="sortable num">Likes</th>
               <th data-sort="comments" class="sortable num">Com.</th>
               <th data-sort="avg_view_pct" class="sortable num">Ret.</th>
+              <th></th>
             </tr>
           </thead>
           <tbody id="perf-body"></tbody>
         </table>
       </div>
-      <p class="muted small" style="margin-top:10px">
-        Set retention from Studio:
-        <code>python src/analytics.py retention "&lt;title or video id&gt;" 72.5</code>
-      </p>
     </section>
 
     <!-- ———— SPEND ———— -->
@@ -186,7 +200,7 @@
     <section class="panel-section" data-section="pipeline" id="section-pipeline">
       <div class="section-head">
         <h2>Pipeline jobs</h2>
-        <span class="muted small">history survives restarts · logs stream live</span>
+        <span class="muted small">history survives restarts · logs stream live (SSE)</span>
       </div>
       <div class="card">
         <table class="jobs-table">
@@ -210,6 +224,21 @@
       </div>
     </section>
 
+    <!-- ———— WEEKLY REVIEW ———— -->
+    <section class="panel-section" data-section="review" id="section-review">
+      <div class="section-head">
+        <h2>Weekly review</h2>
+        <span class="muted small">7-day ritual · copy for notes</span>
+      </div>
+      <div class="deck-toolbar" style="margin-bottom:14px">
+        <button type="button" id="weekly-refresh" class="primary">Refresh review</button>
+        <button type="button" id="weekly-copy" class="ghost">Copy text</button>
+      </div>
+      <div class="weekly-grid" id="weekly-cards"></div>
+      <div class="section-head"><h2>Plain text</h2></div>
+      <div class="card"><pre class="weekly-text" id="weekly-text">Loading…</pre></div>
+    </section>
+
     <!-- ———— HELP ———— -->
     <section class="panel-section" data-section="help" id="section-help">
       <div class="section-head">
@@ -228,46 +257,37 @@
         <div class="card">
           <h3>Keyboard</h3>
           <table class="kbd-table">
-            <tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd></td><td>Command palette — generate, post, jump anywhere</td></tr>
-            <tr><td><kbd>1</kbd>–<kbd>6</kbd></td><td>Switch tabs</td></tr>
+            <tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd></td><td>Command palette</td></tr>
+            <tr><td><kbd>1</kbd>–<kbd>7</kbd></td><td>Switch tabs</td></tr>
             <tr><td><kbd>R</kbd></td><td>Re-sync overview data</td></tr>
-            <tr><td><kbd>M</kbd></td><td>Refresh YouTube metrics (starts job)</td></tr>
+            <tr><td><kbd>M</kbd></td><td>Refresh YouTube metrics</td></tr>
             <tr><td><kbd>/</kbd></td><td>Search performance table</td></tr>
-            <tr><td><kbd>?</kbd></td><td>This cheat-sheet as overlay</td></tr>
-            <tr><td><kbd>Esc</kbd></td><td>Close overlays / clear focus</td></tr>
+            <tr><td><kbd>?</kbd></td><td>Shortcut overlay</td></tr>
+            <tr><td><kbd>Esc</kbd></td><td>Close overlays</td></tr>
           </table>
         </div>
         <div class="card">
           <h3>Daily loop</h3>
           <ol>
-            <li><strong>Overview → Attention</strong>: clear any anomalies first (silent upload failures, stale metrics)</li>
-            <li><strong>Brands</strong> → Generate only, review the render under <code>output/&lt;brand&gt;/</code> (Open folder button)</li>
-            <li><strong>Pipeline</strong> → watch the filing theater (or See terminal)</li>
-            <li>When ready: Generate &amp; Post now</li>
-            <li>Hit <strong>⟳ Metrics</strong> after uploads land</li>
+            <li><strong>Command Deck → Attention</strong>: clear anomalies first</li>
+            <li><strong>Review Bay / Brands</strong> → Generate only, review under <code>output/&lt;brand&gt;/</code></li>
+            <li><strong>Pipeline</strong> → watch the filing theater</li>
+            <li>When ready: Approve &amp; Post or Generate &amp; Post now</li>
+            <li>Hit <strong>⟳ Metrics</strong>, then check <strong>Review</strong> weekly</li>
           </ol>
         </div>
         <div class="card">
           <h3>Systems LEDs</h3>
           <ul>
-            <li><span class="pill green">green</span> — service reachable / key present / path valid</li>
-            <li><span class="pill amber">amber</span> — degraded: stale metrics, low disk, optional key missing</li>
-            <li><span class="pill red">red</span> — down: Ollama unreachable, missing profile, no config</li>
-            <li>Click the strip to re-run the check. Full preflight: <code>python scripts/preflight_local.py</code></li>
-          </ul>
-        </div>
-        <div class="card">
-          <h3>Blank numbers?</h3>
-          <ul>
-            <li>Views/likes need <code>youtube_api_key</code> in <code>config.json</code> + Refresh metrics</li>
-            <li>Growth Terrain needs at least one metrics refresh (channel snapshots)</li>
-            <li>Topic insights activate at 5+ uploaded Shorts older than 48h with views</li>
-            <li>CTR / RPM / affiliate clicks are not auto-filled (Studio-only)</li>
+            <li><span class="pill green">green</span> — reachable / key present / path valid</li>
+            <li><span class="pill amber">amber</span> — degraded</li>
+            <li><span class="pill red">red</span> — down</li>
+            <li>Click the strip for fix details + Run preflight</li>
           </ul>
         </div>
         <div class="card">
           <h3>Full walkthrough</h3>
-          <p class="muted">Operator guide in the repo:</p>
+          <p class="muted">Operator guide:</p>
           <p><code>docs/Dashboard_Guide.md</code></p>
           <p class="muted small">Also listed from <code>COMMANDS.md</code> under Control panel.</p>
         </div>
@@ -277,8 +297,8 @@
 
   <!-- Command palette -->
   <div id="cmdk" class="cmdk-backdrop" hidden>
-    <div class="cmdk-panel" role="dialog" aria-label="Command palette">
-      <input type="text" id="cmdk-input" placeholder="Type a command… generate, post, metrics, spend…" autocomplete="off" spellcheck="false">
+    <div class="cmdk-panel" role="dialog" aria-modal="true" aria-label="Command palette">
+      <input type="text" id="cmdk-input" placeholder="Type a command… generate, post, metrics, review…" autocomplete="off" spellcheck="false">
       <ul id="cmdk-list" class="cmdk-list"></ul>
       <div class="cmdk-foot muted small"><kbd>↑↓</kbd> navigate · <kbd>Enter</kbd> run · <kbd>Esc</kbd> close</div>
     </div>
@@ -286,11 +306,11 @@
 
   <!-- Shortcut overlay -->
   <div id="keys-overlay" class="cmdk-backdrop" hidden>
-    <div class="cmdk-panel keys-panel" role="dialog" aria-label="Keyboard shortcuts">
+    <div class="cmdk-panel keys-panel" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
       <h3>KEYBOARD</h3>
       <table class="kbd-table">
         <tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd></td><td>Command palette</td></tr>
-        <tr><td><kbd>1</kbd>–<kbd>6</kbd></td><td>Tabs</td></tr>
+        <tr><td><kbd>1</kbd>–<kbd>7</kbd></td><td>Tabs</td></tr>
         <tr><td><kbd>R</kbd></td><td>Re-sync data</td></tr>
         <tr><td><kbd>M</kbd></td><td>Refresh YouTube metrics</td></tr>
         <tr><td><kbd>/</kbd></td><td>Search performance</td></tr>
@@ -299,11 +319,31 @@
     </div>
   </div>
 
-  <div id="toast" role="status"></div>
+  <!-- Health fix modal -->
+  <div id="health-overlay" class="cmdk-backdrop" hidden>
+    <div class="cmdk-panel keys-panel health-modal" role="dialog" aria-modal="true" aria-label="Systems health">
+      <h3>SYSTEMS</h3>
+      <div id="health-detail-rows" class="health-rows"></div>
+      <div class="actions">
+        <button type="button" id="run-preflight" class="primary">Run preflight</button>
+        <button type="button" id="health-recheck" class="ghost">Re-check</button>
+        <button type="button" class="ghost" data-close-overlay="health-overlay">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
 
   <script src="/static/js/charts.js"></script>
   <script src="/static/js/three-heroes.js"></script>
   <script src="/static/js/pipeline-theater.js"></script>
+  <script src="/static/js/webui-core.js"></script>
+  <script src="/static/js/webui-ops.js"></script>
+  <script src="/static/js/webui-brands.js"></script>
+  <script src="/static/js/webui-perf.js"></script>
+  <script src="/static/js/webui-spend.js"></script>
+  <script src="/static/js/webui-jobs.js"></script>
+  <script src="/static/js/webui-cmdk.js"></script>
   <script src="/static/js/webui-app.js"></script>
 </body>
 </html>

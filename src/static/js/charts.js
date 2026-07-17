@@ -1,6 +1,6 @@
 /* Chart.js helpers for EL JEFE mission control (MoneyPrinterV2). */
 (function (global) {
-  const PALETTE = ["#46d7ff", "#3ddc97", "#f5b950", "#ff5c5c", "#b98aff", "#39c5cf", "#f778ba", "#7ee787"];
+  const PALETTE = ["#c9a227", "#3ecf8e", "#e85d4c", "#9a8cff", "#46d7ff", "#e0c45a", "#7ee787", "#f778ba"];
   const TEXT = "#6e8499";
   const GRID = "rgba(70, 130, 180, 0.10)";
   const MONO = "'Cascadia Code', 'Cascadia Mono', Consolas, monospace";
@@ -160,7 +160,7 @@
     const status = overview.status_counts || {};
     const entries = [
       ["uploaded", "#3ddc97"],
-      ["generated", "#46d7ff"],
+      ["generated", "#c9a227"],
       ["other", "#6e8499"],
     ].filter(([k]) => (status[k] || 0) > 0);
     const el = document.getElementById("statusChart");
@@ -191,7 +191,7 @@
     });
   }
 
-  const TIER_COLORS = { standard: "#46d7ff", premium_image: "#f5b950", premium_video: "#b98aff", unknown: "#6e8499" };
+  const TIER_COLORS = { standard: "#c9a227", premium_image: "#e0c45a", premium_video: "#9a8cff", unknown: "#8a8478" };
 
   function drawSpendBreakdowns(overview) {
     const tiers = overview.spend_by_tier || {};
@@ -257,8 +257,8 @@
         datasets: [
           {
             data: [rej.topic_rejections || 0, rej.duration_retries || 0, rej.duration_aborts || 0],
-            backgroundColor: [hexToRgba("#46d7ff", 0.7), hexToRgba("#f5b950", 0.7), hexToRgba("#ff5c5c", 0.7)],
-            borderColor: ["#46d7ff", "#f5b950", "#ff5c5c"],
+            backgroundColor: [hexToRgba("#c9a227", 0.7), hexToRgba("#e0c45a", 0.7), hexToRgba("#e85d4c", 0.7)],
+            borderColor: ["#c9a227", "#e0c45a", "#e85d4c"],
             borderWidth: 1,
             borderRadius: 4,
           },

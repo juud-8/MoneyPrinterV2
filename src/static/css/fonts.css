@@ -1,0 +1,27 @@
+/* EL JEFE — local-first type (no CDN). Prefer IBM Plex when installed; else strong system faces. */
+
+@font-face {
+  font-family: "ElJefe Sans";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src:
+    local("IBM Plex Sans"),
+    local("IBMPlexSans"),
+    local("Segoe UI Variable Text"),
+    local("Segoe UI");
+}
+
+@font-face {
+  font-family: "ElJefe Mono";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src:
+    local("IBM Plex Mono"),
+    local("IBMPlexMono"),
+    local("Cascadia Code"),
+    local("Cascadia Mono"),
+    local("Consolas"),
+    local("JetBrains Mono");
+}

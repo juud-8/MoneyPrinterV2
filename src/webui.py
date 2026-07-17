@@ -25,10 +25,14 @@ SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 import webui_jobs
-from analytics import get_dashboard_data
+from analytics import (
+    get_dashboard_data,
+    get_weekly_summary,
+    set_video_retention,
+)
 from brand_switcher import list_brands, load_brand
 from performance_insights import get_insights_summary
 from youtube_metrics import get_latest_channel_snapshots
@@ -247,6 +251,176 @@ def api_overview():
     return jsonify(data)
 
 
+@app.get("/api/ops")
+def api_ops():
+    """Cheap poll payload for Command Deck (ops brief + alerts + KPIs)."""
+    days = _parse_days_arg(request.args.get("days"))
+    data = get_dashboard_data(days=days)
+    videos = data.get("videos") or []
+    brands_meta = []
+    for brand in list_brands():
+        manifest = load_brand(brand["brand_id"]) or {}
+        publishing = manifest.get("publishing", {}) or {}
+        brands_meta.append(
+            {
+                "brand_id": brand["brand_id"],
+                "channel_name": brand.get("channel_name", brand["brand_id"]),
+                "shorts_per_day": publishing.get("shorts_per_day"),
+                "publish_slots": publishing.get("publish_slots", {}),
+                "pilot_mode": bool(
+                    (manifest.get("production") or {}).get("pilot_mode", False)
+                ),
+                "is_active": brand.get("is_active", False),
+            }
+        )
+    insights = {
+        b["brand_id"]: get_insights_summary(b["brand_id"]) for b in data.get("brands", [])
+    }
+    return jsonify(
+        {
+            "generated_at": data.get("generated_at"),
+            "window_days": data.get("window_days"),
+            "totals": data.get("totals"),
+            "spend_alert": data.get("spend_alert"),
+            "rejection_summary": data.get("rejection_summary"),
+            "channel_snapshots": get_latest_channel_snapshots(),
+            "brands_summary": data.get("brands"),
+            "brands_meta": brands_meta,
+            "videos": videos[:40],
+            "insights": insights,
+            "status_counts": data.get("status_counts"),
+        }
+    )
+
+
+@app.post("/api/retention")
+def api_retention():
+    payload = request.get_json(silent=True) or {}
+    needle = str(payload.get("needle") or "").strip()
+    try:
+        pct = float(payload.get("avg_view_pct"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "avg_view_pct must be a number 0-100"}), 400
+    if not needle:
+        return jsonify({"error": "needle is required"}), 400
+    try:
+        count = set_video_retention(needle, pct)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not count:
+        return jsonify({"error": f"No videos matched '{needle}'", "updated": 0}), 404
+    return jsonify({"ok": True, "updated": count, "avg_view_pct": pct})
+
+
+@app.get("/api/weekly")
+def api_weekly():
+    data = get_dashboard_data(days=7)
+    totals = data.get("totals") or {}
+    uploaded = int(totals.get("uploaded") or 0)
+    spend = float(totals.get("spend_window_usd") or 0.0)
+    cost_per = round(spend / uploaded, 4) if uploaded > 0 else None
+    recent = (data.get("videos") or [])[:20]
+    return jsonify(
+        {
+            "generated_at": data.get("generated_at"),
+            "window_days": 7,
+            "totals": totals,
+            "spend_alert": data.get("spend_alert"),
+            "rejection_summary": data.get("rejection_summary"),
+            "cost_per_uploaded_short_usd": cost_per,
+            "recent_videos": recent,
+            "text": get_weekly_summary(),
+            "brands": data.get("brands") or [],
+        }
+    )
+
+
+def _scan_archive_songs() -> list[dict]:
+    """Find archive-song episodes paused at awaiting_song_audio."""
+    out_root = os.path.join(ROOT_DIR, "output")
+    results: list[dict] = []
+    if not os.path.isdir(out_root):
+        return results
+    for brand_id in sorted(os.listdir(out_root)):
+        brand_dir = _safe_brand_output_dir(brand_id)
+        if not brand_dir:
+            continue
+        episodes_dir = os.path.join(brand_dir, "episodes")
+        if not os.path.isdir(episodes_dir):
+            continue
+        try:
+            episode_names = os.listdir(episodes_dir)
+        except OSError:
+            continue
+        for episode_id in episode_names:
+            if not re.fullmatch(r"[A-Za-z0-9_\-]+", episode_id or ""):
+                continue
+            ep_dir = os.path.realpath(os.path.join(episodes_dir, episode_id))
+            if os.path.commonpath([brand_dir, ep_dir]) != brand_dir:
+                continue
+            state_path = os.path.join(ep_dir, "archive_song_state.json")
+            if not os.path.isfile(state_path):
+                continue
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            status = str((state or {}).get("status") or "")
+            if status != "awaiting_song_audio":
+                continue
+            results.append(
+                {
+                    "brand_id": brand_id,
+                    "episode_id": episode_id,
+                    "status": status,
+                    "path": ep_dir,
+                    "topic": (state or {}).get("topic") or "",
+                }
+            )
+    return results
+
+
+@app.get("/api/archive-songs")
+def api_archive_songs():
+    return jsonify(_scan_archive_songs())
+
+
+@app.post("/api/open-episode/<brand_id>/<episode_id>")
+def api_open_episode(brand_id: str, episode_id: str):
+    brand_dir = _safe_brand_output_dir(brand_id)
+    if not brand_dir:
+        return jsonify({"error": f"Invalid brand id: {brand_id}"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", episode_id or ""):
+        return jsonify({"error": f"Invalid episode id: {episode_id}"}), 400
+    folder = os.path.realpath(os.path.join(brand_dir, "episodes", episode_id))
+    if os.path.commonpath([brand_dir, folder]) != brand_dir:
+        return jsonify({"error": "Path escapes brand output"}), 400
+    if not os.path.isdir(folder):
+        return jsonify({"error": "Episode folder not found"}), 404
+    try:
+        if sys.platform == "win32":
+            os.startfile(folder)  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "path": folder})
+
+
+@app.post("/api/preflight")
+def api_preflight():
+    job = webui_jobs.run_python_script(
+        "preflight",
+        "Run preflight",
+        os.path.join("scripts", "preflight_local.py"),
+        [],
+    )
+    return jsonify(job)
+
+
 @app.get("/api/brands")
 def api_brands():
     brands = []
@@ -377,6 +551,51 @@ def api_job_log(job_id: str):
     result = webui_jobs.read_log(job_id, offset)
     result["status"] = job["status"]
     return jsonify(result)
+
+
+@app.get("/api/jobs/<job_id>/log/stream")
+def api_job_log_stream(job_id: str):
+    """Server-Sent Events tail of a job log (fallback: client can poll /log)."""
+    job = webui_jobs.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job"}), 404
+
+    def generate():
+        offset = 0
+        idle_ticks = 0
+        while True:
+            current = webui_jobs.get_job(job_id)
+            if not current:
+                yield "event: end\ndata: {\"error\":\"gone\"}\n\n"
+                break
+            chunk = webui_jobs.read_log(job_id, offset)
+            text = chunk.get("text") or ""
+            offset = int(chunk.get("offset") or offset)
+            status = current.get("status") or ""
+            if text:
+                idle_ticks = 0
+                payload = json.dumps({"text": text, "offset": offset, "status": status})
+                yield f"event: log\ndata: {payload}\n\n"
+            else:
+                idle_ticks += 1
+                yield f"event: ping\ndata: {json.dumps({'status': status, 'offset': offset})}\n\n"
+            if status != "running":
+                yield f"event: end\ndata: {json.dumps({'status': status, 'offset': offset})}\n\n"
+                break
+            if idle_ticks > 600:
+                yield "event: end\ndata: {\"status\":\"timeout\"}\n\n"
+                break
+            time.sleep(0.75)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/api/jobs/<job_id>/cancel")

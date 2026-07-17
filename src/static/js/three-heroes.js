@@ -80,7 +80,7 @@
     dispose();
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x04070d, 10, 20);
+    scene.fog = new THREE.Fog(0x07090c, 10, 20);
 
     const camera = new THREE.PerspectiveCamera(
       40,
@@ -104,7 +104,7 @@
     const key = new THREE.DirectionalLight(0x9ecbff, 0.9);
     key.position.set(3, 8, 5);
     scene.add(key);
-    const rim = new THREE.DirectionalLight(0xf5b950, 0.25);
+    const rim = new THREE.DirectionalLight(0xc9a227, 0.3);
     rim.position.set(-4, 3, -4);
     scene.add(rim);
 
@@ -189,7 +189,7 @@
       meshes.push(tipMesh);
     });
 
-    const grid = new THREE.GridHelper(14, 22, 0x1e4a66, 0x102436);
+    const grid = new THREE.GridHelper(14, 22, 0x3a414c, 0x1a1e24);
     grid.position.y = 0;
     group.add(grid);
 
@@ -267,8 +267,11 @@
   }
 
   function tick() {
+    if (!visible || !state || REDUCED) {
+      rafId = 0;
+      return;
+    }
     rafId = requestAnimationFrame(tick);
-    if (!visible || !state) return;
     state.t += 0.003;
     const driftY = Math.sin(state.t) * 0.06;
     const targetY = driftY + pointerTarget.x * 0.22;
@@ -297,12 +300,25 @@
   }
 
   function setVisible(v) {
-    visible = !!v;
+    visible = !!v && document.visibilityState === "visible";
+    if (visible && state && !REDUCED && !rafId) {
+      tick();
+    } else if (!visible && rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
   }
 
   window.addEventListener("resize", resize);
   document.addEventListener("visibilitychange", () => {
-    setVisible(document.visibilityState === "visible");
+    if (document.visibilityState !== "visible") {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+    } else if (visible && state && !REDUCED && !rafId) {
+      tick();
+    }
   });
 
   global.MPHeroes = { render, setVisible, webglOk };

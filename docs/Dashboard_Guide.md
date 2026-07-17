@@ -2,15 +2,15 @@
 
 Operator walkthrough for the local analytics + production UI.
 
-> The control panel's on-screen identity is **EL JEFE // Mission Control**.
-> Beyond the theme it adds: a header **systems-check LED strip** (`/api/health`:
-> Ollama, API keys, ImageMagick, Firefox profiles, metrics freshness, disk),
-> a **Today's Ops** brief (posts vs `shorts_per_day` target, next publish-window
-> countdown), an **Attention feed** (silent upload failures = uploaded rows with
-> no URL, stale metrics, duration aborts, failed jobs, spend threshold),
-> a **Ctrl+K command palette**, keyboard shortcuts (`1–6`, `R`, `M`, `/`, `?`),
-> per-brand **Open folder** buttons backed by `/api/open-output/<brand>`, and
-> **job history that survives restarts** (`.mp/logs/webui/jobs.json`).
+> The control panel's on-screen identity is **EL JEFE // Mission Control**
+> (brass/ink command deck). Beyond the theme it adds: a header **systems-check
+> LED strip** (`/api/health` — click for fix details + Run preflight), a
+> **Command Deck** (Today's Ops, Attention, Generate CTAs, Review Bay, Archive
+> Song handoffs), **Telemetry** (KPIs, collapsible Growth Terrain, charts),
+> a **Ctrl+K command palette**, keyboard shortcuts (`1–7`, `R`, `M`, `/`, `?`),
+> per-brand **Open folder** / **Approve & Post**, inline retention on Performance,
+> a **Weekly Review** tab, and **job history that survives restarts**
+> (`.mp/logs/webui/jobs.json`).
 
 ## What is the “dashboard”?
 
@@ -52,13 +52,21 @@ Stop with Ctrl+C in that terminal. This does **not** stop Windows Task Scheduler
 
 ### Overview
 
-- **KPI strip** — deduped posts, uploaded count, premium spend for the selected window, all-time spend.
-- **Window picker** (7d / 14d / 30d / All) — changes spend charts and rejection pulse. Post history on the Performance table stays full.
-- **Growth Terrain (3D)** — subscriber snapshots over time as ribbons. Click a ribbon tip to filter 2D charts to that brand.
-- **Spend Constellation (3D)** — premium asset events in the window; sphere size scales with cost.
-- **2D charts** — posts/day, channel growth lines, views leaderboard, upload vs generated mix.
-- **Recent posts** — last 15 deduped videos with status / views / likes when available.
-- **Spend alert banner** — appears when window spend exceeds `asset_spend_alert_threshold_usd` in `config.json`.
+Split into two bands:
+
+**Command Deck**
+- **Today's Ops** — posts vs `shorts_per_day`, next publish window + scheduler task hint
+- **Attention** — silent upload failures, stale metrics, failed jobs, spend threshold, archive-song pauses
+- **Window picker** (7d / 14d / 30d / All) + **⟳ Metrics** + Sync
+- Primary Generate CTAs, insights “Double down” buttons when active
+- **Review Bay** — newest `output/<brand>/` renders with Open folder / Approve & Post
+- **Archive Song bay** — episodes at `awaiting_song_audio` with Open episode folder
+
+**Telemetry**
+- **KPI strip** — subs, channel views, posts in window, posted today, premium spend, attention count
+- **Growth Terrain (3D)** — the single Three.js hero (subscriber ribbons). Collapse/expand is remembered. WebGL pauses when Overview is hidden or the tab is backgrounded.
+- **2D charts** — posts/day, channel growth, output mix, top videos
+- **Recent posts** + spend alert banner (`asset_spend_alert_threshold_usd`)
 
 ### Brands
 
@@ -66,25 +74,28 @@ Per brand:
 
 - Subs + channel views (latest snapshot)
 - Uploaded count, spend in window, posts, metrics filled
-- **Generate only** / **Generate & Post now**
+- **Generate only** / **Generate & Post now** / **Approve & Post** (from latest render)
 - **Focus charts** — filters Overview charts to that brand
 - Performance insights (top/bottom) once enough data exists
 - Recent posts list
-- **Publish times** — edit early/prime windows in `brands/<id>/manifest.json`
+- **Publish times** — edit early/prime windows in `brands/<id>/manifest.json` (shows `scheduler_start_hint`)
 
 ### Performance
 
 Full video metrics table: date, brand, title, status, views, likes, comments, retention %.
 
 Public views/likes/comments come from **Refresh YouTube metrics**.  
-Retention (`avg_view_pct`) is **manual** from YouTube Studio:
+Retention (`avg_view_pct`) can be set **inline** in the table (Save), or via CLI:
 
 ```powershell
 .\venv\Scripts\python.exe src\analytics.py retention "<title or video id>" 72.5
 ```
 
+Large tables are virtualized while scrolling. Copy video id / open YouTube from the row actions.
+
 ### Spend
 
+- Window budget gauge + cost-per-uploaded-short (proxy)
 - Doughnut: spend by tier
 - Pie: spend by provider
 - Bar: rejection pulse (topic near-duplicates + duration gate retries/aborts)
@@ -92,14 +103,15 @@ Retention (`avg_view_pct`) is **manual** from YouTube Studio:
 
 ### Pipeline
 
-- Session job list (generate / metrics refresh)
-- **Filing theater (default)** — stage rail + soft animation while a job runs; MoviePy progress when available
-- **See terminal** — toggle to the raw subprocess log (tqdm spam); preference remembered in the browser
-- Failed jobs auto-switch to terminal so the traceback is visible
+- Job list (generate / metrics / preflight) — history in `.mp/logs/webui/jobs.json` survives restarts (orphaned “running” jobs become `interrupted`)
+- **Filing theater (default)** — stage rail + soft animation while a job runs
+- **See terminal** — raw subprocess log; live tail via SSE (`/api/jobs/<id>/log/stream`) with poll fallback
 - Cancel a running job
 - When a job finishes, Overview auto-refreshes
 
-Jobs are **in-memory for this webui process only** — restarting webui clears the list (logs remain under `.mp/logs/webui/`).
+### Review
+
+7-day weekly ritual: summary cards (posts, spend, cost/upload, quality gates) + plain-text block with Copy.
 
 ### Help
 
@@ -110,11 +122,12 @@ In-app quick start mirroring this guide, plus the path to this file.
 ## Daily workflow
 
 1. Start the control panel.
-2. Open **Brands** → **Generate only** for the channel you want.
-3. Watch **Pipeline** until the job succeeds; review the file under `output/<brand_id>/`.
-4. When happy: **Generate & Post now** (pilot brands treat the button as confirmation).
-5. After the upload is live: **Refresh YouTube metrics**.
-6. Check Overview / Performance for views.
+2. Clear **Attention** items on the Command Deck (systems, silent failures, stale metrics).
+3. **Generate only** from the deck or Brands; watch **Pipeline**.
+4. Review under `output/<brand_id>/` (Review Bay / Open folder).
+5. When happy: **Approve & Post** or **Generate & Post now** (pilot brands treat the click as confirmation).
+6. After the upload is live: **Refresh YouTube metrics**.
+7. Check Overview / Performance; use **Review** weekly.
 
 CLI equivalents are documented in `COMMANDS.md` (`run_brand_short.py`, `upload_brand_short.py`).
 
