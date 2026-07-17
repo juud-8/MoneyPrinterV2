@@ -1,4 +1,6 @@
 import os
+import re
+from pathlib import Path
 
 import requests
 import soundfile as sf
@@ -6,13 +8,13 @@ from kittentts import KittenTTS as KittenModel
 
 from config import (
     ROOT_DIR,
+    get_audio_provider_settings,
     get_elevenlabs_api_key,
     get_elevenlabs_model,
     get_elevenlabs_voice_id,
     get_fishaudio_api_key,
     get_fishaudio_model,
     get_fishaudio_voice_id,
-    get_tts_provider,
     get_tts_voice,
 )
 from brand_switcher import get_production_setting
@@ -21,14 +23,20 @@ from status import warning
 KITTEN_MODEL = "KittenML/kitten-tts-mini-0.8"
 KITTEN_SAMPLE_RATE = 24000
 ELEVENLABS_SAMPLE_RATE = 44100
+VOICEBOX_PERFORMANCE_TAG = re.compile(
+    r"\[(?:laugh|chuckle|gasp|cough|sigh|groan|sniff|shush|clear throat)\]",
+    re.IGNORECASE,
+)
 
 
 class TTS:
-    def __init__(self) -> None:
-        self._provider = get_tts_provider()
+    def __init__(self, *, episode_audio: dict | None = None, cli_audio: dict | None = None) -> None:
+        self._audio_settings = get_audio_provider_settings(episode_audio, cli_audio)
+        self._provider = self._audio_settings.provider
         self._voice = get_tts_voice()
         self.last_provider_used = ""
         self.last_model_used = ""
+        self.last_generation_metadata = {}
         self._kitten = None
         if self._provider == "kittentts":
             self._kitten = KittenModel(KITTEN_MODEL)
@@ -109,6 +117,151 @@ class TTS:
         self.last_model_used = KITTEN_MODEL
         return output_file
 
+    def sanitize_text(self, text: str) -> str:
+        """Keep legacy cleanup exact while preserving verified Voicebox tags."""
+
+        if self._provider != "voicebox":
+            return re.sub(r"[^\w\s.?!]", "", text)
+        protected: list[str] = []
+
+        def reserve(match: re.Match) -> str:
+            protected.append(match.group(0))
+            return f"MPVVOICEBOXTAG{len(protected) - 1}TOKEN"
+
+        reserved = VOICEBOX_PERFORMANCE_TAG.sub(reserve, text)
+        cleaned = re.sub(r"[^\w\s.?!]", "", reserved)
+        for index, tag in enumerate(protected):
+            cleaned = cleaned.replace(f"MPVVOICEBOXTAG{index}TOKEN", tag)
+        return cleaned
+
+    def _provider_manifest_path(self, output_file: str, artifact_directory: str = "") -> Path:
+        if artifact_directory:
+            return Path(artifact_directory, "provider_manifest.json")
+        target = Path(output_file).resolve()
+        return target.parent / "narration" / "manifests" / f"{target.stem}.json"
+
+    def _persist_provider_manifest(
+        self,
+        output_file: str,
+        manifest: dict,
+        *,
+        artifact_directory: str = "",
+    ) -> str:
+        from media_providers.audio_assets import atomic_write_json
+
+        path = self._provider_manifest_path(output_file, artifact_directory)
+        atomic_write_json(path, manifest)
+        return str(path)
+
+    def _synthesize_voicebox(self, text: str, output_file: str) -> str:
+        from media_providers.contracts import GenerationRequest
+        from media_providers.voicebox_provider import build_voicebox_provider
+
+        provider = build_voicebox_provider(self._audio_settings.voicebox)
+        result = provider.generate(
+            GenerationRequest(
+                content=text,
+                output_path=output_file,
+                fallback_behavior=(
+                    f"explicit:{self._audio_settings.fallback_provider}"
+                    if self._audio_settings.allow_fallback
+                    else "disabled"
+                ),
+            )
+        )
+        self.last_provider_used = "voicebox"
+        self.last_model_used = str(result.metadata.get("model_name") or "")
+        manifest = {
+            "schema_version": 1,
+            "status": "completed",
+            "requested_provider": "voicebox",
+            "failed_provider": None,
+            "error_class": None,
+            "selected_provider": "voicebox",
+            "selected_fallback": None,
+            "attempt_count": int(result.metadata.get("attempt_count") or 1),
+            "output_path": str(result.output_path),
+            "output_sha256": result.provenance.derived_artifact_hash,
+            "source_sha256": result.provenance.source_artifact_hash,
+            "request_hash": result.provenance.request_hash,
+            "provenance_path": str(
+                Path(str(result.metadata.get("artifact_directory") or ""), "provenance.json")
+            ),
+        }
+        manifest_path = self._persist_provider_manifest(
+            output_file,
+            manifest,
+            artifact_directory=str(result.metadata.get("artifact_directory") or ""),
+        )
+        manifest["manifest_path"] = manifest_path
+        manifest["artifact_directory"] = str(
+            result.metadata.get("artifact_directory") or ""
+        )
+        self.last_generation_metadata = manifest
+        return str(result.output_path)
+
+    def _synthesize_explicit_fallback(
+        self,
+        provider: str,
+        text: str,
+        output_file: str,
+    ) -> str:
+        if provider == "elevenlabs":
+            return self._synthesize_elevenlabs(text, output_file)
+        if provider == "fishaudio":
+            return self._synthesize_fishaudio(text, output_file)
+        if provider == "kittentts":
+            return self._synthesize_kitten(text, output_file)
+        raise RuntimeError(f"Unsupported explicit Voicebox fallback provider {provider!r}.")
+
+    def _voicebox_fallback(
+        self,
+        error: Exception,
+        text: str,
+        output_file: str,
+    ) -> str:
+        fallback = self._audio_settings.fallback_provider
+        attempt_count = int(getattr(error, "attempt_count", 0) or 1)
+        manifest = {
+            "schema_version": 1,
+            "status": "fallback_pending",
+            "requested_provider": "voicebox",
+            "failed_provider": "voicebox",
+            "error_class": type(error).__name__,
+            "selected_provider": fallback,
+            "selected_fallback": fallback,
+            "attempt_count": attempt_count,
+        }
+        try:
+            warning(
+                f"Voicebox failed ({type(error).__name__}); using explicit fallback "
+                f"{fallback}."
+            )
+            result = self._synthesize_explicit_fallback(fallback, text, output_file)
+            from media_providers.provenance import sha256_file
+
+            manifest.update(
+                {
+                    "status": "fallback_completed",
+                    "output_path": str(result),
+                    "output_sha256": sha256_file(result),
+                }
+            )
+            manifest_path = self._persist_provider_manifest(output_file, manifest)
+            manifest["manifest_path"] = manifest_path
+            self.last_generation_metadata = manifest
+            return result
+        except Exception as fallback_error:
+            manifest.update(
+                {
+                    "status": "fallback_failed",
+                    "fallback_error_class": type(fallback_error).__name__,
+                }
+            )
+            self._persist_provider_manifest(output_file, manifest)
+            self.last_generation_metadata = manifest
+            raise
+
     def _allow_kitten_fallback(self) -> bool:
         if os.environ.get("MPV2_ALLOW_KITTEN_TTS_FALLBACK", "").strip() == "1":
             return True
@@ -126,6 +279,26 @@ class TTS:
         return self._synthesize_kitten(text, output_file)
 
     def synthesize(self, text, output_file=os.path.join(ROOT_DIR, ".mp", "audio.wav")):
+        if self._provider == "voicebox":
+            from media_providers.errors import ProviderError
+
+            try:
+                return self._synthesize_voicebox(text, output_file)
+            except ProviderError as error:
+                if not self._audio_settings.allow_fallback:
+                    self.last_generation_metadata = {
+                        "schema_version": 1,
+                        "status": "failed",
+                        "requested_provider": "voicebox",
+                        "failed_provider": "voicebox",
+                        "error_class": type(error).__name__,
+                        "selected_provider": None,
+                        "selected_fallback": None,
+                        "attempt_count": int(getattr(error, "attempt_count", 0) or 1),
+                    }
+                    self._persist_provider_manifest(output_file, self.last_generation_metadata)
+                    raise
+                return self._voicebox_fallback(error, text, output_file)
         if self._provider == "fishaudio":
             try:
                 return self._synthesize_fishaudio(text, output_file)

@@ -27,6 +27,21 @@ from .errors import (
     ProviderGenerationError,
     ProviderUnavailableError,
     UnknownProviderError,
+    VoiceboxAuthenticationError,
+    VoiceboxError,
+    VoiceboxGenerationError,
+    VoiceboxHealthCheckError,
+    VoiceboxInvalidAudioError,
+    VoiceboxInvalidEngineError,
+    VoiceboxInvalidProfileError,
+    VoiceboxMalformedResponseError,
+    VoiceboxMissingResultError,
+    VoiceboxNormalizationError,
+    VoiceboxRequestTimeoutError,
+    VoiceboxServiceUnavailableError,
+    VoiceboxUnsupportedCapabilityError,
+    VoiceboxUnsupportedTagError,
+    VoiceboxVersionIncompatibilityError,
 )
 from .provenance import (
     canonical_json,
@@ -37,6 +52,20 @@ from .provenance import (
     sha256_text,
 )
 from .registry import ProviderRegistry
+from .voicebox_capabilities import (
+    VOICEBOX_CAPABILITY_MAP_VERSION,
+    VOICEBOX_ENGINES,
+    VoiceboxEngineCapabilities,
+    capabilities_for_engine,
+    prepare_performance_tags,
+)
+from .voicebox_client import VoiceboxClient
+from .voicebox_provider import VoiceboxAudioProvider, build_voicebox_provider
+from .voicebox_settings import (
+    AudioProviderSettings,
+    VoiceboxSettings,
+    resolve_audio_provider_settings,
+)
 
 __all__ = [
     "AssetProvenance",
@@ -61,6 +90,30 @@ __all__ = [
     "VideoProvider",
     "VideoResult",
     "VoiceDescriptor",
+    "AudioProviderSettings",
+    "VoiceboxAudioProvider",
+    "VoiceboxAuthenticationError",
+    "VoiceboxClient",
+    "VoiceboxEngineCapabilities",
+    "VoiceboxError",
+    "VoiceboxGenerationError",
+    "VoiceboxHealthCheckError",
+    "VoiceboxInvalidAudioError",
+    "VoiceboxInvalidEngineError",
+    "VoiceboxInvalidProfileError",
+    "VoiceboxMalformedResponseError",
+    "VoiceboxMissingResultError",
+    "VoiceboxNormalizationError",
+    "VoiceboxRequestTimeoutError",
+    "VoiceboxServiceUnavailableError",
+    "VoiceboxSettings",
+    "VoiceboxUnsupportedCapabilityError",
+    "VoiceboxUnsupportedTagError",
+    "VoiceboxVersionIncompatibilityError",
+    "VOICEBOX_CAPABILITY_MAP_VERSION",
+    "VOICEBOX_ENGINES",
+    "build_voicebox_provider",
+    "capabilities_for_engine",
     "canonical_json",
     "create_asset_provenance",
     "elevenlabs_registry_entry",
@@ -68,4 +121,6 @@ __all__ = [
     "sha256_bytes",
     "sha256_file",
     "sha256_text",
+    "prepare_performance_tags",
+    "resolve_audio_provider_settings",
 ]

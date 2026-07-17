@@ -57,6 +57,27 @@ All your configurations will be in a file in the root directory, called `config.
 - `fishaudio_api_key`: `string` - Fish Audio API key, used when `tts_provider` is `fishaudio` (~$15 per 1M characters — roughly 90% cheaper than ElevenLabs). If empty, MPV2 falls back to the `FISH_AUDIO_API_KEY` environment variable.
 - `fishaudio_voice_id`: `string` - Fish Audio voice model reference id (create/clone a voice at [fish.audio](https://fish.audio)). Brands can override via `production.fishaudio_voice_id`.
 - `fishaudio_model`: `string` - Fish Audio TTS model (default: `s2-pro`). On failure, MPV2 falls back to ElevenLabs (if configured) and then KittenTTS.
+- `audio`: `object` - Optional narration selector. If absent, or if `provider` is `null`, the existing `tts_provider` remains authoritative. Precedence is defaults ← global `audio` ← brand `production.audio` ← episode overrides ← CLI overrides. Unknown keys fail validation. See [VOICEBOX_INTEGRATION.md](VOICEBOX_INTEGRATION.md).
+    * `provider`: `string|null` - `voicebox`, `elevenlabs`, `fishaudio`, or `kittentts`. Default `null` preserves legacy selection.
+    * `allow_fallback`: `boolean` - Voicebox fallback gate. Default `false`; fallback is never implicit.
+    * `fallback_provider`: `string|null` - Exact fallback (`elevenlabs`, `fishaudio`, or `kittentts`) when the gate is true.
+    * `voicebox`: `object` - Voicebox 0.5.x local REST settings:
+        * `base_url`: loopback HTTP URL with explicit port (default `http://127.0.0.1:17493`)
+        * `profile`: exact Voicebox profile id or case-insensitive exact name; required when selected
+        * `engine`: `qwen`, `qwen_custom_voice`, `luxtts`, `chatterbox`, `chatterbox_turbo`, `tada`, `kokoro`, or `null` for the profile default
+        * `language`: explicit language code or `null` for the profile language
+        * `model_size`: `1.7B`/`0.6B` for Qwen, `1B`/`3B` for TADA, otherwise `null`
+        * `instruct`: delivery instruction for `qwen_custom_voice`, otherwise `null`
+        * `request_timeout_seconds`: total generation/poll timeout, 1–3600 (default `600`)
+        * `health_timeout_seconds`: fast endpoint timeout, 0.1–60 (default `5`)
+        * `poll_interval_seconds`: history polling interval, 0.1–30 (default `1`)
+        * `max_retries`: explicit retry count, 0–5 (default `1`; zero disables retries)
+        * `effects_preset`: must be `null`; Voicebox 0.5 generation accepts chains, not preset names
+        * `effects_chain`: explicit Voicebox effect objects or an empty array
+        * `unsupported_tag_policy`: `error` (default) or explicit `strip`; only `chatterbox_turbo` interprets documented performance tags
+        * `max_chunk_chars`: Voicebox long-text chunk size, 100–5000 (default `800`)
+        * `crossfade_ms`: chunk crossfade, 0–500 (default `50`; zero is valid)
+        * `normalize`: Voicebox-side normalization toggle (default `true`); MoneyPrinter still derives its separate 44.1 kHz stereo production WAV
 - `archive_song`: `object` - Optional defaults for Archive Song mode (manual Suno handoff). Brands may override via `production.archive_song` in their manifest. See [ArchiveSong.md](ArchiveSong.md). Key fields:
     * `target_duration_seconds` / `min_duration_seconds` / `max_duration_seconds` - song length window
     * `duration_tolerance_seconds` - allowed mismatch between shot totals and production audio

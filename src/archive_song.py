@@ -23,6 +23,7 @@ from archive_song_settings import (
 )
 from config import ROOT_DIR
 from media_providers.provenance import sha256_file, sha256_text
+from media_providers.audio_assets import build_ffmpeg_normalize_command
 
 
 AUDIO_MODE_NARRATION = "narration"
@@ -656,28 +657,6 @@ def discover_song_audio(
     # Operators commonly add a corrected export under another accepted name.
     # Prefer the newest candidate so a stale invalid `song.wav` does not mask it.
     return os.path.abspath(max(candidates, key=os.path.getmtime))
-
-
-def build_ffmpeg_normalize_command(input_path: str, output_path: str) -> list[str]:
-    """Return an argv list for FFmpeg (no shell) so Windows spaces stay safe."""
-    from moviepy.config import FFMPEG_BINARY
-
-    return [
-        str(FFMPEG_BINARY),
-        "-y",
-        "-v",
-        "error",
-        "-i",
-        os.path.abspath(input_path),
-        "-vn",
-        "-ar",
-        "44100",
-        "-ac",
-        "2",
-        "-c:a",
-        "pcm_s16le",
-        os.path.abspath(output_path),
-    ]
 
 
 def _silence_lengths(samples: Any, sample_rate: int, threshold: float = 0.01) -> tuple[float, float]:

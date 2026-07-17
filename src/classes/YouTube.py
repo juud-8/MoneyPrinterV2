@@ -892,8 +892,10 @@ Return ONLY the prompt sentence.""",
         """
         path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".wav")
 
-        # Clean script, remove every character that is not a word character, a space, a period, a question mark, or an exclamation mark.
-        self.script = re.sub(r"[^\w\s.?!]", "", self.script)
+        # Preserve the historical cleanup for legacy providers. Voicebox keeps
+        # only its verified performance tags so the provider can validate them
+        # against the selected engine instead of speaking stripped tag words.
+        self.script = tts_instance.sanitize_text(self.script)
 
         self.tts_path = tts_instance.synthesize(self.script, path)
 
@@ -901,6 +903,19 @@ Return ONLY the prompt sentence.""",
             info(f' => Wrote TTS to "{self.tts_path}"')
 
         return self.tts_path
+
+    def _record_tts_metadata(self, tts_instance: TTS) -> None:
+        """Attach narration provider identity before captions and rendering."""
+
+        self.production_metadata["tts_provider"] = getattr(
+            tts_instance, "last_provider_used", ""
+        )
+        self.production_metadata["tts_model"] = getattr(
+            tts_instance, "last_model_used", ""
+        )
+        narration = getattr(tts_instance, "last_generation_metadata", None)
+        if isinstance(narration, dict) and narration:
+            self.production_metadata["narration_provider"] = dict(narration)
 
     def add_video(self, video: dict) -> None:
         """
@@ -1370,12 +1385,7 @@ Return ONLY the prompt sentence.""",
             )
             self.generate_metadata()
             self.generate_script_to_speech(tts_instance)
-            self.production_metadata["tts_provider"] = getattr(
-                tts_instance, "last_provider_used", ""
-            )
-            self.production_metadata["tts_model"] = getattr(
-                tts_instance, "last_model_used", ""
-            )
+            self._record_tts_metadata(tts_instance)
             audio_duration = AudioFileClip(self.tts_path).duration
 
         if audio_duration > max_audio:
@@ -2028,12 +2038,7 @@ Return ONLY the prompt sentence.""",
                 )
 
         self.generate_script_to_speech(tts_instance)
-        self.production_metadata["tts_provider"] = getattr(
-            tts_instance, "last_provider_used", ""
-        )
-        self.production_metadata["tts_model"] = getattr(
-            tts_instance, "last_model_used", ""
-        )
+        self._record_tts_metadata(tts_instance)
 
         style = get_content_style()
         if style["enforce_min_audio_duration"] and self.format_type != "longform":
@@ -2049,12 +2054,7 @@ Return ONLY the prompt sentence.""",
                 self.generate_script()
                 self.generate_metadata()
                 self.generate_script_to_speech(tts_instance)
-                self.production_metadata["tts_provider"] = getattr(
-                    tts_instance, "last_provider_used", ""
-                )
-                self.production_metadata["tts_model"] = getattr(
-                    tts_instance, "last_model_used", ""
-                )
+                self._record_tts_metadata(tts_instance)
 
         self._enforce_max_audio_duration(tts_instance, style)
 

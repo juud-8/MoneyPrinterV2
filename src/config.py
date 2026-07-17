@@ -385,9 +385,42 @@ def get_youtube_api_key() -> str:
         )
 
 
+def get_audio_provider_settings(
+    episode_audio: dict | None = None,
+    cli_audio: dict | None = None,
+):
+    """Resolve narration provider settings with explicit, lossless precedence.
+
+    Precedence is legacy/default <- global audio <- brand production.audio <-
+    episode <- CLI. Existing callers pass no episode/CLI layer and retain the
+    historical ``tts_provider`` default.
+    """
+
+    from media_providers.voicebox_settings import resolve_audio_provider_settings
+
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        config_json = json.load(file)
+    brand_audio = None
+    try:
+        from brand_switcher import load_active_brand
+
+        production = (load_active_brand() or {}).get("production", {})
+        if isinstance(production, dict):
+            brand_audio = production.get("audio")
+    except Exception:
+        # Standalone config tests and first-run setup may not have a brand yet.
+        brand_audio = None
+    return resolve_audio_provider_settings(
+        legacy_provider=config_json.get("tts_provider", "kittentts"),
+        global_audio=config_json.get("audio"),
+        brand_audio=brand_audio,
+        episode_audio=episode_audio,
+        cli_audio=cli_audio,
+    )
+
+
 def get_tts_provider() -> str:
-    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
-        return json.load(file).get("tts_provider", "kittentts").lower()
+    return get_audio_provider_settings().provider
 
 
 def get_elevenlabs_api_key() -> str:
