@@ -927,9 +927,6 @@ Return ONLY the prompt sentence.""",
         Returns:
             None
         """
-        videos = self.get_videos()
-        videos.append(video)
-
         cache = get_youtube_cache_path()
 
         with open(cache, "r") as file:

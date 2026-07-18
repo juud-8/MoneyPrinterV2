@@ -69,6 +69,14 @@ class Twitter:
         )
         self.wait: WebDriverWait = WebDriverWait(self.browser, 30)
 
+    def close_browser(self) -> None:
+        if self.browser is not None:
+            try:
+                self.browser.quit()
+            except Exception:
+                pass
+            self.browser = None
+
     def post(self, text: Optional[str] = None) -> None:
         """
         Starts the Twitter Bot.
@@ -178,9 +186,6 @@ class Twitter:
         Returns:
             None
         """
-        posts = self.get_posts()
-        posts.append(post)
-
         with open(get_twitter_cache_path(), "r") as file:
             previous_json = json.loads(file.read())
 

@@ -4,13 +4,14 @@ import sys
 from status import *
 from cache import get_accounts
 from config import get_verbose
+from utils import rem_temp_files
 from classes.Tts import TTS
 from classes.Twitter import Twitter
 from classes.YouTube import YouTube
 from llm_provider import select_model
 from post_bridge_integration import maybe_crosspost_youtube_short
 from review_gate import should_proceed_with_upload
-from archived_brands import assert_brand_runnable, is_brand_archived
+from archived_brands import is_brand_archived
 from brand_switcher import (
     bootstrap_brand,
     get_active_brand_id,
@@ -51,80 +52,95 @@ def main():
         error("No Ollama model specified. Pass model name as third argument.")
         sys.exit(1)
 
+    rem_temp_files()
     verbose = get_verbose()
 
-    if purpose == "twitter":
-        accounts = get_accounts("twitter")
+    try:
+        if purpose == "twitter":
+            accounts = get_accounts("twitter")
 
-        if not account_id:
-            error("Account UUID cannot be empty.")
+            if not account_id:
+                error("Account UUID cannot be empty.")
+                sys.exit(1)
 
-        for acc in accounts:
-            if acc["id"] == account_id:
-                if verbose:
-                    info("Initializing Twitter...")
-                twitter = Twitter(
-                    acc["id"],
-                    acc["nickname"],
-                    acc["firefox_profile"],
-                    acc["topic"]
-                )
-                twitter.post()
-                if verbose:
-                    success("Done posting.")
-                break
-    elif purpose == "youtube":
-        tts = TTS()
-
-        accounts = get_accounts("youtube")
-
-        if not account_id:
-            error("Account UUID cannot be empty.")
-
-        # Prefer account linked to active brand
-        brand = load_active_brand()
-        brand_account = resolve_youtube_account(brand, create=False)
-        if brand_account and brand_account.get("id") != account_id:
-            if verbose:
-                warning(
-                    f"Cron account {account_id} differs from active brand account "
-                    f"{brand_account.get('id')}; using cron account id."
-                )
-
-        for acc in accounts:
-            if acc["id"] == account_id:
-                if verbose:
-                    info(f"Initializing YouTube ({load_active_brand().get('channel_name')})...")
-                youtube = YouTube(
-                    acc["id"],
-                    acc["nickname"],
-                    acc["firefox_profile"],
-                    acc["niche"],
-                    acc["language"]
-                )
-                youtube.generate_video(tts, interactive=False)
-                if should_proceed_with_upload(
-                    youtube.video_path,
-                    youtube.metadata.get("title", ""),
-                    youtube.metadata.get("description", ""),
-                    interactive=False,
-                ):
-                    upload_success = youtube.upload_video()
-                    if upload_success:
+            for acc in accounts:
+                if acc["id"] == account_id:
+                    if verbose:
+                        info("Initializing Twitter...")
+                    twitter = Twitter(
+                        acc["id"],
+                        acc["nickname"],
+                        acc["firefox_profile"],
+                        acc["topic"]
+                    )
+                    try:
+                        twitter.post()
                         if verbose:
-                            success("Uploaded Short.")
-                        maybe_crosspost_youtube_short(
-                            video_path=youtube.video_path,
-                            title=youtube.metadata.get("title", ""),
+                            success("Done posting.")
+                    finally:
+                        twitter.close_browser()
+                    break
+        elif purpose == "youtube":
+            tts = TTS()
+
+            accounts = get_accounts("youtube")
+
+            if not account_id:
+                error("Account UUID cannot be empty.")
+                sys.exit(1)
+
+            # Prefer account linked to active brand
+            brand = load_active_brand()
+            brand_account = resolve_youtube_account(brand, create=False)
+            if brand_account and brand_account.get("id") != account_id:
+                if verbose:
+                    warning(
+                        f"Cron account {account_id} differs from active brand account "
+                        f"{brand_account.get('id')}; using cron account id."
+                    )
+
+            for acc in accounts:
+                if acc["id"] == account_id:
+                    if verbose:
+                        info(f"Initializing YouTube ({load_active_brand().get('channel_name')})...")
+                    youtube = YouTube(
+                        acc["id"],
+                        acc["nickname"],
+                        acc["firefox_profile"],
+                        acc["niche"],
+                        acc["language"]
+                    )
+                    try:
+                        youtube.generate_video(tts, interactive=False)
+                        if should_proceed_with_upload(
+                            youtube.video_path,
+                            youtube.metadata.get("title", ""),
+                            youtube.metadata.get("description", ""),
                             interactive=False,
-                        )
-                    else:
-                        warning("YouTube upload failed. Skipping Post Bridge cross-post.")
-                else:
-                    warning("Upload skipped by review gate.")
-                break
-    else:
-        error("Invalid Purpose, exiting...")
+                        ):
+                            upload_success = youtube.upload_video()
+                            if upload_success:
+                                if verbose:
+                                    success("Uploaded Short.")
+                                maybe_crosspost_youtube_short(
+                                    video_path=youtube.video_path,
+                                    title=youtube.metadata.get("title", ""),
+                                    interactive=False,
+                                )
+                            else:
+                                warning("YouTube upload failed. Skipping Post Bridge cross-post.")
+                        else:
+                            warning("Upload skipped by review gate.")
+                    finally:
+                        youtube.close_browser()
+                    break
+        else:
+            error("Invalid Purpose, exiting...")
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        error(f"FATAL: cron run crashed ({type(e).__name__}): {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
