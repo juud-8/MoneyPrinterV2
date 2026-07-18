@@ -139,6 +139,11 @@ class GetContentStyleTests(unittest.TestCase):
         prompt = style["topic_prompt"]("weird but true history", "")
         self.assertIn("MUST pair a specific number", prompt)
         self.assertIn("50-60 second", prompt)
+        self.assertIn("Title formula that works", prompt)
+        self.assertIn("weird agent must be the star", prompt)
+        self.assertNotIn("dead pope", prompt.lower())
+        self.assertIn("Dry military/rebel/war chronicles", prompt)
+        self.assertIn("Disaster-documentary framing", prompt)
         title_rules = style["title_rules"]
         self.assertIn("MUST contain at least one specific number", title_rules)
         self.assertIn("absurd conflict or outcome", title_rules)

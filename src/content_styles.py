@@ -97,13 +97,20 @@ def _weird_history_topic_prompt(niche: str, episode_hint: str) -> str:
 
 Niche: {niche}
 
-Prefer topics from: strange wars, bizarre trials, disasters, odd customs, accidental
-inventions, hoaxes, royal/political oddities, scientific mishaps, or forgotten conflicts.
-Good reference energy: "army vs birds," "war over a pig," "dead pope put on trial,"
-"the flood made of beer," "the war started by a bucket."
+Prefer topics from: strange wars, bizarre trials, odd customs, accidental inventions,
+hoaxes, royal/political oddities, scientific mishaps, or forgotten conflicts — but only
+when a weird agent (object, animal, food, bureaucratic absurdity) is the star of the story.
+Good reference energy: "army vs birds," "war over a pig," "the flood made of beer,"
+"the war started by a bucket," "a church bell exiled to Siberia."
+
+Title formula that works:
+How [tiny absurd cause] [verb] [outsized historical effect] in [YEAR]
+The weird agent must be the star — not a generic army, nation, or rebel mob.
 
 The topic MUST pair a specific number (a year, a count, a quantity) with an absurd
 conflict or outcome — the number and the absurdity should collide in one sentence.
+Prefer a punchline number in the hook itself (80 men returned with 81, 25 bison,
+a 60,000-peso pastry bill).
 Titles built from topics like these are the channel's best performers:
 - "How Liechtenstein Sent 80 Men to War in 1866 and Returned with 81"
 - "How Cherries Made Millard Fillmore President in 1850"
@@ -128,6 +135,10 @@ Requirements:
   strange, ironic, or overlooked over the violent
 
 Explicitly DO NOT generate:
+- Dry military/rebel/war chronicles with no weird agent (e.g. generic prison-storming
+  or "X declared war and won fast" without an absurd cause)
+- Disaster-documentary framing (floods, collapses, body counts) without a weird ironic agent
+- Legal/trial topics that bury the absurd agent, or near-clones of prior hits
 - Modern true crime or anything involving a living person / recent allegations
 - Unsolved disappearances or conspiracy theories
 - Fictional stories presented as real

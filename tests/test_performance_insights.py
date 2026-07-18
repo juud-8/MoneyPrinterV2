@@ -149,6 +149,61 @@ class PerformanceInsightsTests(unittest.TestCase):
         self.assertEqual(summary["sample_size"], 6)
         self.assertEqual(len(summary["top"]), 3)
         self.assertLessEqual(len(summary["bottom"]), 2)
+        self.assertIn("dna_rules", summary)
+        self.assertTrue(summary["dna_rules"])  # fixed rules always present at sample
+
+    def test_block_includes_dna_section_and_fixed_rules(self):
+        # Winners: How + year + number + compact. Flops: non-How, no year, long.
+        videos = [
+            _video("How 12 Goats Ended a Siege in 1487", views=9000),
+            _video("How 1 Spoon Started a Riot in 1902", views=5000),
+            _video("How 3 Letters Toppled a Cabinet in 1911", views=1000),
+            _video(
+                "An Extremely Long Multi Clause Title About Politics Without Punchline Energy",
+                views=40,
+            ),
+            _video(
+                "Another Rambling Non How Title Lacking Any Specific Dated Number Hook",
+                views=5,
+            ),
+            _video("How 9 Coins Bought a Treaty in 1648", views=800),
+        ]
+        self._seed(videos)
+
+        block = performance_insights.build_topic_insights_block("alpha", now=NOW)
+        self.assertIn("WINNING DNA", block)
+        self.assertIn('Prefer titles that open with "How"', block)
+        self.assertIn("punchline number", block)
+        self.assertIn("Do not rephrase the listed winners or flops", block)
+        self.assertNotIn("alpha", block)  # no brand-id leakage in prompt text
+        self.assertNotIn("the_strange_archive", block)
+
+        rules = performance_insights.derive_dna_rules(
+            performance_insights.get_brand_performance("alpha", now=NOW)
+        )
+        self.assertTrue(any("How" in r for r in rules))
+
+    def test_dna_empty_below_min_sample(self):
+        self._seed([_video(f"Video {i}", views=100 * i) for i in range(3)])
+        scored = performance_insights.get_brand_performance("alpha", now=NOW)
+        self.assertEqual(performance_insights.derive_dna_rules(scored), [])
+
+    def test_young_videos_excluded_from_dna(self):
+        videos = [
+            _video("How 1 Bell Was Exiled in 1591", views=100, days_old=7),
+            _video("How 2 Cats Closed a Port in 1703", views=200, days_old=7),
+            _video("How 3 Hats Caused a Duel in 1812", views=300, days_old=7),
+            _video("How 4 Pies Ended a Strike in 1920", views=400, days_old=7),
+            _video("Fresh How 999 Rockets Won in 2099", views=99999, days_old=0),
+        ]
+        self._seed(videos)
+        # Only 4 mature — below MIN_SAMPLE; no block / no DNA.
+        self.assertEqual(
+            performance_insights.build_topic_insights_block("alpha", now=NOW), ""
+        )
+        scored = performance_insights.get_brand_performance("alpha", now=NOW)
+        self.assertEqual(len(scored), 4)
+        self.assertEqual(performance_insights.derive_dna_rules(scored), [])
 
 
 if __name__ == "__main__":
