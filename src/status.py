@@ -1,4 +1,16 @@
+import sys
+
 from termcolor import colored
+
+# Windows consoles/redirected streams often resolve to a legacy codepage (e.g.
+# cp1252) that can't encode the emoji below, which would otherwise crash any
+# process the moment it logs a status line (including unattended cron runs).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 def error(message: str, show_emoji: bool = True) -> None:
     """

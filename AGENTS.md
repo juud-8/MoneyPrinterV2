@@ -1,4 +1,103 @@
-# Repository Guidelines
+
+
+# MoneyPrinterV2 Engineering Instructions
+
+## Project Mission
+
+MoneyPrinterV2 is a modular, multi-brand content production system.
+
+The goal is not merely to generate videos. The long-term goal is to become a
+closed-loop channel optimization platform that:
+
+1. Generates candidate content packages.
+2. Verifies factual claims.
+3. Produces reviewable media.
+4. Uploads only after approval.
+5. Collects performance analytics.
+6. Diagnoses results honestly.
+7. Improves future strategy without overfitting.
+
+## Non-Negotiable Architecture Rules
+
+- Preserve the brand-agnostic engine architecture.
+- Never hardcode `the_strange_archive` or another brand inside generic engine code.
+- Brand-specific behavior belongs in brand manifests, configurable profiles, or
+  strategy data.
+- Preserve backward compatibility unless the task explicitly approves a migration.
+- Prefer small cohesive modules over expanding `classes/YouTube.py` indefinitely.
+- Do not duplicate logic already available elsewhere in the repository.
+- Use typed structured objects or validated schemas for LLM-generated data.
+- Treat LLM output as untrusted input and validate it before use.
+
+## Upload and External-Action Safety
+
+- Never upload, publish, delete, edit, unlist, schedule, or modify a live video
+  unless the user explicitly requests that action.
+- Preserve `review_before_upload`.
+- Do not respond to comments or change channel settings.
+- Analytics integrations must be read-only.
+- Dry-run by default when external services are involved.
+- Do not make paid asset-generation calls during testing unless explicitly approved.
+
+## Data Safety
+
+- Never commit credentials, API keys, OAuth tokens, cookies, browser profiles,
+  `.env` contents, or local configuration secrets.
+- Never destructively overwrite `.mp/analytics.json`.
+- Back up persisted data before migrations.
+- Migrations must be versioned, repeatable, and tested.
+- Use YouTube video IDs as canonical identities instead of titles.
+- Missing analytics must remain explicitly missing; never silently fabricate proxies.
+- Label proxy metrics clearly.
+
+## Historical Content Quality
+
+- Central historical claims require adequate sourcing.
+- Never present folklore, legends, disputed claims, or uncertain dates as settled fact.
+- Do not generate modern true crime, living-person allegations, graphic violence,
+  deceptive conspiracy framing, or fictional events presented as real.
+- Preserve source and claim metadata wherever practical.
+- Generated visuals should be checked for obvious anachronisms.
+
+## Testing and Validation
+
+Before declaring work complete:
+
+- Discover and run the repository's existing tests.
+- Add focused tests for all new behavior.
+- Run `python -m compileall src`.
+- Exercise malformed LLM output.
+- Exercise missing configuration.
+- Exercise failed external-service calls.
+- Exercise duplicate and partial data.
+- Verify Windows compatibility.
+- Report commands run and their results.
+- Never hide failing tests.
+
+## Git and Scope
+
+- Work in an isolated Codex worktree for substantial changes.
+- Keep each task focused on one feature.
+- Do not perform unrelated cleanup.
+- Do not commit generated media, secrets, caches, virtual environments, or local data.
+- Present the implementation plan before making major architectural changes.
+- Use clear commits grouped by logical change.
+- Do not merge to `main` automatically.
+
+## Completion Report
+
+At completion provide:
+
+1. What changed.
+2. Why the architecture was selected.
+3. Files added and modified.
+4. Data or configuration migrations.
+5. Tests run and results.
+6. Known limitations.
+7. Security and cost considerations.
+8. Exact operator commands.
+9. Rollback instructions.
+10. Recommended next task.# Repository Guidelines
 
 ## Project Structure & Module Organization
 - `src/` contains the application code. Use `src/main.py` as the interactive entrypoint.

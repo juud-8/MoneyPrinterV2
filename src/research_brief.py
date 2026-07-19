@@ -113,22 +113,176 @@ def search_library_of_congress(
     return sources
 
 
-def collect_sources(topic: str, per_provider: int = 3) -> list[dict]:
-    """Collect and label source candidates, tolerating one provider outage."""
-    collected = []
-    for collector in (search_wikipedia, search_library_of_congress):
-        try:
-            collected.extend(collector(topic, limit=per_provider))
-        except (requests.RequestException, ValueError, TypeError):
-            continue
+_NARRATIVE_STOPWORDS = {
+    "how",
+    "why",
+    "when",
+    "what",
+    "the",
+    "a",
+    "an",
+    "of",
+    "in",
+    "on",
+    "to",
+    "for",
+    "and",
+    "or",
+    "with",
+    "from",
+    "that",
+    "this",
+    "into",
+    "over",
+    "after",
+    "before",
+    "during",
+    "between",
+    "forced",
+    "sparked",
+    "ended",
+    "began",
+    "made",
+    "took",
+    "sent",
+    "single",
+    "major",
+    "full",
+    "scale",
+    "fullscale",
+    "humiliating",
+    "organized",
+    "domestic",
+    "runaway",
+    "military",
+    "invasion",
+    "border",
+    "forcing",
+    "emperor",
+    "retreat",
+    "july",
+    "june",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "january",
+    "february",
+    "march",
+    "april",
+    "crate",
+}
 
+
+def _topic_is_title_case(topic: str) -> bool:
+    words = [w for w in re.findall(r"[A-Za-z]+", topic) if len(w) > 2]
+    if len(words) < 4:
+        return False
+    capped = sum(1 for w in words if w[0].isupper())
+    return capped / len(words) >= 0.7
+
+
+def search_queries_for_topic(topic: str) -> list[str]:
+    """Build progressively shorter search queries for public archives.
+
+    LLM topic sentences ("How a single runaway dog sparked...") and Title Case
+    hooks ("How 1 Crate of Exploding Vinyl...") are poor Wikipedia/LOC queries.
+    Prefer the full topic first, then compact year + content-keyword queries.
+    """
+    topic = (topic or "").strip()
+    if not topic:
+        return []
+
+    years = re.findall(r"\b(?:1[0-9]{3}|20[0-9]{2})\b", topic)
+    tokens = re.findall(r"[A-Za-z]{3,}", topic)
+    content_words = [
+        token
+        for token in tokens
+        if token.lower() not in _NARRATIVE_STOPWORDS and not token.isdigit()
+    ]
+
+    queries = [topic]
+
+    # Strip "How/Why ..." framing and leading numerals: keeps more searchable nouns.
+    stripped = re.sub(
+        r"^(?:how|why|when|what)\s+(?:\d+\s+)?",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    ).strip(" .")
+    stripped = re.sub(r"\bon\s+[A-Za-z]+\s+\d{1,2},\s*\d{4}\.?$", "", stripped, flags=re.IGNORECASE).strip()
+    if stripped and stripped.lower() != topic.lower():
+        queries.append(stripped)
+
+    # Multi-word institution/place phrases only when the topic is NOT title case
+    # (title case makes every word look like a proper noun).
+    if not _topic_is_title_case(topic):
+        proper = re.findall(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", topic)
+        entity_names = [
+            name
+            for name in proper
+            if name.lower() not in _NARRATIVE_STOPWORDS
+        ]
+        if years and len(entity_names) >= 2:
+            short = f"{entity_names[0]} {entity_names[1]} {years[0]}"
+            if short not in queries:
+                queries.append(short)
+        elif years and entity_names:
+            short = f"{entity_names[0]} {years[0]}"
+            if short not in queries:
+                queries.append(short)
+
+    # Year + distinctive content nouns (vinyl, baseball, forfeit, etc.).
+    # Prefer longer tokens; keep order of first appearance for readability.
+    ranked = sorted(
+        dict.fromkeys(content_words),
+        key=lambda w: (-len(w), content_words.index(w)),
+    )
+    keyword_core = ranked[:4]
+    if years and keyword_core:
+        keyword_query = " ".join(keyword_core[:3] + years[:1])
+        if keyword_query not in queries:
+            queries.append(keyword_query)
+    if years and len(keyword_core) >= 2:
+        short_keywords = f"{keyword_core[0]} {keyword_core[1]} {years[0]}"
+        if short_keywords not in queries:
+            queries.append(short_keywords)
+
+    # Deduplicate while preserving order.
+    seen = set()
+    unique = []
+    for query in queries:
+        key = query.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(query)
+    return unique
+
+
+def _filter_relevant_sources(
+    topic: str,
+    collected: list[dict],
+    *,
+    query: str | None = None,
+) -> list[dict]:
     topic_terms = {
         term
         for term in re.findall(r"[a-z0-9]+", topic.lower())
         if len(term) > 2
         and term not in {"the", "and", "with", "from", "that", "this", "into", "great"}
     }
-    distinctive_terms = {term for term in topic_terms if not term.isdigit() and len(term) >= 7}
+    if query:
+        topic_terms |= {
+            term
+            for term in re.findall(r"[a-z0-9]+", query.lower())
+            if len(term) > 2
+            and term not in {"the", "and", "with", "from", "that", "this", "into", "great"}
+        }
+    distinctive_terms = {
+        term for term in topic_terms if not term.isdigit() and len(term) >= 7
+    }
 
     deduped = []
     seen_urls = set()
@@ -150,6 +304,24 @@ def collect_sources(topic: str, per_provider: int = 3) -> list[dict]:
         enriched["id"] = f"S{len(deduped) + 1}"
         deduped.append(enriched)
     return deduped
+
+
+def collect_sources(topic: str, per_provider: int = 3) -> list[dict]:
+    """Collect and label source candidates, tolerating one provider outage."""
+    best: list[dict] = []
+    for query in search_queries_for_topic(topic):
+        collected = []
+        for collector in (search_wikipedia, search_library_of_congress):
+            try:
+                collected.extend(collector(query, limit=per_provider))
+            except (requests.RequestException, ValueError, TypeError):
+                continue
+        filtered = _filter_relevant_sources(topic, collected, query=query)
+        if len(filtered) > len(best):
+            best = filtered
+        if len(best) >= 2:
+            return best
+    return best
 
 
 def build_grounded_research_prompt(topic: str, niche: str, sources: list[dict]) -> str:

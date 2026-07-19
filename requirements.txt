@@ -17,3 +17,9 @@ srt_equalizer
 undetected_chromedriver
 platformdirs
 flask
+pytrends
+edge-tts
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2

@@ -31,23 +31,22 @@ def print_cli_dashboard(days: int = 7) -> None:
             continue
         views = brand["tracked_views"]
         views_label = str(views) if views is not None else "—"
-        spend_recent_key = f"spend_{days}d_usd"
         print(
             f"{brand['channel_name'][:28]:<28} "
             f"{brand['post_count']:>5} "
             f"{brand['uploaded_count']:>4} "
             f"{views_label:>8} "
-            f"${brand[spend_recent_key]:>10.2f} "
+            f"${brand.get('spend_window_usd', 0):>10.2f} "
             f"${brand['spend_all_time_usd']:>10.2f}"
         )
 
     print("-" * len(header))
     print(
         f"{'TOTAL':<28} {totals['videos']:>5} {totals['uploaded']:>4} "
-        f"{'—':>8} ${totals[f'spend_{days}d_usd']:>10.2f} "
+        f"{'—':>8} ${totals.get('spend_window_usd', 0):>10.2f} "
         f"${totals['spend_all_time_usd']:>10.2f}"
     )
-    print("\n* Views only appear after metrics are updated manually in analytics.json")
+    print("\n* Views fill in after YouTube metrics refresh (web UI button or youtube_metrics.py)")
 
     if data["recent_spend"]:
         print("\n=== Premium Spend (last {0} days) ===".format(days))
@@ -62,7 +61,7 @@ def print_cli_dashboard(days: int = 7) -> None:
             )
 
         threshold = get_asset_spend_alert_threshold_usd()
-        recent_total = totals[f"spend_{days}d_usd"]
+        recent_total = totals.get("spend_window_usd", 0)
         if recent_total > threshold:
             print(
                 f"\n⚠ Recent spend ${recent_total:.2f} exceeds alert threshold ${threshold:.2f}"
@@ -95,8 +94,6 @@ def _chart_rows(mapping: dict[str, float]) -> list[dict]:
 def render_html_dashboard(days: int = 7) -> str:
     data = get_dashboard_data(days=days)
     totals = data["totals"]
-    spend_recent_key = f"spend_{days}d_usd"
-
     posts_by_day: dict[str, int] = defaultdict(int)
     for video in data["videos"]:
         day = (video.get("date") or "")[:10]
@@ -132,7 +129,7 @@ def render_html_dashboard(days: int = 7) -> str:
                 <div><strong>{brand['post_count']}</strong><span>Posts</span></div>
                 <div><strong>{brand['uploaded_count']}</strong><span>Uploaded</span></div>
                 <div><strong>{brand['metrics_filled']}</strong><span>With metrics</span></div>
-                <div><strong>${brand[spend_recent_key]:.2f}</strong><span>Spend ({days}d)</span></div>
+                <div><strong>${brand.get('spend_window_usd', 0):.2f}</strong><span>Spend ({days}d)</span></div>
               </div>
               <ul class="recent">{''.join(recent_rows) or '<li class="muted">No posts yet</li>'}</ul>
             </article>
@@ -242,7 +239,7 @@ def render_html_dashboard(days: int = 7) -> str:
     <div class="totals">
       <div><strong>{totals['videos']}</strong><span class="muted">Total posts (deduped)</span></div>
       <div><strong>{totals['uploaded']}</strong><span class="muted">Uploaded</span></div>
-      <div><strong>${totals[spend_recent_key]:.2f}</strong><span class="muted">Premium spend ({days}d)</span></div>
+      <div><strong>${totals.get('spend_window_usd', 0):.2f}</strong><span class="muted">Premium spend ({days}d)</span></div>
       <div><strong>${totals['spend_all_time_usd']:.2f}</strong><span class="muted">Premium spend (all time)</span></div>
     </div>
   </header>

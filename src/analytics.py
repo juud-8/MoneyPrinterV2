@@ -30,6 +30,7 @@ def _load() -> dict:
         data.setdefault("asset_spend", [])
         data.setdefault("duration_rejections", [])
         data.setdefault("topic_rejections", [])
+        data.setdefault("channel_snapshots", [])
         return data
 
 
@@ -191,6 +192,30 @@ def log_video(
     _save(data)
 
 
+def _match_video_entries(needle: str) -> tuple[dict, list[dict]]:
+    """Return (data, matching video entries) for a needle search."""
+    needle = (needle or "").strip()
+    needle_norm = _normalize_title(needle)
+    data = _load()
+    if not needle_norm:
+        return data, []
+    matches = []
+    for entry in data.get("videos", []):
+        in_url = needle in (entry.get("url") or "")
+        in_title = needle_norm in _normalize_title(entry.get("title", ""))
+        if in_url or in_title:
+            matches.append(entry)
+    return data, matches
+
+
+def _set_metric_source(entry: dict, field: str, source: str) -> None:
+    sources = entry.get("metric_sources")
+    if not isinstance(sources, dict):
+        sources = {}
+    sources[field] = source
+    entry["metric_sources"] = sources
+
+
 def set_video_retention(needle: str, avg_view_pct: float) -> int:
     """Record Studio's "average percentage viewed" (0-100) on matching videos.
 
@@ -201,25 +226,86 @@ def set_video_retention(needle: str, avg_view_pct: float) -> int:
 
     CLI: python src/analytics.py retention "<video id or title fragment>" <pct>
     """
-    pct = float(avg_view_pct)
-    if not 0.0 <= pct <= 100.0:
-        raise ValueError(f"avg_view_pct must be 0-100, got {pct}")
-    needle = (needle or "").strip()
-    needle_norm = _normalize_title(needle)
-    if not needle_norm:
-        return 0
+    from studio_metrics import MetricSource, StudioMetricValue
 
-    data = _load()
-    updated = 0
-    for entry in data.get("videos", []):
-        in_url = needle in (entry.get("url") or "")
-        in_title = needle_norm in _normalize_title(entry.get("title", ""))
-        if in_url or in_title:
-            entry["avg_view_pct"] = pct
-            updated += 1
-    if updated:
+    metric = StudioMetricValue(
+        field="avg_view_pct",
+        value=avg_view_pct,
+        source=MetricSource.MANUAL_STUDIO,
+        unit="percent",
+    )
+    data, matches = _match_video_entries(needle)
+    for entry in matches:
+        entry["avg_view_pct"] = metric.value
+        _set_metric_source(entry, "avg_view_pct", metric.source.value)
+    if matches:
         _save(data)
-    return updated
+    return len(matches)
+
+
+def set_video_ctr(needle: str, ctr_percent: float) -> int:
+    """Record Studio CTR as 0-100 percent on matching videos.
+
+    Never invents a value from views alone — operator/API must supply CTR.
+    Labels source as ``manual_studio`` for strategy gating.
+
+    CLI: python src/analytics.py ctr "<video id or title fragment>" <pct>
+    """
+    from studio_metrics import MetricSource, StudioMetricValue
+
+    metric = StudioMetricValue(
+        field="ctr",
+        value=ctr_percent,
+        source=MetricSource.MANUAL_STUDIO,
+        unit="percent",
+    )
+    data, matches = _match_video_entries(needle)
+    for entry in matches:
+        entry["ctr"] = metric.value
+        _set_metric_source(entry, "ctr", metric.source.value)
+    if matches:
+        _save(data)
+    return len(matches)
+
+
+def set_studio_metrics(
+    needle: str,
+    metrics: list,
+    *,
+    allow_proxy: bool = False,
+) -> int:
+    """Apply one or more Studio-private metrics with explicit sources.
+
+    Rejects ``proxy_estimate`` unless ``allow_proxy=True`` (still labeled so
+    strategy helpers can ignore them).
+    """
+    from studio_metrics import (
+        MetricSource,
+        normalize_metrics,
+    )
+
+    normalized = normalize_metrics(metrics)
+    if not normalized:
+        return 0
+    for metric in normalized:
+        if metric.source == MetricSource.PROXY_ESTIMATE and not allow_proxy:
+            raise ValueError(
+                f"Refusing proxy_estimate for {metric.field!r}. "
+                "Pass allow_proxy=True only when deliberately labeling a proxy."
+            )
+        if metric.source == MetricSource.MISSING:
+            raise ValueError(f"Cannot persist missing source for {metric.field!r}")
+        if metric.value is None:
+            raise ValueError(f"Cannot persist null value for {metric.field!r}")
+
+    data, matches = _match_video_entries(needle)
+    for entry in matches:
+        for metric in normalized:
+            entry[metric.field] = metric.value
+            _set_metric_source(entry, metric.field, metric.source.value)
+    if matches:
+        _save(data)
+    return len(matches)
 
 
 def log_asset_spend(
@@ -324,26 +410,42 @@ def _assign_spend_brand(entry: dict, videos: list[dict], niche_map: dict[str, st
     return "unknown"
 
 
-def get_asset_spend_summary(days: int = 7) -> dict:
-    """Total and recent (last N days) premium asset spend."""
+def get_asset_spend_summary(days: int | None = 7) -> dict:
+    """Total and recent (last N days) premium asset spend.
+
+    Pass days=None or days<=0 for an all-time "recent" window.
+    """
     data = _load()
     entries = data.get("asset_spend", [])
     total = round(sum(e.get("cost_usd", 0.0) for e in entries), 2)
 
-    recent_entries = _spend_in_window(entries, days)
+    window = days if days is not None and days > 0 else None
+    recent_entries = _entries_in_window(entries, window)
     recent_total = round(sum(e.get("cost_usd", 0.0) for e in recent_entries), 2)
 
     return {
         "total_usd": total,
         "recent_usd": recent_total,
-        "recent_days": days,
+        "recent_days": window,
         "recent_count": len(recent_entries),
         "total_count": len(entries),
     }
 
 
-def get_brand_summary(days: int = 7) -> list[dict]:
-    """Per-brand counts and spend totals from deduped video rows."""
+def _entries_in_window(entries: list[dict], days: int | None) -> list[dict]:
+    """Filter dated entries to the last N days. days=None / <=0 means all-time."""
+    if days is None or days <= 0:
+        return list(entries)
+    return _spend_in_window(entries, days)
+
+
+def get_brand_summary(days: int | None = 7) -> list[dict]:
+    """Per-brand counts and spend totals from deduped video rows.
+
+    Pass days=None or days<=0 for all-time spend in the window field.
+    Always includes spend_window_usd; also spend_{N}d_usd when N is set.
+    """
+    window_days = days if days is not None and days > 0 else None
     videos = dedupe_videos()
     niche_map, channel_map = _brand_lookup()
     spend_entries = _load().get("asset_spend", [])
@@ -373,32 +475,125 @@ def get_brand_summary(days: int = 7) -> list[dict]:
         ]
         spend_all = round(sum(e.get("cost_usd", 0.0) for e in brand_spend), 2)
         spend_recent = round(
-            sum(e.get("cost_usd", 0.0) for e in _spend_in_window(brand_spend, days)), 2
+            sum(e.get("cost_usd", 0.0) for e in _entries_in_window(brand_spend, window_days)), 2
         )
 
-        summaries.append(
-            {
-                "brand_id": brand_id,
-                "channel_name": brand_names.get(brand_id, brand_id.replace("_", " ").title()),
-                "post_count": len(brand_videos),
-                "uploaded_count": len(uploaded),
-                "tracked_views": sum(views_values) if views_values else None,
-                "metrics_filled": len(views_values),
-                "spend_all_time_usd": spend_all,
-                f"spend_{days}d_usd": spend_recent,
-                "recent_posts": brand_videos[:5],
-            }
-        )
+        row = {
+            "brand_id": brand_id,
+            "channel_name": brand_names.get(brand_id, brand_id.replace("_", " ").title()),
+            "post_count": len(brand_videos),
+            "uploaded_count": len(uploaded),
+            "tracked_views": sum(views_values) if views_values else None,
+            "metrics_filled": len(views_values),
+            "spend_all_time_usd": spend_all,
+            "spend_window_usd": spend_recent,
+            "recent_posts": brand_videos[:5],
+        }
+        if window_days is not None:
+            row[f"spend_{window_days}d_usd"] = spend_recent
+        else:
+            row["spend_all_usd"] = spend_recent
+        summaries.append(row)
 
     summaries.sort(key=lambda item: (item["post_count"], item["channel_name"]), reverse=True)
     return summaries
 
 
-def get_dashboard_data(days: int = 7) -> dict:
-    """Structured payload for CLI and HTML dashboards."""
+def get_channel_growth() -> dict[str, list[dict]]:
+    """Per-brand time series from channel_snapshots for growth charts.
+
+    Returns {brand_id: [{date, subscribers, total_views, video_count}, ...]}
+    sorted ascending by date.
+    """
+    snapshots = _load().get("channel_snapshots", [])
+    by_brand: dict[str, list[dict]] = {}
+    for snap in snapshots:
+        brand_id = (snap.get("brand_id") or "").strip()
+        if not brand_id:
+            continue
+        by_brand.setdefault(brand_id, []).append(
+            {
+                "date": snap.get("date", ""),
+                "subscribers": snap.get("subscribers"),
+                "total_views": snap.get("total_views"),
+                "video_count": snap.get("video_count"),
+            }
+        )
+    for brand_id, series in by_brand.items():
+        series.sort(key=lambda item: item.get("date") or "")
+    return by_brand
+
+
+def get_video_metrics_table(videos: list[dict] | None = None) -> list[dict]:
+    """Flattened video rows for the Performance tab."""
+    rows = []
+    for video in videos if videos is not None else dedupe_videos():
+        rows.append(
+            {
+                "date": video.get("date", ""),
+                "title": video.get("title", ""),
+                "brand_id": video.get("brand_id", "unknown"),
+                "status": video.get("status") or "generated",
+                "format": video.get("format", ""),
+                "views": video.get("views"),
+                "likes": video.get("likes"),
+                "comments": video.get("comments"),
+                "avg_view_pct": video.get("avg_view_pct"),
+                "url": video.get("url") or "",
+                "metrics_updated_at": video.get("metrics_updated_at"),
+            }
+        )
+    return rows
+
+
+def get_rejection_summary(days: int | None = 7) -> dict:
+    """Topic + duration rejection counts in the analytics window."""
+    data = _load()
+    topic = _entries_in_window(data.get("topic_rejections", []), days)
+    duration = _entries_in_window(data.get("duration_rejections", []), days)
+    duration_abort = sum(1 for e in duration if e.get("action") == "abort")
+    duration_retry = sum(1 for e in duration if e.get("action") == "retry")
+    return {
+        "topic_rejections": len(topic),
+        "duration_rejections": len(duration),
+        "duration_retries": duration_retry,
+        "duration_aborts": duration_abort,
+    }
+
+
+def get_spend_alert(recent_spend_usd: float, days: int | None = 7) -> dict:
+    """Informational spend threshold alert for dashboards."""
+    threshold = get_asset_spend_alert_threshold_usd()
+    return {
+        "threshold_usd": threshold,
+        "recent_spend_usd": round(float(recent_spend_usd or 0.0), 2),
+        "window_days": days if days and days > 0 else None,
+        "triggered": float(recent_spend_usd or 0.0) > threshold,
+    }
+
+
+def get_status_counts(videos: list[dict] | None = None) -> dict[str, int]:
+    """Upload vs generated mix for status charts."""
+    counts = {"uploaded": 0, "generated": 0, "other": 0}
+    for video in videos if videos is not None else dedupe_videos():
+        status = video.get("status") or "generated"
+        if status in counts:
+            counts[status] += 1
+        else:
+            counts["other"] += 1
+    return counts
+
+
+def get_dashboard_data(days: int | None = 7) -> dict:
+    """Structured payload for CLI and HTML dashboards.
+
+    Pass days=None or days<=0 for an all-time window (no date cutoff).
+    """
+    window_days = days if days is not None and days > 0 else None
+
     videos = dedupe_videos()
     spend_entries = _load().get("asset_spend", [])
-    recent_spend = _spend_in_window(spend_entries, days)
+    recent_spend = _entries_in_window(spend_entries, window_days)
 
     spend_by_provider: dict[str, float] = {}
     spend_by_tier: dict[str, float] = {}
@@ -409,26 +604,41 @@ def get_dashboard_data(days: int = 7) -> dict:
         spend_by_provider[provider] = round(spend_by_provider.get(provider, 0.0) + cost, 2)
         spend_by_tier[tier] = round(spend_by_tier.get(tier, 0.0) + cost, 2)
 
-    brands = get_brand_summary(days=days)
+    brands = get_brand_summary(days=window_days)
     uploaded_total = sum(b["uploaded_count"] for b in brands)
-    spend_summary = get_asset_spend_summary(days=days)
+    spend_summary = get_asset_spend_summary(days=window_days)
+    window_spend = spend_summary["recent_usd"]
+    window_asset_count = spend_summary["recent_count"]
+
+    spend_key = f"spend_{window_days}d_usd" if window_days is not None else "spend_all_usd"
+    assets_key = (
+        f"premium_assets_{window_days}d" if window_days is not None else "premium_assets_all"
+    )
+
+    totals = {
+        "videos": len(videos),
+        "uploaded": uploaded_total,
+        "spend_all_time_usd": spend_summary["total_usd"],
+        spend_key: window_spend,
+        "spend_window_usd": window_spend,
+        "premium_assets_all_time": spend_summary["total_count"],
+        assets_key: window_asset_count,
+    }
 
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "window_days": days,
+        "window_days": window_days,
         "brands": brands,
         "videos": videos,
         "recent_spend": recent_spend,
         "spend_by_provider": spend_by_provider,
         "spend_by_tier": spend_by_tier,
-        "totals": {
-            "videos": len(videos),
-            "uploaded": uploaded_total,
-            "spend_all_time_usd": spend_summary["total_usd"],
-            f"spend_{days}d_usd": spend_summary["recent_usd"],
-            "premium_assets_all_time": spend_summary["total_count"],
-            f"premium_assets_{days}d": spend_summary["recent_count"],
-        },
+        "totals": totals,
+        "channel_growth": get_channel_growth(),
+        "video_metrics_table": get_video_metrics_table(videos),
+        "rejection_summary": get_rejection_summary(window_days),
+        "spend_alert": get_spend_alert(window_spend, window_days),
+        "status_counts": get_status_counts(videos),
     }
 
 
@@ -465,7 +675,7 @@ def get_weekly_summary() -> str:
         lines.append("")
         lines.append("=== Premium Asset Spend ===")
         lines.append(
-            f"Last {spend['recent_days']} days: ${spend['recent_usd']:.2f} "
+            f"Last {spend['recent_days'] or 'all'} days: ${spend['recent_usd']:.2f} "
             f"({spend['recent_count']} premium asset(s))"
         )
         lines.append(
@@ -495,6 +705,14 @@ if __name__ == "__main__":
             _sys.exit(2)
         _count = set_video_retention(_args[1], float(_args[2]))
         print(f"Set avg_view_pct={float(_args[2]):g} on {_count} matching entr{'y' if _count == 1 else 'ies'}.")
+        if not _count:
+            _sys.exit(1)
+    elif _args and _args[0] == "ctr":
+        if len(_args) != 3:
+            print('Usage: python src/analytics.py ctr "<video id or title fragment>" <pct>')
+            _sys.exit(2)
+        _count = set_video_ctr(_args[1], float(_args[2]))
+        print(f"Set ctr={float(_args[2]):g}% on {_count} matching entr{'y' if _count == 1 else 'ies'}.")
         if not _count:
             _sys.exit(1)
     else:

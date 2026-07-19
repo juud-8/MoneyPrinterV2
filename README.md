@@ -67,6 +67,12 @@ python src/main.py
 
 All relevant documents can be found [here](docs/).
 
+- [Archive Song episodes](docs/ArchiveSong.md) — optional manual Suno handoff,
+  factual packages, local audio validation, and resumable rendering.
+- [Voicebox local narration](docs/VOICEBOX_INTEGRATION.md) — optional,
+  loopback-only Voicebox 0.5 provider with explicit fallback and offline-tested
+  provenance. Voicebox remains a separate manual installation.
+
 ## Scripts
 
 For easier usage, there are some scripts in the `scripts` directory that can be used to directly access the core functionality of MPV2 without the need for user interaction.

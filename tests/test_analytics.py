@@ -183,6 +183,105 @@ class AnalyticsDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard["totals"]["uploaded"], 1)
         self.assertEqual(dashboard["totals"]["spend_7d_usd"], 1.25)
 
+    def test_dashboard_enrichments(self) -> None:
+        recent = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._write_analytics(
+            {
+                "videos": [
+                    {
+                        "date": recent,
+                        "title": "Alpha One",
+                        "format": "short",
+                        "niche": "alpha niche",
+                        "brand_id": "alpha",
+                        "status": "uploaded",
+                        "views": 120,
+                        "likes": 4,
+                        "comments": 1,
+                        "avg_view_pct": 72.5,
+                        "url": "https://youtube.com/watch?v=abc",
+                        "metrics_updated_at": recent,
+                    },
+                    {
+                        "date": recent,
+                        "title": "Beta One",
+                        "format": "short",
+                        "niche": "beta niche",
+                        "brand_id": "beta",
+                        "status": "generated",
+                    },
+                ],
+                "weekly_notes": [],
+                "asset_spend": [
+                    {
+                        "date": recent,
+                        "video_title": "Beta One",
+                        "brand_id": "beta",
+                        "role": "hook",
+                        "tier": "premium_image",
+                        "modality": "image",
+                        "provider": "gemini:test",
+                        "cost_usd": 30.0,
+                    }
+                ],
+                "channel_snapshots": [
+                    {
+                        "date": "2026-06-01 09:00:00",
+                        "brand_id": "alpha",
+                        "subscribers": 100,
+                        "total_views": 1000,
+                        "video_count": 5,
+                    },
+                    {
+                        "date": "2026-06-08 09:00:00",
+                        "brand_id": "alpha",
+                        "subscribers": 150,
+                        "total_views": 2000,
+                        "video_count": 8,
+                    },
+                ],
+                "topic_rejections": [
+                    {
+                        "date": recent,
+                        "candidate": "x",
+                        "matched": "y",
+                        "similarity": 0.9,
+                        "brand_id": "alpha",
+                    }
+                ],
+                "duration_rejections": [
+                    {
+                        "date": recent,
+                        "video_subject": "z",
+                        "brand_id": "alpha",
+                        "audio_seconds": 90,
+                        "cap_seconds": 60,
+                        "attempt": 1,
+                        "action": "retry",
+                    }
+                ],
+            }
+        )
+
+        with patch.object(analytics, "get_asset_spend_alert_threshold_usd", return_value=25.0):
+            dashboard = analytics.get_dashboard_data(days=7)
+
+        self.assertEqual(dashboard["status_counts"]["uploaded"], 1)
+        self.assertEqual(dashboard["status_counts"]["generated"], 1)
+        self.assertEqual(len(dashboard["channel_growth"]["alpha"]), 2)
+        self.assertEqual(dashboard["channel_growth"]["alpha"][1]["subscribers"], 150)
+        self.assertEqual(dashboard["rejection_summary"]["topic_rejections"], 1)
+        self.assertEqual(dashboard["rejection_summary"]["duration_retries"], 1)
+        self.assertTrue(dashboard["spend_alert"]["triggered"])
+        self.assertEqual(dashboard["spend_alert"]["threshold_usd"], 25.0)
+        self.assertEqual(len(dashboard["video_metrics_table"]), 2)
+        self.assertEqual(dashboard["video_metrics_table"][0]["likes"], 4)
+        self.assertIn("spend_window_usd", dashboard["totals"])
+
+        all_time = analytics.get_dashboard_data(days=0)
+        self.assertIsNone(all_time["window_days"])
+        self.assertIn("spend_all_usd", all_time["totals"])
+
     def test_log_video_records_experiment_research_and_production_metadata(self) -> None:
         analytics.log_video(
             title="Measured video",

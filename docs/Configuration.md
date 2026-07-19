@@ -53,10 +53,52 @@ All your configurations will be in a file in the root directory, called `config.
 - `fal_video_resolution`: `string` - Resolution requested from the fal.ai video model (default: `1080p`).
 - `fal_video_poll_timeout_seconds`: `number` - Max seconds to wait for a fal.ai video generation job before giving up and falling back to a premium still image.
 - `premium_video_max_duration_seconds`: `number` - Hard cap on a single premium video clip's requested duration (cost control; default: `6`).
+- `trend_provider`: `string` - Source for the dashboard's manual "Suggest from trends" button (default: `google_trends`, via the unofficial, free, keyless `pytrends` package — it scrapes an undocumented Google endpoint and can break; no other source is implemented yet). Manual-trigger only, never runs automatically.
+- `upload_backend`: `string` - `selenium` (default, drives YouTube Studio's upload UI) or `api` (YouTube Data API v3 resumable upload — no browser). Env `MPV2_UPLOAD_BACKEND` overrides. See `src/youtube_api_upload.py`.
+- `youtube_api_client_secrets_path`: `string` - Path to a **Desktop** OAuth client secrets JSON from Google Cloud Console, required when `upload_backend` is `api` (not a service account — those can't complete the interactive consent screen).
+- `youtube_api_token_path`: `string` - Where the cached OAuth refresh token is written after first-run consent (default: `.mp/youtube_api_token.json`). Once present, unattended/cron runs refresh silently — no browser popup.
+- `youtube_api_category_id`: `string` - YouTube category id sent with `videos.insert` when `upload_backend` is `api` (default: `22`, People & Blogs).
+- `caption_backend`: `string` - `moviepy` (default, in-process `TextClip` overlays) or `ass_karaoke` (FFmpeg ASS karaoke burn-in — see `src/caption_ass.py`; requires `ffmpeg` on `PATH`, falls back to `moviepy` if missing). Brands can override via `production.caption_backend`. Archive Song episodes always keep their existing lyric-caption path regardless of this setting.
 - `asset_spend_alert_threshold_usd`: `number` - Informational threshold: the weekly analytics review warns if recent (7-day) premium asset spend exceeds this (default: `25`). Does not block generation.
 - `fishaudio_api_key`: `string` - Fish Audio API key, used when `tts_provider` is `fishaudio` (~$15 per 1M characters — roughly 90% cheaper than ElevenLabs). If empty, MPV2 falls back to the `FISH_AUDIO_API_KEY` environment variable.
 - `fishaudio_voice_id`: `string` - Fish Audio voice model reference id (create/clone a voice at [fish.audio](https://fish.audio)). Brands can override via `production.fishaudio_voice_id`.
 - `fishaudio_model`: `string` - Fish Audio TTS model (default: `s2-pro`). On failure, MPV2 falls back to ElevenLabs (if configured) and then KittenTTS.
+- `audio`: `object` - Optional narration selector. If absent, or if `provider` is `null`, the existing `tts_provider` remains authoritative. Precedence is defaults ← global `audio` ← brand `production.audio` ← episode overrides ← CLI overrides. Unknown keys fail validation. See [VOICEBOX_INTEGRATION.md](VOICEBOX_INTEGRATION.md).
+    * `provider`: `string|null` - `voicebox`, `elevenlabs`, `fishaudio`, or `kittentts`. Default `null` preserves legacy selection.
+    * `allow_fallback`: `boolean` - Voicebox fallback gate. Default `false`; fallback is never implicit.
+    * `fallback_provider`: `string|null` - Exact fallback (`elevenlabs`, `fishaudio`, or `kittentts`) when the gate is true.
+    * `voicebox`: `object` - Voicebox 0.5.x local REST settings:
+        * `base_url`: loopback HTTP URL with explicit port (default `http://127.0.0.1:17493`)
+        * `profile`: exact Voicebox profile id or case-insensitive exact name; required when selected
+        * `engine`: `qwen`, `qwen_custom_voice`, `luxtts`, `chatterbox`, `chatterbox_turbo`, `tada`, `kokoro`, or `null` for the profile default
+        * `language`: explicit language code or `null` for the profile language
+        * `model_size`: `1.7B`/`0.6B` for Qwen, `1B`/`3B` for TADA, otherwise `null`
+        * `instruct`: delivery instruction for `qwen_custom_voice`, otherwise `null`
+        * `request_timeout_seconds`: total generation/poll timeout, 1–3600 (default `600`)
+        * `health_timeout_seconds`: fast endpoint timeout, 0.1–60 (default `5`)
+        * `poll_interval_seconds`: history polling interval, 0.1–30 (default `1`)
+        * `max_retries`: explicit retry count, 0–5 (default `1`; zero disables retries)
+        * `effects_preset`: must be `null`; Voicebox 0.5 generation accepts chains, not preset names
+        * `effects_chain`: explicit Voicebox effect objects or an empty array
+        * `unsupported_tag_policy`: `error` (default) or explicit `strip`; only `chatterbox_turbo` interprets documented performance tags
+        * `max_chunk_chars`: Voicebox long-text chunk size, 100–5000 (default `800`)
+        * `crossfade_ms`: chunk crossfade, 0–500 (default `50`; zero is valid)
+        * `normalize`: Voicebox-side normalization toggle (default `true`); MoneyPrinter still derives its separate 44.1 kHz stereo production WAV
+- `archive_song`: `object` - Optional defaults for Archive Song mode (manual Suno handoff). Brands may override via `production.archive_song` in their manifest. See [ArchiveSong.md](ArchiveSong.md). Key fields:
+    * `target_duration_seconds` / `min_duration_seconds` / `max_duration_seconds` - song length window
+    * `duration_tolerance_seconds` - allowed mismatch between shot totals and production audio
+    * `lyric_min_words` / `lyric_max_words` - target lyric length for package generation
+    * `default_musical_direction` / `default_vocal_direction` - brand defaults injected into the song package prompt
+    * `bpm_min` / `bpm_max` - preferred tempo guidance
+    * `caption_style` - `lyric_highlight` (default) or `phrase_only`
+    * `hook_repetition` - `none`, `prefer_repeated_hook`, or `require_repeated_hook`
+    * `visual_pacing` - `beat_map` (default) or `equal_lyric_fallback`
+    * `fullscreen_emphasis` - `on_screen_text`, `hook_phrases`, or `off`
+    * `audio_filenames` - accepted import names in the episode directory
+    * `min_shot_seconds` / `max_shot_seconds` - beat merge/split thresholds
+    * `embed_source_in_visual_prompts` - include source/confidence in image prompts only (not on-screen)
+    * `show_source_on_screen` - when true, may render source metadata in full-screen text moments
+    * `enforce_duration` - hard-fail outside the duration window (CLI `--skip-song-validation` forces false)
 
 ## Example
 

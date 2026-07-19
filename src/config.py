@@ -232,6 +232,85 @@ def get_tts_voice() -> str:
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return json.load(file).get("tts_voice", "Jasper")
 
+
+def get_edge_tts_voice() -> str:
+    """Microsoft Edge neural voice id for the ``edge_tts`` provider.
+
+    Best-effort free fallback — unofficial protocol; not a brand primary voice.
+    """
+    try:
+        from brand_switcher import get_production_setting
+
+        val = get_production_setting("edge_tts_voice", None)
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        return json.load(file).get("edge_tts_voice", "en-US-GuyNeural")
+
+
+def get_upload_backend() -> str:
+    """Return ``selenium`` (default) or ``api`` for YouTube uploads."""
+    from youtube_api_upload import resolve_upload_backend
+
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        cfg = json.load(file)
+    return resolve_upload_backend(cfg)
+
+
+def _resolve_config_path(value: str) -> str:
+    """Resolve a config-supplied relative path against ROOT_DIR."""
+    if not value or os.path.isabs(value):
+        return value
+    return os.path.join(ROOT_DIR, value)
+
+
+def get_youtube_api_client_secrets_path() -> str:
+    """Path to a Google OAuth desktop client secrets JSON for ``upload_backend: api``.
+
+    Empty by default — the API backend is opt-in and only usable once an
+    operator downloads a Desktop OAuth client from Google Cloud Console.
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        val = str(json.load(file).get("youtube_api_client_secrets_path", "") or "")
+    return _resolve_config_path(val)
+
+
+def get_youtube_api_token_path() -> str:
+    """Path where the cached OAuth refresh token is stored after first-run consent."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        val = str(
+            json.load(file).get("youtube_api_token_path", ".mp/youtube_api_token.json")
+        )
+    return _resolve_config_path(val)
+
+
+def get_youtube_api_category_id() -> str:
+    """YouTube category id used for ``videos.insert`` (default: 22, People & Blogs)."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        return str(json.load(file).get("youtube_api_category_id", "22"))
+
+
+def get_caption_backend() -> str:
+    """Return ``moviepy`` (default) or ``ass_karaoke`` for word-caption rendering.
+
+    ``ass_karaoke`` burns FFmpeg ASS karaoke captions onto the rendered video
+    (see ``caption_ass.py``) instead of compositing MoviePy TextClips in-process.
+    Falls back to ``moviepy`` at render time if FFmpeg is unavailable.
+    """
+    try:
+        from brand_switcher import get_production_setting
+
+        val = get_production_setting("caption_backend", None)
+        if val:
+            return str(val).strip().lower()
+    except Exception:
+        pass
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        return str(json.load(file).get("caption_backend", "moviepy")).strip().lower()
+
+
 def get_assemblyai_api_key() -> str:
     """
     Gets the AssemblyAI API key.
@@ -385,9 +464,42 @@ def get_youtube_api_key() -> str:
         )
 
 
+def get_audio_provider_settings(
+    episode_audio: dict | None = None,
+    cli_audio: dict | None = None,
+):
+    """Resolve narration provider settings with explicit, lossless precedence.
+
+    Precedence is legacy/default <- global audio <- brand production.audio <-
+    episode <- CLI. Existing callers pass no episode/CLI layer and retain the
+    historical ``tts_provider`` default.
+    """
+
+    from media_providers.voicebox_settings import resolve_audio_provider_settings
+
+    with open(os.path.join(ROOT_DIR, "config.json"), "r", encoding="utf-8") as file:
+        config_json = json.load(file)
+    brand_audio = None
+    try:
+        from brand_switcher import load_active_brand
+
+        production = (load_active_brand() or {}).get("production", {})
+        if isinstance(production, dict):
+            brand_audio = production.get("audio")
+    except Exception:
+        # Standalone config tests and first-run setup may not have a brand yet.
+        brand_audio = None
+    return resolve_audio_provider_settings(
+        legacy_provider=config_json.get("tts_provider", "kittentts"),
+        global_audio=config_json.get("audio"),
+        brand_audio=brand_audio,
+        episode_audio=episode_audio,
+        cli_audio=cli_audio,
+    )
+
+
 def get_tts_provider() -> str:
-    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
-        return json.load(file).get("tts_provider", "kittentts").lower()
+    return get_audio_provider_settings().provider
 
 
 def get_elevenlabs_api_key() -> str:
@@ -560,6 +672,19 @@ def get_post_bridge_config() -> dict:
     }
 
 
+def get_trend_provider() -> str:
+    """
+    Provider for the dashboard's manual "suggest from trends" button.
+
+    "google_trends" (default, via the unofficial `pytrends` package) is the
+    only option today; the string-dispatch shape leaves room for a future
+    provider (Reddit, YouTube trending, X/Twitter if API access is ever
+    obtained) without changing callers.
+    """
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        return json.load(file).get("trend_provider", "google_trends").lower()
+
+
 def get_fal_api_key() -> str:
     """
     Gets the fal.ai API key (used for premium video clip generation).
@@ -577,10 +702,17 @@ def get_standard_image_provider() -> str:
     """
     Provider for standard-tier still images: "gemini" (default) or "fal".
 
-    Brands can override via `production.standard_image_provider`. "fal" routes
-    standard shots to the cheaper fal.ai image model (`fal_image_model`) and
-    falls back to Gemini on failure; premium_image always stays on Gemini.
+    Brands can override via `production.standard_image_provider`. A one-off,
+    per-run override can be set via the MPV2_IMAGE_PROVIDER_OVERRIDE env var
+    (highest precedence — set by the web dashboard's per-run provider picker;
+    does not touch config.json or the brand manifest). "fal" routes standard
+    shots to the cheaper fal.ai image model (`fal_image_model`) and falls back
+    to Gemini on failure; premium_image always stays on Gemini.
     """
+    override = os.environ.get("MPV2_IMAGE_PROVIDER_OVERRIDE", "").strip().lower()
+    if override in ("gemini", "fal"):
+        return override
+
     try:
         from brand_switcher import get_production_setting
 
@@ -656,3 +788,22 @@ def get_asset_spend_alert_threshold_usd() -> float:
     surface a warning. Purely informational — does not block generation."""
     with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
         return float(json.load(file).get("asset_spend_alert_threshold_usd", 25))
+
+
+def get_archive_song_config() -> dict:
+    """Return local/manual Archive Song settings with conservative defaults."""
+    with open(os.path.join(ROOT_DIR, "config.json"), "r") as file:
+        value = json.load(file).get("archive_song", {})
+    return value if isinstance(value, dict) else {}
+
+
+def get_archive_song_target_duration_seconds() -> float:
+    return float(get_archive_song_config().get("target_duration_seconds", 60))
+
+
+def get_archive_song_min_duration_seconds() -> float:
+    return float(get_archive_song_config().get("min_duration_seconds", 55))
+
+
+def get_archive_song_max_duration_seconds() -> float:
+    return float(get_archive_song_config().get("max_duration_seconds", 65))

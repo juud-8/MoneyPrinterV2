@@ -24,7 +24,9 @@ def _parse_srt(srt_path: str) -> list[dict]:
         if "-->" not in timing:
             continue
         start_s, end_s = timing.split("-->")
-        text = " ".join(lines[2:]).strip()
+        # Preserve authored lyric/paragraph line breaks. Word-caption callers
+        # can still split on whitespace, while block/lyric layouts retain form.
+        text = "\n".join(lines[2:]).strip()
         if not text:
             continue
         entries.append(
@@ -121,3 +123,144 @@ def composite_captions_on_video(base_clip, srt_path: str):
     if not caption_clips:
         return base_clip
     return CompositeVideoClip([base_clip, *caption_clips])
+
+
+def build_lyric_caption_clips(
+    srt_path: str,
+    video_size: tuple[int, int] = (1080, 1920),
+    highlight_color: str = "#FFD93D",
+    base_color: str = "#FFFFFF",
+    caption_style: str = "lyric_highlight",
+) -> list:
+    """Render authoritative lyric phrases plus the currently sung word.
+
+    Timing comes from the post-import alignment file. The full phrase remains
+    readable while the active word receives a separate high-contrast highlight.
+    """
+    font_path = os.path.join(get_fonts_dir(), get_font())
+    entries = _parse_srt(srt_path)
+    clips = []
+    width, height = video_size
+    caption_width = width - 140
+    highlight_words = caption_style != "phrase_only"
+
+    for entry in entries:
+        words = entry["text"].split()
+        duration = max(0.05, entry["end"] - entry["start"])
+        if not words:
+            continue
+        try:
+            phrase = TextClip(
+                text=entry["text"],
+                font=font_path,
+                font_size=54,
+                color=base_color,
+                stroke_color="black",
+                stroke_width=4,
+                size=(caption_width, 260),
+                method="caption",
+                text_align="center",
+            )
+            clips.append(
+                phrase.with_start(entry["start"])
+                .with_duration(duration)
+                .with_position(("center", int(height * 0.50)))
+            )
+        except Exception:
+            pass
+
+        if not highlight_words:
+            continue
+        word_duration = duration / len(words)
+        for index, word in enumerate(words):
+            clean = re.sub(r"[^\w'\-]", "", word).strip() or word
+            try:
+                active = TextClip(
+                    text=clean.upper(),
+                    font=font_path,
+                    font_size=_font_size_for_word(clean),
+                    color=highlight_color,
+                    stroke_color="black",
+                    stroke_width=5,
+                    size=(caption_width, 150),
+                    method="caption",
+                    text_align="center",
+                )
+                clips.append(
+                    active.with_start(entry["start"] + index * word_duration)
+                    .with_duration(word_duration)
+                    .with_position(("center", int(height * 0.66)))
+                )
+            except Exception:
+                continue
+    return clips
+
+
+def composite_lyric_captions_on_video(
+    base_clip,
+    srt_path: str,
+    timed_beat_map_path: str = "",
+    caption_options: dict | None = None,
+):
+    """Composite lyric captions and optional full-screen beat-map moments."""
+    import json
+
+    options = caption_options or {}
+    caption_style = str(options.get("caption_style") or "lyric_highlight")
+    fullscreen_emphasis = str(options.get("fullscreen_emphasis") or "on_screen_text")
+    fullscreen_max_seconds = float(options.get("fullscreen_max_seconds") or 1.5)
+    show_source_on_screen = bool(options.get("show_source_on_screen"))
+
+    clips = build_lyric_caption_clips(
+        srt_path,
+        video_size=(base_clip.w, base_clip.h),
+        caption_style=caption_style,
+    )
+    if (
+        fullscreen_emphasis != "off"
+        and timed_beat_map_path
+        and os.path.isfile(timed_beat_map_path)
+    ):
+        try:
+            with open(timed_beat_map_path, "r", encoding="utf-8") as file:
+                beats = json.load(file)
+            font_path = os.path.join(get_fonts_dir(), get_font())
+            for beat in beats:
+                text = str(beat.get("on_screen_text") or "").strip()
+                if fullscreen_emphasis == "hook_phrases" and not text:
+                    text = str(beat.get("lyric_phrase") or "").strip()
+                if show_source_on_screen:
+                    source_bits = ", ".join(beat.get("source_ids") or [])
+                    confidence = str(beat.get("confidence") or "").strip()
+                    provenance = " · ".join(
+                        part for part in (source_bits, confidence) if part
+                    )
+                    if provenance:
+                        text = f"{text}\n{provenance}" if text else provenance
+                start = float(beat.get("start_seconds") or 0)
+                end = float(beat.get("end_seconds") or start)
+                if not text or end <= start:
+                    continue
+                moment = TextClip(
+                    text=text,
+                    font=font_path,
+                    font_size=88,
+                    color="#FFD93D",
+                    stroke_color="black",
+                    stroke_width=6,
+                    size=(base_clip.w - 120, 500),
+                    method="caption",
+                    text_align="center",
+                )
+                clips.append(
+                    moment.with_start(start)
+                    .with_duration(min(fullscreen_max_seconds, end - start))
+                    .with_position(("center", "center"))
+                )
+        except Exception:
+            # Captions remain usable even if optional full-screen guidance is
+            # malformed or unsupported by the local ImageMagick setup.
+            pass
+    if not clips:
+        return base_clip
+    return CompositeVideoClip([base_clip, *clips])

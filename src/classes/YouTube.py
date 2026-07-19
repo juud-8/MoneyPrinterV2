@@ -2,7 +2,9 @@ import re
 import json
 import time
 import os
+import shutil
 import assemblyai as aai
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils import *
 from cache import *
@@ -10,11 +12,50 @@ from .Tts import TTS
 from llm_provider import generate_text
 from config import *
 from status import *
+from pipeline_stage import emit_stage
 from content_funnel import build_description
 from asset_gen import AssetResult, generate_image as gen_image, generate_asset_with_fallback
 from asset_strategy import shot_role_for_index, tier_for_shot_role
 from video_effects import apply_ken_burns, apply_crossfade
-from video_captions import composite_captions_on_video
+from video_captions import (
+    _parse_srt,
+    composite_captions_on_video,
+    composite_lyric_captions_on_video,
+)
+from archive_song import (
+    AUDIO_MODE_ARCHIVE_SONG,
+    AUDIO_MODE_NARRATION,
+    ArchiveSongError,
+    ArchiveSongState,
+    AwaitingSongAudio,
+    SongPackage,
+    build_lyric_alignment,
+    build_song_package_prompt,
+    compute_file_identity,
+    copy_checkpoint_asset,
+    discover_song_audio,
+    ensure_episode_directory,
+    extract_json_object,
+    identities_match,
+    invalidate_audio_dependent_outputs,
+    load_state,
+    lyrics_content_hash,
+    normalize_audio_mode,
+    prepare_timed_beat_maps,
+    save_state,
+    snap_durations_to_frames,
+    validate_and_normalize_audio,
+    write_song_package_files,
+)
+from archive_song_settings import (
+    ArchiveSongSettings,
+    load_resolved_archive_song_settings,
+)
+from archive_song_visuals import (
+    ArchiveShotPlan,
+    build_archive_shot_plan,
+    equal_duration_fallback_plan,
+)
 from analytics import (
     log_video,
     log_asset_spend,
@@ -22,7 +63,13 @@ from analytics import (
     log_topic_rejection,
 )
 from brand_switcher import get_production_setting, load_active_brand
+from channel_branding import get_publishing_config
 from content_styles import get_content_style, resolve_style_name, DEFAULT_SCRIPT_RULES
+from youtube_upload_flow import (
+    radio_matches_visibility,
+    resolve_upload_visibility,
+    visibility_radios_present,
+)
 from topic_scoring import pick_best
 from content_strategy import (
     build_topic_strategy_block,
@@ -122,6 +169,19 @@ class YouTube:
         self.production_metadata = {}
         self.last_upload_error = None
         self.chapters = []
+        self.audio_mode = AUDIO_MODE_NARRATION
+        self.archive_song_resume = False
+        self.archive_song_episode_id = ""
+        self.archive_song_audio_path = ""
+        self.regenerate_song_package = False
+        self.skip_song_validation = False
+        self.archive_song_state = None
+        self.archive_song_episode_dir = ""
+        self.archive_subtitles_path = ""
+        self.archive_timed_beat_map_path = ""
+        self.shot_durations = []
+        self.archive_song_settings = None
+        self.archive_caption_options = {}
 
         # Initialize the Firefox profile
         self.options: Options = Options()
@@ -227,6 +287,7 @@ class YouTube:
                 f" => Grounded research: {len(brief['claims'])} claims across "
                 f"{len(brief['cited_source_ids'])} cited sources."
             )
+            emit_stage("research")
             return self.research_notes
 
         prompt = f"""
@@ -241,7 +302,67 @@ class YouTube:
         self.research_notes = notes
         if get_verbose():
             info(f" => Research notes:\n{notes[:300]}...")
+        emit_stage("research")
         return notes
+
+    @staticmethod
+    def _is_retryable_research_error(error: BaseException) -> bool:
+        """True when a fresh topic may succeed (thin sources / quality gate)."""
+        message = str(error)
+        return (
+            "Grounded research found only" in message
+            or "Research quality gate failed" in message
+        )
+
+    def _generate_topic_and_research(self, max_attempts: int = 3) -> None:
+        """Pick a topic and ground it; retry with a new topic if research fails.
+
+        Preset subjects (self.subject already set) are attempted once — we never
+        silently replace an operator-supplied topic.
+        """
+        preset = (getattr(self, "subject", None) or "").strip()
+        attempts = 1 if preset else max(1, int(max_attempts))
+        rejected: list[str] = list(getattr(self, "_research_rejected_topics", []) or [])
+        last_error: BaseException | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                if not preset:
+                    # Clear so generate_topic() rolls a new candidate.
+                    self.subject = ""
+                self._research_rejected_topics = rejected
+                self.generate_topic()
+                self.generate_research()
+                return
+            except RuntimeError as error:
+                last_error = error
+                if preset or not self._is_retryable_research_error(error):
+                    raise
+                failed_topic = (getattr(self, "subject", None) or "").strip()
+                if failed_topic and failed_topic not in rejected:
+                    rejected.append(failed_topic)
+                    active_brand = load_active_brand() or {}
+                    log_topic_rejection(
+                        candidate=failed_topic,
+                        matched="research_gate",
+                        similarity=0.0,
+                        brand_id=active_brand.get("brand_id", ""),
+                    )
+                warning(
+                    f"Topic research failed (attempt {attempt}/{attempts}): {error}"
+                )
+                if attempt < attempts:
+                    info(" => Picking a different topic and retrying research...")
+                    self.subject = ""
+                    self.research_notes = ""
+                    self.research_brief = {}
+                    self.research_brief_path = ""
+
+        assert last_error is not None
+        raise RuntimeError(
+            f"Exhausted {attempts} topic attempts without grounded research. "
+            f"Last error: {last_error}"
+        ) from last_error
 
     def generate_topic(self) -> str:
         """
@@ -255,6 +376,7 @@ class YouTube:
             self.subject = preset
             if get_verbose():
                 info(f" => Using preset topic: {self.subject}")
+            emit_stage("topic", topic=self.subject)
             return self.subject
 
         style = get_content_style()
@@ -276,6 +398,17 @@ class YouTube:
         if strategy_block:
             prompt += "\n\n" + strategy_block
 
+        rejected = [
+            t for t in (getattr(self, "_research_rejected_topics", None) or []) if t
+        ]
+        if rejected:
+            blocked = "\n".join(f"- {t}" for t in rejected[-5:])
+            prompt += (
+                "\n\nDo NOT reuse any of these rejected topics (research could not "
+                "verify them). Pick a completely different historical incident:\n"
+                f"{blocked}"
+            )
+
         # Steer topics toward what actually performed once the brand has
         # enough tracked view data (see performance_insights.py). Empty
         # string until then, so behavior is unchanged for new brands.
@@ -289,6 +422,32 @@ class YouTube:
                     info(" => Topic prompt includes channel performance insights.")
         except Exception as e:
             warning(f"Performance insights skipped: {e}")
+
+        # Opt-in trend seeds (production.use_trending_topics or
+        # MPV2_USE_TRENDING_TOPICS=1). Failures degrade to normal generation.
+        trend_candidates: list[str] = []
+        try:
+            from topic_discovery_loop import (
+                build_trend_seed_block,
+                fetch_trend_seeds_for_niche,
+                trending_topics_enabled,
+            )
+
+            production = active_brand.get("production") if isinstance(active_brand, dict) else None
+            if trending_topics_enabled(
+                production if isinstance(production, dict) else None
+            ):
+                trend_candidates = fetch_trend_seeds_for_niche(self.niche)
+                seed_block = build_trend_seed_block(trend_candidates)
+                if seed_block:
+                    prompt += "\n\n" + seed_block
+                    if get_verbose():
+                        info(
+                            f" => Topic prompt includes {len(trend_candidates)} trend seed(s)."
+                        )
+        except Exception as e:
+            warning(f"Trend topic seeds skipped: {e}")
+            trend_candidates = []
 
         candidate_count = max(1, int(style.get("topic_candidate_count", 1) or 1))
 
@@ -321,13 +480,19 @@ class YouTube:
                 "No novel topic candidate passed generation and duplicate checks."
             )
 
-        if len(candidates) > 1:
-            self.subject = pick_best(candidates)
+        if trend_candidates or len(candidates) > 1:
+            from topic_discovery_loop import select_topic_from_pools
+
+            self.subject = select_topic_from_pools(candidates, trend_candidates)
             if get_verbose():
-                info(f" => Picked best of {len(candidates)} topic candidates: {self.subject}")
+                info(
+                    f" => Picked topic from {len(candidates)} LLM + "
+                    f"{len(trend_candidates)} trend candidate(s): {self.subject}"
+                )
         else:
             self.subject = candidates[0]
 
+        emit_stage("topic", topic=self.subject)
         return self.subject
 
     def _short_speech_wps(self) -> float:
@@ -764,8 +929,10 @@ Return ONLY the prompt sentence.""",
         """
         path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".wav")
 
-        # Clean script, remove every character that is not a word character, a space, a period, a question mark, or an exclamation mark.
-        self.script = re.sub(r"[^\w\s.?!]", "", self.script)
+        # Preserve the historical cleanup for legacy providers. Voicebox keeps
+        # only its verified performance tags so the provider can validate them
+        # against the selected engine instead of speaking stripped tag words.
+        self.script = tts_instance.sanitize_text(self.script)
 
         self.tts_path = tts_instance.synthesize(self.script, path)
 
@@ -773,6 +940,19 @@ Return ONLY the prompt sentence.""",
             info(f' => Wrote TTS to "{self.tts_path}"')
 
         return self.tts_path
+
+    def _record_tts_metadata(self, tts_instance: TTS) -> None:
+        """Attach narration provider identity before captions and rendering."""
+
+        self.production_metadata["tts_provider"] = getattr(
+            tts_instance, "last_provider_used", ""
+        )
+        self.production_metadata["tts_model"] = getattr(
+            tts_instance, "last_model_used", ""
+        )
+        narration = getattr(tts_instance, "last_generation_metadata", None)
+        if isinstance(narration, dict) and narration:
+            self.production_metadata["narration_provider"] = dict(narration)
 
     def add_video(self, video: dict) -> None:
         """
@@ -784,9 +964,6 @@ Return ONLY the prompt sentence.""",
         Returns:
             None
         """
-        videos = self.get_videos()
-        videos.append(video)
-
         cache = get_youtube_cache_path()
 
         with open(cache, "r") as file:
@@ -953,11 +1130,26 @@ Return ONLY the prompt sentence.""",
         Returns:
             path (str): The path to the generated MP4 File.
         """
+        emit_stage("compose")
         combined_image_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".mp4")
         threads = get_threads()
         tts_clip = AudioFileClip(self.tts_path)
         max_duration = tts_clip.duration
-        req_dur = max_duration / len(self.images)
+        shot_durations = list(getattr(self, "shot_durations", None) or [])
+        use_explicit_shots = (
+            len(shot_durations) == len(self.images)
+            and len(self.images) > 0
+            and all(float(value) > 0 for value in shot_durations)
+        )
+        if use_explicit_shots:
+            shot_durations = snap_durations_to_frames(
+                [float(value) for value in shot_durations],
+                total_seconds=max_duration,
+                fps=30.0,
+            )
+            default_req_dur = max_duration / len(self.images)
+        else:
+            default_req_dur = max_duration / max(len(self.images), 1)
 
         # Make a generator that returns a TextClip when called with consecutive
         generator = lambda txt: TextClip(
@@ -977,19 +1169,59 @@ Return ONLY the prompt sentence.""",
         tot_dur = 0
         ken_burns = get_ken_burns_enabled()
         idx = 0
-        while tot_dur < max_duration:
-            for slot, image_path in enumerate(self.images):
+        image_cycle = list(enumerate(self.images))
+        if not use_explicit_shots:
+            # Narration and lyric-fallback keep the historical fill-to-audio loop.
+            while tot_dur < max_duration:
+                for slot, image_path in image_cycle:
+                    req_dur = default_req_dur
+                    modality = (
+                        self.asset_modalities[slot]
+                        if slot < len(self.asset_modalities)
+                        else "image"
+                    )
+                    if modality == "video_clip":
+                        clip = self._build_video_clip_shot(image_path, req_dur)
+                    else:
+                        clip = ImageClip(image_path, duration=req_dur).with_fps(30)
+                        if round((clip.w / clip.h), 4) < 0.5625:
+                            if get_verbose():
+                                info(f" => Resizing Image: {image_path} to 1080x1920")
+                            clip = clip.cropped(
+                                width=clip.w,
+                                height=round(clip.w / 0.5625),
+                                x_center=clip.w / 2,
+                                y_center=clip.h / 2,
+                            )
+                        else:
+                            if get_verbose():
+                                info(f" => Resizing Image: {image_path} to 1920x1080")
+                            clip = clip.cropped(
+                                width=round(0.5625 * clip.h),
+                                height=clip.h,
+                                x_center=clip.w / 2,
+                                y_center=clip.h / 2,
+                            )
+                        clip = clip.resized(new_size=(1080, 1920))
+                        if ken_burns:
+                            clip = apply_ken_burns(clip, req_dur, index=idx)
+                            idx += 1
+                    clips.append(clip)
+                    tot_dur += clip.duration
+                    if tot_dur >= max_duration:
+                        break
+        else:
+            for slot, image_path in image_cycle:
+                req_dur = float(shot_durations[slot])
                 modality = (
                     self.asset_modalities[slot]
                     if slot < len(self.asset_modalities)
                     else "image"
                 )
-
                 if modality == "video_clip":
                     clip = self._build_video_clip_shot(image_path, req_dur)
                 else:
                     clip = ImageClip(image_path, duration=req_dur).with_fps(30)
-
                     if round((clip.w / clip.h), 4) < 0.5625:
                         if get_verbose():
                             info(f" => Resizing Image: {image_path} to 1080x1920")
@@ -1009,11 +1241,9 @@ Return ONLY the prompt sentence.""",
                             y_center=clip.h / 2,
                         )
                     clip = clip.resized(new_size=(1080, 1920))
-
                     if ken_burns:
                         clip = apply_ken_burns(clip, req_dur, index=idx)
                         idx += 1
-
                 clips.append(clip)
                 tot_dur += clip.duration
 
@@ -1021,30 +1251,64 @@ Return ONLY the prompt sentence.""",
             clips = apply_crossfade(clips, fade_duration=get_crossfade_duration())
 
         final_clip = concatenate_videoclips(clips, method="compose").with_fps(30)
-        random_song = choose_random_song(
-            prefer_keywords=get_content_style()["music_keywords"]
-        )
-
         subtitles = None
-        subtitles_path = None
-        try:
-            subtitles_path = self.generate_subtitles(self.tts_path)
-            equalize_subtitles(subtitles_path, 8)
-        except Exception as e:
-            warning(f"Failed to generate subtitles: {e}")
+        subtitles_path = getattr(self, "archive_subtitles_path", "") or None
+        if not subtitles_path:
+            try:
+                subtitles_path = self.generate_subtitles(self.tts_path)
+                equalize_subtitles(subtitles_path, 8)
+            except Exception as e:
+                warning(f"Failed to generate subtitles: {e}")
 
-        random_song_clip = AudioFileClip(random_song).with_fps(44100)
+        # Stashed for later regardless of caption backend — the API upload
+        # path (see upload_video()) attaches this as a caption track.
+        self.subtitles_path = subtitles_path or ""
 
-        # Turn down volume
-        random_song_clip = random_song_clip.with_effects([afx.MultiplyVolume(0.1)])
-        comp_audio = CompositeAudioClip([tts_clip.with_fps(44100), random_song_clip])
+        use_ass_captions = (
+            get_caption_backend() == "ass_karaoke"
+            and bool(subtitles_path)
+            and get_word_captions_enabled()
+            and normalize_audio_mode(getattr(self, "audio_mode", None))
+            != AUDIO_MODE_ARCHIVE_SONG
+        )
+        if use_ass_captions:
+            from caption_ass import ffmpeg_available
+
+            if not ffmpeg_available():
+                warning(
+                    "caption_backend=ass_karaoke selected but ffmpeg is not on "
+                    "PATH; falling back to MoviePy word captions for this run."
+                )
+                use_ass_captions = False
+
+        if normalize_audio_mode(getattr(self, "audio_mode", None)) == AUDIO_MODE_ARCHIVE_SONG:
+            # The imported track is the complete musical mix. Adding the normal
+            # background library track would double the music and damage clarity.
+            comp_audio = tts_clip.with_fps(44100)
+        else:
+            random_song = choose_random_song(
+                prefer_keywords=get_content_style()["music_keywords"]
+            )
+            random_song_clip = AudioFileClip(random_song).with_fps(44100)
+            random_song_clip = random_song_clip.with_effects([afx.MultiplyVolume(0.1)])
+            comp_audio = CompositeAudioClip([tts_clip.with_fps(44100), random_song_clip])
 
         final_clip = final_clip.with_audio(comp_audio)
         final_clip = final_clip.with_duration(tts_clip.duration)
 
-        if subtitles_path and get_word_captions_enabled():
+        if use_ass_captions:
+            pass  # burned into the file after write_videofile, below.
+        elif subtitles_path and get_word_captions_enabled():
             try:
-                final_clip = composite_captions_on_video(final_clip, subtitles_path)
+                if normalize_audio_mode(getattr(self, "audio_mode", None)) == AUDIO_MODE_ARCHIVE_SONG:
+                    final_clip = composite_lyric_captions_on_video(
+                        final_clip,
+                        subtitles_path,
+                        getattr(self, "archive_timed_beat_map_path", ""),
+                        caption_options=getattr(self, "archive_caption_options", None),
+                    )
+                else:
+                    final_clip = composite_captions_on_video(final_clip, subtitles_path)
             except Exception as e:
                 warning(f"Word captions failed, falling back to block subtitles: {e}")
                 subtitles = SubtitlesClip(subtitles_path, make_textclip=generator)
@@ -1069,14 +1333,50 @@ Return ONLY the prompt sentence.""",
         else:
             final_clip.write_videofile(combined_image_path, threads=threads)
 
+        if use_ass_captions:
+            combined_image_path = self._burn_ass_captions(
+                combined_image_path, subtitles_path
+            )
+
         success(f'Wrote Video to "{combined_image_path}"')
 
         return combined_image_path
 
+    def _burn_ass_captions(self, video_path: str, subtitles_path: str) -> str:
+        """Burn FFmpeg ASS karaoke captions onto the rendered video.
+
+        Post-render step (opt-in via ``caption_backend: ass_karaoke``), not a
+        MoviePy composite — see ``caption_ass.py``. Any failure ships the
+        video without burned captions rather than blocking the run.
+        """
+        from caption_ass import burn_captions, write_ass_from_srt
+
+        ass_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".ass")
+        burned_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".mp4")
+        try:
+            write_ass_from_srt(subtitles_path, ass_path)
+            burn_captions(video_path, ass_path, burned_path)
+            return burned_path
+        except Exception as e:
+            warning(f"ASS caption burn-in failed ({e}); shipping video without burned captions.")
+            return video_path
+
     def _generate_shot_asset(
-        self, prompt: str, tier: str, *, per_shot_seconds: float
+        self,
+        prompt: str,
+        tier: str,
+        *,
+        per_shot_seconds: float,
+        fallback_path: str | None = None,
     ) -> AssetResult:
-        """Generate one shot asset; fall back to a safe prompt or prior frame on block."""
+        """Generate one shot asset; fall back to a safe prompt or a supplied
+        prior-frame path on block.
+
+        `fallback_path` is passed in explicitly (rather than read from
+        `self.images`) so this method has no shared-state dependency and is
+        safe to call concurrently from multiple worker threads — see the
+        parallel shot loop in `_generate_pipeline`.
+        """
         kwargs = {
             "aspect_ratio": get_nanobanana2_aspect_ratio(),
             "video_duration_seconds": min(
@@ -1100,15 +1400,81 @@ Return ONLY the prompt sentence.""",
             try:
                 return generate_asset_with_fallback(safe_prompt, "standard", **kwargs)
             except RuntimeError:
-                if self.images:
+                if fallback_path:
                     warning("Safe fallback also failed; reusing previous shot image.")
                     return AssetResult(
-                        path=self.images[-1],
+                        path=fallback_path,
                         modality="image",
                         tier="standard",
                         provider="reuse",
                     )
                 raise
+
+    def _generate_shot_assets_parallel(
+        self, prompts: List[str], *, per_shot_seconds: float
+    ) -> List[AssetResult]:
+        """Generate all shot assets concurrently, preserving prompt order.
+
+        Shots are independent, so this runs on a small bounded thread pool:
+        each shot's network call can retry up to 6x with backoff on a 429
+        (asset_gen.py), and a strictly sequential loop meant one throttled
+        shot could stall the entire run for minutes. Bounded (not unbounded)
+        to avoid making rate-limit throttling worse with a thundering herd.
+        """
+        n_shots = len(prompts)
+        results: list[AssetResult | None] = [None] * n_shots
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(4, max(1, n_shots))) as pool:
+            futures = {
+                pool.submit(
+                    self._generate_shot_asset,
+                    prompt,
+                    tier_for_shot_role(shot_role_for_index(i)),
+                    per_shot_seconds=per_shot_seconds,
+                    # No well-defined "previous shot" while running
+                    # concurrently — see the backfill pass below for what
+                    # happens if a shot fails outright.
+                    fallback_path=None,
+                ): i
+                for i, prompt in enumerate(prompts)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    results[i] = future.result()
+                except RuntimeError:
+                    results[i] = None  # backfilled below
+                completed += 1
+                emit_stage("assets", index=completed, total=n_shots)
+
+        # Backfill any shot whose primary + safe-prompt generation both
+        # failed by reusing the nearest successfully-generated neighbor
+        # (closest match to the old sequential "reuse previous shot"
+        # resilience guarantee, without the shared-state race that would
+        # make this unsafe if _generate_shot_asset read self.images itself).
+        for i in range(n_shots):
+            if results[i] is not None:
+                continue
+            neighbor = next(
+                (results[j] for j in range(i - 1, -1, -1) if results[j] is not None),
+                None,
+            ) or next(
+                (results[j] for j in range(i + 1, n_shots) if results[j] is not None),
+                None,
+            )
+            if neighbor is None:
+                raise RuntimeError(
+                    f"Shot {i} failed and no other shot succeeded to reuse as a fallback."
+                )
+            warning(f"Shot {i} failed after retries; reusing an adjacent shot's image.")
+            results[i] = AssetResult(
+                path=neighbor.path,
+                modality=neighbor.modality,
+                tier="standard",
+                provider="reuse",
+            )
+
+        return results
 
     def _build_experiment_metadata(self) -> dict:
         brand = load_active_brand() or {}
@@ -1179,12 +1545,7 @@ Return ONLY the prompt sentence.""",
             )
             self.generate_metadata()
             self.generate_script_to_speech(tts_instance)
-            self.production_metadata["tts_provider"] = getattr(
-                tts_instance, "last_provider_used", ""
-            )
-            self.production_metadata["tts_model"] = getattr(
-                tts_instance, "last_model_used", ""
-            )
+            self._record_tts_metadata(tts_instance)
             audio_duration = AudioFileClip(self.tts_path).duration
 
         if audio_duration > max_audio:
@@ -1202,8 +1563,601 @@ Return ONLY the prompt sentence.""",
                 "uploading an over-length Short."
             )
 
+    def _archive_resume_command(self, brand_id: str, episode_id: str) -> str:
+        return (
+            f"python scripts/run_brand_short.py {brand_id} --audio-mode archive-song "
+            f'--episode "{episode_id}" --resume'
+        )
+
+    def _hydrate_archive_song_state(self, state: ArchiveSongState) -> None:
+        self.archive_song_state = state
+        self.subject = state.subject
+        self.script = state.script
+        self.metadata = dict(state.metadata)
+        self.research_brief = dict(state.research_brief)
+        self.research_notes = render_research_notes(self.research_brief)
+        self.research_brief_path = os.path.join(
+            self.archive_song_episode_dir, "research_brief.json"
+        )
+        self.image_prompts = list(state.image_prompts)
+        self.shot_durations = [float(value) for value in (state.shot_durations or [])]
+        self.archive_timed_beat_map_path = state.timed_beat_map_path or ""
+        self.archive_subtitles_path = state.subtitles_path or ""
+
+    def _resolve_archive_song_settings(
+        self, episode_package: SongPackage | dict | None = None
+    ) -> ArchiveSongSettings:
+        brand = load_active_brand() or {}
+        settings = load_resolved_archive_song_settings(
+            brand=brand,
+            episode_package=episode_package,
+            cli_overrides={
+                "skip_song_validation": bool(
+                    getattr(self, "skip_song_validation", False)
+                )
+            },
+        )
+        self.archive_song_settings = settings
+        self.archive_caption_options = {
+            "caption_style": settings.caption_style,
+            "fullscreen_emphasis": settings.fullscreen_emphasis,
+            "fullscreen_max_seconds": settings.fullscreen_max_seconds,
+            "show_source_on_screen": settings.show_source_on_screen,
+        }
+        return settings
+
+    def _generate_archive_song_package(
+        self, target_duration: float, settings: ArchiveSongSettings
+    ) -> SongPackage:
+        prompt = build_song_package_prompt(
+            self.subject,
+            self.script,
+            self.research_brief,
+            target_duration_seconds=target_duration,
+            settings=settings,
+        )
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                raw = self.generate_response(prompt, quality=True)
+                return SongPackage.from_dict(
+                    extract_json_object(raw),
+                    self.research_brief,
+                    settings=settings,
+                )
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                last_error = exc
+                warning(
+                    f"Invalid Archive Song package (attempt {attempt}/3): {exc}"
+                )
+        raise ArchiveSongError(
+            f"LLM did not return a valid source-backed song package: {last_error}"
+        )
+
+    def _save_archive_research_files(self) -> None:
+        with open(
+            os.path.join(self.archive_song_episode_dir, "research_brief.json"),
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(self.research_brief, file, ensure_ascii=False, indent=2)
+        with open(
+            os.path.join(self.archive_song_episode_dir, "approved_script.txt"),
+            "w",
+            encoding="utf-8",
+        ) as file:
+            file.write(self.script.rstrip() + "\n")
+
+    def _restore_archive_assets(self, state: ArchiveSongState) -> bool:
+        if not state.assets or not all(
+            os.path.isfile(str(item.get("path") or "")) for item in state.assets
+        ):
+            return False
+        self.asset_results = [
+            AssetResult(
+                path=str(item["path"]),
+                modality=str(item.get("modality") or "image"),
+                tier=str(item.get("tier") or "standard"),
+                provider=str(item.get("provider") or "checkpoint"),
+                cost_usd=float(item.get("cost_usd") or 0.0),
+            )
+            for item in state.assets
+        ]
+        self.images = [item.path for item in self.asset_results]
+        self.asset_modalities = [item.modality for item in self.asset_results]
+        self.image_prompts = list(state.image_prompts or [])
+        self.shot_durations = [float(value) for value in (state.shot_durations or [])]
+        return (
+            bool(state.image_prompts)
+            and len(self.asset_results) >= len(state.image_prompts)
+            and (
+                not state.shot_durations
+                or len(state.shot_durations) == len(state.image_prompts)
+            )
+        )
+
+    def _build_archive_shot_plan(
+        self,
+        state: ArchiveSongState,
+        package: SongPackage,
+        audio_duration: float,
+        settings: ArchiveSongSettings,
+    ) -> ArchiveShotPlan:
+        style_suffix = get_production_setting("image_style_suffix", "") or (
+            "cinematic documentary illustration style, high contrast, dramatic lighting, "
+            "no text in images, 9:16 vertical"
+        )
+        plan = build_archive_shot_plan(
+            audio_duration=audio_duration,
+            timed_beat_map_path=state.timed_beat_map_path
+            or getattr(self, "archive_timed_beat_map_path", ""),
+            package_beats=package.visual_beat_map,
+            subject=self.subject,
+            historical_topic=package.historical_topic,
+            style_suffix=style_suffix,
+            settings=settings,
+            fallback_prompts=list(state.image_prompts or []),
+        )
+        if plan.used_fallback:
+            warning(
+                "Archive Song visual fallback: "
+                f"{plan.fallback_reason or 'equal-duration lyric prompts'}"
+            )
+            if not plan.shots:
+                self.images = []
+                self.asset_modalities = []
+                self.asset_results = []
+                self.generate_prompts()
+                plan = equal_duration_fallback_plan(
+                    list(self.image_prompts),
+                    audio_duration,
+                    plan.fallback_reason
+                    or "equal-duration lyric prompts after beat-map failure",
+                )
+        else:
+            info(
+                f" => Using timed visual beat map for {len(plan.shots)} Archive Song shots "
+                f"(total {plan.total_duration_seconds:.2f}s / audio {audio_duration:.2f}s)."
+            )
+        return plan
+
+    def _generate_archive_assets(
+        self,
+        state: ArchiveSongState,
+        package: SongPackage,
+        settings: ArchiveSongSettings,
+    ) -> None:
+        audio_clip = AudioFileClip(self.tts_path)
+        try:
+            audio_duration = float(audio_clip.duration)
+        finally:
+            audio_clip.close()
+
+        assets_complete = self._restore_archive_assets(state)
+        durations_ok = (
+            bool(state.shot_durations)
+            and len(state.shot_durations) == len(state.image_prompts or [])
+            and abs(sum(float(value) for value in state.shot_durations) - audio_duration)
+            <= max(0.05, float(settings.duration_tolerance_seconds))
+        )
+        if assets_complete and durations_ok:
+            info(f" => Reusing {len(self.images)} checkpointed Archive Song assets.")
+            return
+        if assets_complete and not durations_ok:
+            warning(
+                "Checkpointed Archive Song shot durations no longer match production "
+                "audio length; rebuilding the shot plan while keeping durable assets "
+                "only when counts still align."
+            )
+            # Force plan rebuild; keep only a durable asset prefix if counts match.
+            if len(self.asset_results) != len(state.image_prompts or []):
+                self.images = []
+                self.asset_modalities = []
+                self.asset_results = []
+                state.assets = []
+            state.image_prompts = []
+            state.shot_durations = []
+            state.shot_plan = {}
+
+        if (
+            state.image_prompts
+            and state.shot_durations
+            and len(state.image_prompts) == len(state.shot_durations)
+            and durations_ok
+            and not state.shot_plan.get("used_fallback", False)
+        ):
+            self.image_prompts = list(state.image_prompts)
+            self.shot_durations = snap_durations_to_frames(
+                [float(value) for value in state.shot_durations],
+                total_seconds=audio_duration,
+                fps=30.0,
+            )
+            plan_source = "checkpoint"
+        else:
+            plan = self._build_archive_shot_plan(
+                state, package, audio_duration, settings
+            )
+            self.image_prompts = [shot.prompt for shot in plan.shots]
+            self.shot_durations = snap_durations_to_frames(
+                [shot.duration_seconds for shot in plan.shots],
+                total_seconds=audio_duration,
+                fps=30.0,
+            )
+            state.image_prompts = list(self.image_prompts)
+            state.shot_durations = list(self.shot_durations)
+            state.shot_plan = plan.to_dict()
+            plan_source = plan.source
+            # Asset count must match the rebuilt plan.
+            if len(self.asset_results) != len(self.image_prompts):
+                self.images = []
+                self.asset_modalities = []
+                self.asset_results = []
+                state.assets = []
+            save_state(self.archive_song_episode_dir, state)
+            info(f" => Archive Song shot plan source: {plan_source}")
+
+        # A prior process may have stopped after any individual asset. Reuse the
+        # durable prefix and continue at the first missing shot.
+        if not self.asset_results:
+            self.images = []
+            self.asset_modalities = []
+            self.asset_results = []
+            state.assets = []
+
+        for index, prompt in enumerate(
+            self.image_prompts[len(self.asset_results) :],
+            start=len(self.asset_results),
+        ):
+            role = shot_role_for_index(index)
+            tier = tier_for_shot_role(role)
+            per_shot_seconds = (
+                float(self.shot_durations[index])
+                if index < len(self.shot_durations)
+                else audio_duration / max(len(self.image_prompts), 1)
+            )
+            result = self._generate_shot_asset(
+                prompt,
+                tier,
+                per_shot_seconds=per_shot_seconds,
+                fallback_path=self.images[-1] if self.images else None,
+            )
+            durable_path = copy_checkpoint_asset(
+                result.path, self.archive_song_episode_dir, index
+            )
+            result = AssetResult(
+                path=durable_path,
+                modality=result.modality,
+                tier=result.tier,
+                provider=result.provider,
+                cost_usd=result.cost_usd,
+            )
+            self.images.append(result.path)
+            self.asset_modalities.append(result.modality)
+            self.asset_results.append(result)
+            state.assets.append(
+                {
+                    "path": result.path,
+                    "modality": result.modality,
+                    "tier": result.tier,
+                    "provider": result.provider,
+                    "cost_usd": result.cost_usd,
+                }
+            )
+            save_state(self.archive_song_episode_dir, state)
+
+            if result.tier != "standard":
+                log_asset_spend(
+                    video_title=self.subject,
+                    role=role,
+                    tier=result.tier,
+                    modality=result.modality,
+                    provider=result.provider,
+                    cost_usd=result.cost_usd,
+                    brand_id=state.brand_id,
+                )
+
+    def _generate_archive_song_pipeline(self) -> str:
+        if self.format_type != "short":
+            raise ArchiveSongError("Archive Song mode currently supports Shorts only.")
+
+        brand = load_active_brand() or {}
+        brand_id = str(brand.get("brand_id") or "default")
+        episode_id = (
+            str(getattr(self, "archive_song_episode_id", "") or "").strip()
+            or str(getattr(self, "episode_number", "") or "").strip()
+            or re.sub(
+                r"[^a-z0-9]+",
+                "-",
+                str(getattr(self, "subject", "") or "").lower(),
+            ).strip("-")[:60]
+            or datetime.now().strftime("%Y%m%d-%H%M%S")
+        )
+        self.archive_song_episode_id = episode_id
+        self.archive_song_episode_dir = ensure_episode_directory(brand_id, episode_id)
+        resume_command = self._archive_resume_command(brand_id, episode_id)
+        existing_state_path = os.path.join(
+            self.archive_song_episode_dir, "archive_song_state.json"
+        )
+
+        state = None
+        if os.path.isfile(existing_state_path):
+            state = load_state(self.archive_song_episode_dir)
+            if state.brand_id != brand_id:
+                raise ArchiveSongError(
+                    f"Episode state belongs to brand {state.brand_id!r}, not {brand_id!r}."
+                )
+            requested_subject = str(getattr(self, "subject", "") or "").strip()
+            if (
+                requested_subject
+                and state.subject
+                and requested_subject.casefold() != state.subject.casefold()
+            ):
+                raise ArchiveSongError(
+                    f"Episode {episode_id!r} is checkpointed for {state.subject!r}; "
+                    f"refusing to reuse it for {requested_subject!r}. Choose a new --episode id."
+                )
+            self._hydrate_archive_song_state(state)
+
+        if state is None:
+            self.run_id = str(uuid4())
+            self.images = []
+            self.asset_modalities = []
+            self.asset_results = []
+            self.research_notes = ""
+            self.research_brief = {}
+            self.research_brief_path = ""
+            self.production_metadata = {"audio_mode": AUDIO_MODE_ARCHIVE_SONG}
+            self._research_rejected_topics = []
+            self._generate_topic_and_research(max_attempts=3)
+            self.generate_script()
+            self._save_archive_research_files()
+            state = ArchiveSongState(
+                episode_id=episode_id,
+                brand_id=brand_id,
+                subject=self.subject,
+                script=self.script,
+                research_brief=self.research_brief,
+            )
+
+        settings = self._resolve_archive_song_settings(
+            state.song_package if state.song_package else None
+        )
+        target_duration = float(settings.target_duration_seconds)
+        if not state.song_package or self.regenerate_song_package:
+            # Regeneration reuses the approved script and research; it never
+            # discards imported audio, but downstream timing/visuals must be
+            # rebuilt because lyrics and beat guidance may have changed.
+            if self.regenerate_song_package:
+                invalidate_audio_dependent_outputs(state)
+                state.package_lyrics_hash = ""
+            approved_script = state.script
+            self.script = approved_script
+            # Brand/config settings guide generation before an episode package exists.
+            settings = self._resolve_archive_song_settings(None)
+            package = self._generate_archive_song_package(target_duration, settings)
+            # Episode package values now override brand defaults for this run.
+            settings = self._resolve_archive_song_settings(package)
+            state.song_package = package.to_dict()
+            state.package_lyrics_hash = lyrics_content_hash(package.lyrics.text)
+            state.settings = settings.to_dict()
+            state.metadata = {
+                "title": package.suggested_youtube_title,
+                "description": build_description(
+                    package.suggested_description,
+                    subject=self.subject,
+                    format_type="short",
+                    include_affiliate=True,
+                )
+                + ("\n\n" + " ".join(package.suggested_hashtags) if package.suggested_hashtags else ""),
+            }
+            self.metadata = dict(state.metadata)
+            with open(
+                os.path.join(self.archive_song_episode_dir, "metadata.json"),
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(self.metadata, file, ensure_ascii=False, indent=2)
+            state.status = "awaiting_song_audio"
+            save_state(self.archive_song_episode_dir, state)
+            write_song_package_files(
+                self.archive_song_episode_dir,
+                package,
+                self.research_brief,
+                resume_command,
+            )
+        else:
+            package = SongPackage.from_dict(
+                state.song_package, state.research_brief, settings=settings
+            )
+            settings = self._resolve_archive_song_settings(package)
+            state.settings = settings.to_dict()
+            state.package_lyrics_hash = state.package_lyrics_hash or lyrics_content_hash(
+                package.lyrics.text
+            )
+            self.metadata = dict(state.metadata)
+            # Repair companion files if state survived but artifacts were deleted.
+            lyrics_path = os.path.join(self.archive_song_episode_dir, "lyrics.txt")
+            if not os.path.isfile(lyrics_path):
+                write_song_package_files(
+                    self.archive_song_episode_dir,
+                    package,
+                    self.research_brief,
+                    resume_command,
+                )
+
+        self.archive_song_state = state
+        if not self.archive_song_resume:
+            state.status = "awaiting_song_audio"
+            save_state(self.archive_song_episode_dir, state)
+            raise AwaitingSongAudio(self.archive_song_episode_dir, resume_command)
+
+        imported = discover_song_audio(
+            self.archive_song_episode_dir,
+            getattr(self, "archive_song_audio_path", "") or None,
+            filenames=settings.audio_filenames,
+        )
+        if not imported:
+            state.status = "awaiting_song_audio"
+            save_state(self.archive_song_episode_dir, state)
+            raise AwaitingSongAudio(self.archive_song_episode_dir, resume_command)
+
+        # Never overwrite the operator's export. Normalize from the discovered
+        # path (or --song-audio) and keep that path as the import identity.
+        imported = os.path.abspath(imported)
+        current_identity = compute_file_identity(imported)
+        if not identities_match(current_identity, state.imported_audio_identity):
+            if state.imported_audio_identity:
+                warning(
+                    "Imported Archive Song audio changed; invalidating timed map, "
+                    "alignment, assets, and prior render."
+                )
+            invalidate_audio_dependent_outputs(state)
+            state.imported_audio_identity = current_identity
+
+        if (
+            not self.regenerate_song_package
+            and state.status == "rendered"
+            and state.rendered_video_path
+            and os.path.isfile(state.rendered_video_path)
+            and identities_match(current_identity, state.imported_audio_identity)
+            and state.normalized_audio_path
+            and os.path.isfile(state.normalized_audio_path)
+        ):
+            self.video_path = state.rendered_video_path
+            self.output_video_path = state.rendered_video_path
+            self.tts_path = state.normalized_audio_path
+            self.metadata = dict(state.metadata)
+            info(f" => Reusing completed Archive Song render: {state.rendered_video_path}")
+            return state.rendered_video_path
+
+        validation = validate_and_normalize_audio(
+            imported,
+            self.archive_song_episode_dir,
+            target_duration_seconds=package.target_duration_seconds,
+            min_duration_seconds=float(settings.min_duration_seconds),
+            max_duration_seconds=float(settings.max_duration_seconds),
+            enforce_duration=bool(settings.enforce_duration),
+        )
+        state.imported_audio_path = imported
+        state.imported_audio_identity = current_identity
+        state.audio_validation = validation.to_dict()
+        if not validation.valid:
+            state.status = "invalid_song_audio"
+            state.errors = list(validation.errors)
+            save_state(self.archive_song_episode_dir, state)
+            raise ArchiveSongError(
+                "Archive Song audio validation failed: " + "; ".join(validation.errors)
+            )
+
+        state.errors = []
+        state.normalized_audio_path = validation.normalized_path
+        self.tts_path = validation.normalized_path
+        self.production_metadata = {
+            "audio_mode": AUDIO_MODE_ARCHIVE_SONG,
+            "audio_validation": validation.to_dict(),
+            "imported_audio_identity": current_identity,
+            "tts_provider": "manual_suno_handoff",
+            "tts_model": "",
+            "archive_song_settings": settings.to_dict(),
+        }
+        if not (
+            state.timed_beat_map_path
+            and os.path.isfile(state.timed_beat_map_path)
+        ):
+            _raw_path, normalized_map_path = prepare_timed_beat_maps(
+                self.archive_song_episode_dir,
+                package.visual_beat_map,
+                validation.duration_seconds,
+                settings,
+            )
+            state.timed_beat_map_path = normalized_map_path
+        self.archive_timed_beat_map_path = state.timed_beat_map_path
+
+        lyrics_hash = lyrics_content_hash(package.lyrics.text)
+        alignment_reusable = (
+            state.caption_alignment_path
+            and state.subtitles_path
+            and os.path.isfile(state.caption_alignment_path)
+            and os.path.isfile(state.subtitles_path)
+            and state.package_lyrics_hash == lyrics_hash
+        )
+        if alignment_reusable:
+            self.archive_subtitles_path = state.subtitles_path
+            info(" => Reusing checkpointed Archive Song lyric alignment.")
+        else:
+            if state.caption_alignment_path or state.subtitles_path:
+                info(
+                    " => Rebuilding lyric alignment "
+                    "(lyrics changed, audio changed, or alignment files were missing)."
+                )
+            detected_entries = []
+            try:
+                detected_srt = self.generate_subtitles_local_whisper(self.tts_path)
+                detected_entries = _parse_srt(detected_srt)
+            except Exception as exc:
+                warning(
+                    f"Sung-lyric transcription unavailable; using editable phrase timing fallback: {exc}"
+                )
+            alignment_path, subtitles_path = build_lyric_alignment(
+                self.archive_song_episode_dir,
+                package.lyrics.text,
+                validation.duration_seconds,
+                detected_entries,
+            )
+            state.caption_alignment_path = alignment_path
+            state.subtitles_path = subtitles_path
+            state.package_lyrics_hash = lyrics_hash
+            self.archive_subtitles_path = subtitles_path
+        state.status = "audio_ready"
+        save_state(self.archive_song_episode_dir, state)
+
+        # Lyrics become the visual/caption script only after the approved source
+        # narration and research have been safely checkpointed in state.
+        self.script = package.lyrics.text
+        self._generate_archive_assets(state, package, settings)
+        state.status = "assets_ready"
+        save_state(self.archive_song_episode_dir, state)
+
+        path = self.combine()
+        self.video_path = os.path.abspath(path)
+        durable_video = os.path.join(self.archive_song_episode_dir, "final_video.mp4")
+        shutil.copy2(self.video_path, durable_video)
+        self.output_video_path = os.path.abspath(durable_video)
+        state.rendered_video_path = self.output_video_path
+        state.status = "rendered"
+        state.metadata = dict(self.metadata)
+        save_state(self.archive_song_episode_dir, state)
+
+        self.production_metadata.update(
+            {
+                "asset_count": len(self.asset_results),
+                "asset_modalities": [result.modality for result in self.asset_results],
+                "asset_tiers": [result.tier for result in self.asset_results],
+                "asset_providers": [result.provider for result in self.asset_results],
+                "target_duration_seconds": package.target_duration_seconds,
+                "episode_dir": self.archive_song_episode_dir,
+            }
+        )
+        log_video(
+            title=self.metadata.get("title", ""),
+            format_type=self.format_type,
+            niche=self.niche,
+            video_path=self.output_video_path,
+            subject=self.subject,
+            brand_id=brand_id,
+            status="generated",
+            experiment=self._build_experiment_metadata(),
+            research=self._research_metadata(),
+            production=self.production_metadata,
+        )
+        return self.output_video_path
+
     def _generate_pipeline(self, tts_instance: TTS, interactive: bool = True) -> str:
         """Shared generation pipeline for short and long-form."""
+        self.audio_mode = normalize_audio_mode(getattr(self, "audio_mode", None))
+        if self.audio_mode == AUDIO_MODE_ARCHIVE_SONG:
+            return self._generate_archive_song_pipeline()
+
         self.run_id = str(uuid4())
         self.images = []
         self.asset_modalities = []
@@ -1212,25 +2166,23 @@ Return ONLY the prompt sentence.""",
         self.research_brief = {}
         self.research_brief_path = ""
         self.production_metadata = {}
+        self._research_rejected_topics = []
 
-        self.generate_topic()
-        self.generate_research()
+        self._generate_topic_and_research(max_attempts=3)
         self.generate_script()
         self.generate_metadata()
         self.generate_prompts()
+        emit_stage("script")
 
         # Per-shot asset tier (see asset_strategy.py): brand-configurable,
         # defaults to "standard" for every shot unless a brand manifest
         # opts in (e.g. production.asset_strategy.hook = "premium_video").
         per_shot_seconds = self._short_target_duration() / max(len(self.image_prompts), 1)
-        for i, prompt in enumerate(self.image_prompts):
+        shot_assets = self._generate_shot_assets_parallel(
+            self.image_prompts, per_shot_seconds=per_shot_seconds
+        )
+        for i, result in enumerate(shot_assets):
             role = shot_role_for_index(i)
-            tier = tier_for_shot_role(role)
-            result = self._generate_shot_asset(
-                prompt,
-                tier,
-                per_shot_seconds=per_shot_seconds,
-            )
             self.images.append(result.path)
             self.asset_modalities.append(result.modality)
             self.asset_results.append(result)
@@ -1247,12 +2199,7 @@ Return ONLY the prompt sentence.""",
                 )
 
         self.generate_script_to_speech(tts_instance)
-        self.production_metadata["tts_provider"] = getattr(
-            tts_instance, "last_provider_used", ""
-        )
-        self.production_metadata["tts_model"] = getattr(
-            tts_instance, "last_model_used", ""
-        )
+        self._record_tts_metadata(tts_instance)
 
         style = get_content_style()
         if style["enforce_min_audio_duration"] and self.format_type != "longform":
@@ -1268,12 +2215,7 @@ Return ONLY the prompt sentence.""",
                 self.generate_script()
                 self.generate_metadata()
                 self.generate_script_to_speech(tts_instance)
-                self.production_metadata["tts_provider"] = getattr(
-                    tts_instance, "last_provider_used", ""
-                )
-                self.production_metadata["tts_model"] = getattr(
-                    tts_instance, "last_model_used", ""
-                )
+                self._record_tts_metadata(tts_instance)
 
         self._enforce_max_audio_duration(tts_instance, style)
 
@@ -1554,6 +2496,148 @@ Return ONLY the prompt sentence.""",
         element.send_keys(Keys.BACKSPACE)
         element.send_keys(text)
 
+    def _collect_radio_label_texts(self, driver) -> list[str]:
+        labels = driver.find_elements(By.XPATH, YOUTUBE_RADIO_BUTTON_XPATH)
+        texts = []
+        for el in labels:
+            text = (el.text or "").strip()
+            if not text:
+                text = (el.get_attribute("aria-label") or "").strip()
+            texts.append(text)
+        return texts
+
+    def _on_visibility_step(self, driver) -> bool:
+        return visibility_radios_present(self._collect_radio_label_texts(driver))
+
+    def _advance_to_visibility_step(
+        self, driver, wait: WebDriverWait, max_clicks: int = 8
+    ) -> None:
+        """Click Next until Private/Unlisted/Public radios are visible.
+
+        Studio insert steps vary (Video elements / Checks). Blindly clicking
+        Next three times often lands Done on the wrong step and saves a Draft.
+        """
+        for _ in range(max_clicks):
+            if self._on_visibility_step(driver):
+                return
+            try:
+                next_button = wait.until(
+                    EC.presence_of_element_located((By.ID, YOUTUBE_NEXT_BUTTON_ID))
+                )
+            except Exception:
+                time.sleep(2)
+                continue
+            aria_disabled = (next_button.get_attribute("aria-disabled") or "").lower()
+            if aria_disabled == "true" or not next_button.is_enabled():
+                # Checks still running — wait and retry rather than force Done.
+                time.sleep(2.5)
+                continue
+            try:
+                next_button.click()
+            except ElementClickInterceptedException:
+                self._dismiss_youtube_overlays(driver)
+                time.sleep(0.5)
+                next_button.click()
+            time.sleep(1.5)
+
+        if not self._on_visibility_step(driver):
+            raise RuntimeError(
+                "Could not reach YouTube Studio visibility step "
+                "(Private/Unlisted/Public). Upload aborted to avoid leaving a Draft."
+            )
+
+    def _set_visibility(self, driver, visibility: str) -> None:
+        """Click the visibility radio by label text (not brittle index)."""
+        target = resolve_upload_visibility({"default_visibility": visibility})
+        labels = driver.find_elements(By.XPATH, YOUTUBE_RADIO_BUTTON_XPATH)
+        for el in labels:
+            text = (el.text or "").strip()
+            aria = (el.get_attribute("aria-label") or "").strip()
+            name = (el.get_attribute("name") or "").strip()
+            haystack = f"{text} {aria} {name}"
+            if radio_matches_visibility(haystack, target):
+                try:
+                    el.click()
+                except ElementClickInterceptedException:
+                    driver.execute_script("arguments[0].click();", el)
+                time.sleep(0.5)
+                return
+
+        # Fallback: paper-radio name attributes used by some Studio builds.
+        for name_attr in (target.upper(), target.lower(), target.capitalize()):
+            found = driver.find_elements(By.NAME, name_attr)
+            if found:
+                try:
+                    found[0].click()
+                except ElementClickInterceptedException:
+                    driver.execute_script("arguments[0].click();", found[0])
+                time.sleep(0.5)
+                return
+
+        raise RuntimeError(
+            f"Could not find YouTube visibility radio for {target!r}. "
+            "Studio UI may have changed — refusing to click a wrong index."
+        )
+
+    def _wait_for_done_enabled(self, driver, timeout: float = 180) -> None:
+        """Wait until Done/Publish is clickable (Checks may block it)."""
+
+        def _enabled(d):
+            buttons = d.find_elements(By.ID, YOUTUBE_DONE_BUTTON_ID)
+            if not buttons:
+                return False
+            btn = buttons[0]
+            aria_disabled = (btn.get_attribute("aria-disabled") or "").lower()
+            if aria_disabled == "true":
+                return False
+            try:
+                return btn.is_enabled() and btn.is_displayed()
+            except Exception:
+                return False
+
+        WebDriverWait(driver, timeout).until(_enabled)
+
+    def _click_done_and_confirm(self, driver) -> None:
+        """Click Done/Publish and dismiss common secondary confirmations."""
+        done_button = driver.find_element(By.ID, YOUTUBE_DONE_BUTTON_ID)
+        try:
+            done_button.click()
+        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].click();", done_button)
+
+        time.sleep(2)
+        # Public visibility sometimes shows an extra "Publish" confirm sheet.
+        confirm_xpaths = [
+            "//ytcp-button[@id='publish-button']",
+            "//*[@id='publish-button']",
+            "//*[self::button or @role='button'][normalize-space()='Publish']",
+        ]
+        for xpath in confirm_xpaths:
+            for el in driver.find_elements(By.XPATH, xpath):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    el.click()
+                    time.sleep(1)
+                    return
+                except Exception:
+                    continue
+
+    def _upload_dialog_looks_published(self, driver) -> bool:
+        """True when post-Done success copy is visible (not just the draft link)."""
+        phrases = (
+            "video published",
+            "video is being processed",
+            "finished processing",
+            "checks complete",
+            "your video is live",
+        )
+        try:
+            body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+        except Exception:
+            body = ""
+        return any(phrase in body for phrase in phrases)
+
     def upload_video(self) -> bool:
         """
         Uploads the video to YouTube.
@@ -1561,6 +2645,10 @@ Return ONLY the prompt sentence.""",
         Returns:
             success (bool): Whether the upload was successful or not.
         """
+        if get_upload_backend() == "api":
+            return self._upload_video_api()
+
+        emit_stage("upload")
         try:
             self.get_channel_id()
 
@@ -1652,71 +2740,72 @@ Return ONLY the prompt sentence.""",
             )
             self._set_ai_disclosure(driver, bool(disclose_ai))
 
-            # Click next
+            visibility = resolve_upload_visibility(get_publishing_config())
             if verbose:
-                info("\t=> Clicking next...")
-
-            next_button = driver.find_element(By.ID, YOUTUBE_NEXT_BUTTON_ID)
-            next_button.click()
-
-            # Click next again
-            if verbose:
-                info("\t=> Clicking next again...")
-            next_button = driver.find_element(By.ID, YOUTUBE_NEXT_BUTTON_ID)
-            next_button.click()
-
-            # Wait for 2 seconds
-            time.sleep(2)
-
-            # Click next again
-            if verbose:
-                info("\t=> Clicking next again...")
-            next_button = driver.find_element(By.ID, YOUTUBE_NEXT_BUTTON_ID)
-            next_button.click()
-
-            # Set as unlisted
-            if verbose:
-                info("\t=> Setting as unlisted...")
-
-            radio_button = self._require_elements(
-                driver,
-                By.XPATH,
-                YOUTUBE_RADIO_BUTTON_XPATH,
-                minimum=3,
-                context="visibility radio buttons (private/unlisted/public)",
-            )
-            radio_button[2].click()
+                info(f"\t=> Advancing to visibility step (target: {visibility})...")
+            self._advance_to_visibility_step(driver, wait)
 
             if verbose:
-                info("\t=> Clicking done button...")
+                info(f"\t=> Setting visibility to {visibility}...")
+            self._set_visibility(driver, visibility)
 
-            # Click done button
-            done_button = driver.find_element(By.ID, YOUTUBE_DONE_BUTTON_ID)
-            done_button.click()
+            if verbose:
+                info("\t=> Waiting for Done/Publish to become enabled...")
+            self._wait_for_done_enabled(driver, timeout=180)
 
-            # Wait for 2 seconds
-            time.sleep(2)
+            if verbose:
+                info("\t=> Clicking done/publish button...")
+            self._click_done_and_confirm(driver)
 
             if verbose:
                 info("\t=> Getting video URL...")
 
-            # Last chance to read the dialog link if the earlier capture
-            # missed it (e.g. the link renders late on slow uploads).
-            if not uploaded_video_id:
+            # Prefer dialog link; give Studio time to finish the publish dialog
+            # so we do not close Firefox while the upload is still a Draft.
+            deadline = time.time() + 45
+            while time.time() < deadline and not uploaded_video_id:
                 uploaded_video_id = self._capture_upload_dialog_video_id(driver)
+                if uploaded_video_id:
+                    break
+                time.sleep(1.5)
 
-            if not uploaded_video_id:
-                # Fallback: scan the Studio video list, but only trust a row
-                # whose title matches this upload — the top row can still be
-                # an older video while the new one is processing.
-                driver.get(
-                    f"https://studio.youtube.com/channel/{self.channel_id}/videos/short"
+            publish_ok = self._upload_dialog_looks_published(driver)
+
+            # Always verify against the Shorts list when possible. Drafts get
+            # video IDs too, so a dialog link alone is not proof of publish.
+            list_video_id = ""
+            for attempt in range(4):
+                try:
+                    driver.get(
+                        f"https://studio.youtube.com/channel/{self.channel_id}/videos/short"
+                    )
+                    time.sleep(3)
+                    list_video_id = self._find_uploaded_video_id_in_list(driver) or ""
+                except Exception as list_err:
+                    warning(f"Studio Shorts list verification attempt failed: {list_err}")
+                    list_video_id = ""
+                if list_video_id:
+                    break
+                if attempt < 3:
+                    time.sleep(5)
+
+            if list_video_id:
+                uploaded_video_id = list_video_id
+                publish_ok = True
+            elif not publish_ok:
+                raise RuntimeError(
+                    "Upload wizard finished but the video was not found in Studio "
+                    "Shorts — it was likely left as a Draft. Open YouTube Studio → "
+                    "Content → Drafts, set visibility, publish, then backfill the "
+                    "URL in .mp/analytics.json."
                 )
-                time.sleep(2)
-                uploaded_video_id = self._find_uploaded_video_id_in_list(driver)
+            elif not uploaded_video_id:
+                warning(
+                    "Publish UI looked OK but no video id was captured; logging "
+                    "upload without a URL. Repair analytics after confirming in Studio."
+                )
 
             url = build_url(uploaded_video_id) if uploaded_video_id else ""
-
             self.uploaded_video_url = url
 
             upload_brand = load_active_brand()
@@ -1763,6 +2852,77 @@ Return ONLY the prompt sentence.""",
             if get_verbose():
                 traceback.print_exc()
             self.close_browser()
+            return False
+
+    def _upload_video_api(self) -> bool:
+        """Upload via the YouTube Data API (opt-in — see get_upload_backend()).
+
+        No Selenium/browser involved. Requires an OAuth token already minted
+        via youtube_api_upload.load_or_refresh_credentials() (interactive
+        first-run consent, then silent refresh on unattended runs).
+        """
+        emit_stage("upload")
+        try:
+            from youtube_api_upload import (
+                build_api_upload_request,
+                load_or_refresh_credentials,
+                upload_video_resumable,
+            )
+
+            request = build_api_upload_request(
+                video_path=self.video_path,
+                title=self.metadata["title"],
+                description=self.metadata["description"],
+                category_id=get_youtube_api_category_id(),
+                publishing=get_publishing_config(),
+                made_for_kids=get_is_for_kids(),
+                srt_path=getattr(self, "subtitles_path", "") or None,
+                thumbnail_path=getattr(self, "thumbnail_path", "") or None,
+            )
+            credentials = load_or_refresh_credentials(
+                get_youtube_api_client_secrets_path(), get_youtube_api_token_path()
+            )
+            result = upload_video_resumable(request, credentials=credentials, execute=True)
+
+            url = result.watch_url()
+            self.uploaded_video_url = url
+
+            upload_brand = load_active_brand()
+            log_video(
+                title=self.metadata.get("title", ""),
+                format_type=getattr(self, "format_type", "short"),
+                niche=self.niche,
+                video_path=self.video_path,
+                url=url,
+                subject=getattr(self, "subject", ""),
+                brand_id=upload_brand.get("brand_id", ""),
+                status="uploaded",
+                experiment=self._build_experiment_metadata(),
+                research=self._research_metadata(),
+                production=self.production_metadata,
+            )
+
+            if get_verbose():
+                success(f" => Uploaded Video via API: {url}")
+
+            self.add_video(
+                {
+                    "title": self.metadata["title"],
+                    "description": self.metadata["description"],
+                    "url": url,
+                    "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+
+            return True
+        except Exception as e:
+            import traceback
+
+            self.last_upload_error = f"{type(e).__name__}: {e}"
+            self.last_upload_traceback = traceback.format_exc()
+            error(f"YouTube API upload failed: {e}")
+            if get_verbose():
+                traceback.print_exc()
             return False
 
     def get_videos(self) -> List[dict]:
