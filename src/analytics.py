@@ -192,6 +192,30 @@ def log_video(
     _save(data)
 
 
+def _match_video_entries(needle: str) -> tuple[dict, list[dict]]:
+    """Return (data, matching video entries) for a needle search."""
+    needle = (needle or "").strip()
+    needle_norm = _normalize_title(needle)
+    data = _load()
+    if not needle_norm:
+        return data, []
+    matches = []
+    for entry in data.get("videos", []):
+        in_url = needle in (entry.get("url") or "")
+        in_title = needle_norm in _normalize_title(entry.get("title", ""))
+        if in_url or in_title:
+            matches.append(entry)
+    return data, matches
+
+
+def _set_metric_source(entry: dict, field: str, source: str) -> None:
+    sources = entry.get("metric_sources")
+    if not isinstance(sources, dict):
+        sources = {}
+    sources[field] = source
+    entry["metric_sources"] = sources
+
+
 def set_video_retention(needle: str, avg_view_pct: float) -> int:
     """Record Studio's "average percentage viewed" (0-100) on matching videos.
 
@@ -202,25 +226,86 @@ def set_video_retention(needle: str, avg_view_pct: float) -> int:
 
     CLI: python src/analytics.py retention "<video id or title fragment>" <pct>
     """
-    pct = float(avg_view_pct)
-    if not 0.0 <= pct <= 100.0:
-        raise ValueError(f"avg_view_pct must be 0-100, got {pct}")
-    needle = (needle or "").strip()
-    needle_norm = _normalize_title(needle)
-    if not needle_norm:
-        return 0
+    from studio_metrics import MetricSource, StudioMetricValue
 
-    data = _load()
-    updated = 0
-    for entry in data.get("videos", []):
-        in_url = needle in (entry.get("url") or "")
-        in_title = needle_norm in _normalize_title(entry.get("title", ""))
-        if in_url or in_title:
-            entry["avg_view_pct"] = pct
-            updated += 1
-    if updated:
+    metric = StudioMetricValue(
+        field="avg_view_pct",
+        value=avg_view_pct,
+        source=MetricSource.MANUAL_STUDIO,
+        unit="percent",
+    )
+    data, matches = _match_video_entries(needle)
+    for entry in matches:
+        entry["avg_view_pct"] = metric.value
+        _set_metric_source(entry, "avg_view_pct", metric.source.value)
+    if matches:
         _save(data)
-    return updated
+    return len(matches)
+
+
+def set_video_ctr(needle: str, ctr_percent: float) -> int:
+    """Record Studio CTR as 0-100 percent on matching videos.
+
+    Never invents a value from views alone — operator/API must supply CTR.
+    Labels source as ``manual_studio`` for strategy gating.
+
+    CLI: python src/analytics.py ctr "<video id or title fragment>" <pct>
+    """
+    from studio_metrics import MetricSource, StudioMetricValue
+
+    metric = StudioMetricValue(
+        field="ctr",
+        value=ctr_percent,
+        source=MetricSource.MANUAL_STUDIO,
+        unit="percent",
+    )
+    data, matches = _match_video_entries(needle)
+    for entry in matches:
+        entry["ctr"] = metric.value
+        _set_metric_source(entry, "ctr", metric.source.value)
+    if matches:
+        _save(data)
+    return len(matches)
+
+
+def set_studio_metrics(
+    needle: str,
+    metrics: list,
+    *,
+    allow_proxy: bool = False,
+) -> int:
+    """Apply one or more Studio-private metrics with explicit sources.
+
+    Rejects ``proxy_estimate`` unless ``allow_proxy=True`` (still labeled so
+    strategy helpers can ignore them).
+    """
+    from studio_metrics import (
+        MetricSource,
+        normalize_metrics,
+    )
+
+    normalized = normalize_metrics(metrics)
+    if not normalized:
+        return 0
+    for metric in normalized:
+        if metric.source == MetricSource.PROXY_ESTIMATE and not allow_proxy:
+            raise ValueError(
+                f"Refusing proxy_estimate for {metric.field!r}. "
+                "Pass allow_proxy=True only when deliberately labeling a proxy."
+            )
+        if metric.source == MetricSource.MISSING:
+            raise ValueError(f"Cannot persist missing source for {metric.field!r}")
+        if metric.value is None:
+            raise ValueError(f"Cannot persist null value for {metric.field!r}")
+
+    data, matches = _match_video_entries(needle)
+    for entry in matches:
+        for metric in normalized:
+            entry[metric.field] = metric.value
+            _set_metric_source(entry, metric.field, metric.source.value)
+    if matches:
+        _save(data)
+    return len(matches)
 
 
 def log_asset_spend(
@@ -620,6 +705,14 @@ if __name__ == "__main__":
             _sys.exit(2)
         _count = set_video_retention(_args[1], float(_args[2]))
         print(f"Set avg_view_pct={float(_args[2]):g} on {_count} matching entr{'y' if _count == 1 else 'ies'}.")
+        if not _count:
+            _sys.exit(1)
+    elif _args and _args[0] == "ctr":
+        if len(_args) != 3:
+            print('Usage: python src/analytics.py ctr "<video id or title fragment>" <pct>')
+            _sys.exit(2)
+        _count = set_video_ctr(_args[1], float(_args[2]))
+        print(f"Set ctr={float(_args[2]):g}% on {_count} matching entr{'y' if _count == 1 else 'ies'}.")
         if not _count:
             _sys.exit(1)
     else:

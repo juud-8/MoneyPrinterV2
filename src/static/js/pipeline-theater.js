@@ -20,6 +20,7 @@
   let forcedTerminal = false;
   let lastStatus = "";
   let lastParsed = null;
+  let lastRenderedActiveIdx = -1;
 
   function $(id) {
     return document.getElementById(id);
@@ -44,6 +45,18 @@
       if (total > 0) return Math.min(100, (100 * cur) / total);
     }
     return null;
+  }
+
+  function parseStructuredStage(fullLog) {
+    if (!fullLog) return null;
+    const matches = fullLog.match(/##MPV2_STAGE##(\{[^\n]*\})/g);
+    if (!matches || !matches.length) return null;
+    try {
+      // Last match = most recent stage marker written to the log.
+      return JSON.parse(matches[matches.length - 1].slice("##MPV2_STAGE##".length));
+    } catch {
+      return null;
+    }
   }
 
   function parseStages(fullLog, label) {
@@ -81,6 +94,21 @@
       if (hits[order[i]]) activeIdx = i;
     }
 
+    // Prefer the reliable, machine-parseable signal (pipeline_stage.py)
+    // over the regex guesswork above when present. Un-instrumented paths
+    // (Archive Song, older jobs) just keep using the regex result — this
+    // never regresses the index, only advances it.
+    let assetsProgress = null;
+    const structured = parseStructuredStage(text);
+    if (structured && order.includes(structured.stage)) {
+      const structuredIdx = order.indexOf(structured.stage);
+      if (structuredIdx > activeIdx) activeIdx = structuredIdx;
+      for (let i = 0; i <= structuredIdx; i++) hits[order[i]] = true;
+    }
+    if (structured && structured.stage === "assets" && structured.total) {
+      assetsProgress = { index: structured.index, total: structured.total };
+    }
+
     // If compose is active, prefer MoviePy % from the tail of the log.
     const tail = text.slice(-4000);
     const renderPct = hits.compose ? parseMoviePyPercent(tail) : null;
@@ -98,6 +126,8 @@
       tip = `Compositing frames · ${Math.round(renderPct)}%`;
     } else if (hits.compose) {
       tip = "Compositing video (MoviePy)…";
+    } else if (hits.assets && assetsProgress) {
+      tip = `Generating shot ${assetsProgress.index} of ${assetsProgress.total}…`;
     } else if (hits.assets) {
       tip = "Generating images & voice…";
     } else if (hits.research) {
@@ -116,6 +146,7 @@
       activeIdx,
       hits,
       renderPct,
+      assetsProgress,
       tip,
       title: titleMatch ? titleMatch[1].trim() : "",
       url: urlMatch ? urlMatch[1].trim() : "",
@@ -149,9 +180,10 @@
     theater.hidden = !showTheater;
     log.hidden = showTheater;
     btn.textContent = showTheater ? "See terminal" : "Theater";
+    btn.classList.toggle("is-terminal", !showTheater);
   }
 
-  function renderTheater(parsed, label, status) {
+  function renderTheater(parsed, label, status, justAdvanced) {
     const root = $("pipeline-theater");
     const stageLabel = $("pipeline-stage-label");
     if (!root) return;
@@ -172,6 +204,12 @@
         let cls = "stage-pill";
         if (i < active) cls += " done";
         if (i === active) cls += " active";
+        // One-shot activation glow: only present on the single render where
+        // this pill just became active, so it plays once per real
+        // transition rather than replaying every tick (the whole rail is
+        // rebuilt each tick, and a CSS `animation` — unlike `transition` —
+        // plays on any freshly-inserted element that already has the class).
+        if (i === active && justAdvanced) cls += " just-activated";
         return `<span class="${cls}" data-stage="${s.id}">${s.label}</span>`;
       })
       .join('<span class="stage-sep" aria-hidden="true"></span>');
@@ -181,7 +219,11 @@
         ? `<div class="render-bar"><div class="render-bar-fill" style="width:${Math.round(
             parsed.renderPct
           )}%"></div><span>${Math.round(parsed.renderPct)}% render</span></div>`
-        : "";
+        : parsed.assetsProgress
+          ? `<div class="render-bar"><div class="render-bar-fill" style="width:${Math.round(
+              (100 * parsed.assetsProgress.index) / Math.max(parsed.assetsProgress.total, 1)
+            )}%"></div><span>${parsed.assetsProgress.index}/${parsed.assetsProgress.total} shots</span></div>`
+          : "";
 
     let outcome = "";
     if (status === "succeeded" || (status !== "running" && parsed.succeeded)) {
@@ -200,7 +242,7 @@
         <div class="drawer-slot"><div class="drawer-face"></div></div>
         <div class="drawer-slot"><div class="drawer-face delay"></div></div>
         <div class="drawer-slot"><div class="drawer-face delay2"></div></div>
-        <div class="stamp-pulse"></div>
+        <div class="stamp-pulse${justAdvanced ? " fire" : ""}"></div>
       </div>
       <div class="theater-rail">${rail}</div>
       ${pct}
@@ -225,6 +267,7 @@
     forcedTerminal = false;
     lastParsed = null;
     lastStatus = "";
+    lastRenderedActiveIdx = -1;
     const tip = $("pipeline-stage-label");
     if (tip) tip.textContent = "Waiting for log…";
     applyView();
@@ -241,7 +284,10 @@
       forcedTerminal = false;
     }
 
-    renderTheater(parsed, label || "", status || "");
+    const justAdvanced = parsed.activeIdx > lastRenderedActiveIdx;
+    lastRenderedActiveIdx = parsed.activeIdx;
+
+    renderTheater(parsed, label || "", status || "", justAdvanced);
     applyView();
   }
 

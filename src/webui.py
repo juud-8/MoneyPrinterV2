@@ -35,6 +35,7 @@ from analytics import (
 )
 from brand_switcher import list_brands, load_brand
 from performance_insights import get_insights_summary
+from trend_discovery import fetch_trending_topics
 from youtube_metrics import get_latest_channel_snapshots
 
 app = Flask(
@@ -489,11 +490,30 @@ def api_update_slots(brand_id: str):
     return jsonify({"ok": True, "publish_slots": slots})
 
 
+@app.post("/api/brands/<brand_id>/trending-topics")
+def api_trending_topics(brand_id: str):
+    """Suggest topic candidates from current search trends for a brand's niche.
+
+    Manual-trigger only — a quick in-process fetch + LLM rank, not routed
+    through webui_jobs (no Selenium/profile-lock concern here). Never 500s
+    on a trend-source failure; fetch_trending_topics degrades to [] itself.
+    """
+    manifest = load_brand(brand_id)
+    if not manifest:
+        return jsonify({"error": f"Unknown brand: {brand_id}"}), 404
+
+    niche = manifest.get("niche", "")
+    topics = fetch_trending_topics(niche)
+    return jsonify({"topics": topics})
+
+
 @app.post("/api/generate")
 def api_generate():
     payload = request.get_json(silent=True) or {}
     brand_id = payload.get("brand_id", "")
     upload = bool(payload.get("upload", False))
+    topic = str(payload.get("topic") or "").strip()
+    image_provider = str(payload.get("image_provider") or "").strip().lower()
 
     if not load_brand(brand_id):
         return jsonify({"error": f"Unknown brand: {brand_id}"}), 404
@@ -510,6 +530,11 @@ def api_generate():
         # The button click is the explicit human confirmation pilot mode
         # asks for on non-interactive runs (see review_gate.py).
         env_extra["MPV2_PILOT_UPLOAD_CONFIRMED"] = "1"
+    if topic:
+        args += ["--topic", topic]
+    if image_provider in ("gemini", "fal"):
+        # One-off override for this run only — see config.get_standard_image_provider().
+        env_extra["MPV2_IMAGE_PROVIDER_OVERRIDE"] = image_provider
 
     label = f"{'Generate & post' if upload else 'Generate'} — {brand_id}"
     try:

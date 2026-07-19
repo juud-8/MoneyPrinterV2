@@ -274,3 +274,19 @@ with fallback disabled and inspect the original/production WAVs and manifests.
 Do not upload, commit, push, begin ACE-Step, or begin LongLive without a separate
 explicit instruction.
 ```
+
+## Voicebox readiness evaluation (2026-07-18)
+
+Offline readiness check added: `scripts/evaluate_voicebox_readiness.py`.
+
+Result on this workstation (no live inference performed):
+
+- `audio.provider` is still `elevenlabs` (not `voicebox`)
+- `audio.voicebox.profile` is empty
+- Voicebox `/health` on `http://127.0.0.1:17493` is not reachable
+- `ready_for_live_comparison`: **false**
+
+Operator next steps unchanged: install/start Voicebox 0.5.x, set
+`audio.provider=voicebox` + `allow_fallback=false` + profile, re-run readiness,
+then `scripts/test_voicebox_narration.py`. ACE-Step / LongLive remain blocked
+until that comparison decision.

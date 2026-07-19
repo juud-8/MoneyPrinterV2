@@ -63,6 +63,55 @@ class WebuiApiTests(unittest.TestCase):
         self.assertIn("videos", data)
         self.assertEqual(data["window_days"], 7)
 
+    def test_generate_passes_topic_and_image_provider_override(self):
+        captured = {}
+
+        def fake_run_python_script(kind, label, script_relpath, args, brand_id="", env_extra=None):
+            captured["args"] = args
+            captured["env_extra"] = env_extra
+            return {"id": "job-1", "label": label}
+
+        with patch.object(webui, "load_brand", return_value={"brand_id": "demo_brand"}), patch(
+            "archived_brands.is_brand_archived", return_value=False
+        ), patch.object(webui.webui_jobs, "run_python_script", side_effect=fake_run_python_script):
+            res = self.client.post(
+                "/api/generate",
+                json={"brand_id": "demo_brand", "topic": "The Dancing Plague of 1518", "image_provider": "fal"},
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("--topic", captured["args"])
+        self.assertIn("The Dancing Plague of 1518", captured["args"])
+        self.assertEqual(captured["env_extra"].get("MPV2_IMAGE_PROVIDER_OVERRIDE"), "fal")
+
+    def test_generate_ignores_invalid_image_provider(self):
+        captured = {}
+
+        def fake_run_python_script(kind, label, script_relpath, args, brand_id="", env_extra=None):
+            captured["env_extra"] = env_extra
+            return {"id": "job-1", "label": label}
+
+        with patch.object(webui, "load_brand", return_value={"brand_id": "demo_brand"}), patch(
+            "archived_brands.is_brand_archived", return_value=False
+        ), patch.object(webui.webui_jobs, "run_python_script", side_effect=fake_run_python_script):
+            res = self.client.post(
+                "/api/generate",
+                json={"brand_id": "demo_brand", "image_provider": "bogus"},
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertNotIn("MPV2_IMAGE_PROVIDER_OVERRIDE", captured["env_extra"])
+
+    def test_trending_topics_returns_suggestions(self):
+        with patch.object(webui, "load_brand", return_value={"brand_id": "demo_brand", "niche": "weird history"}), \
+            patch.object(webui, "fetch_trending_topics", return_value=["topic a", "topic b"]):
+            res = self.client.post("/api/brands/demo_brand/trending-topics")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.get_json()["topics"], ["topic a", "topic b"])
+
+    def test_trending_topics_unknown_brand_404s(self):
+        with patch.object(webui, "load_brand", return_value=None):
+            res = self.client.post("/api/brands/nope/trending-topics")
+        self.assertEqual(res.status_code, 404)
+
     def test_overview_still_works(self):
         fake = {
             "generated_at": "2026-07-16 12:00:00",

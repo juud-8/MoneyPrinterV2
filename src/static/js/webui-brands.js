@@ -260,6 +260,15 @@
           <span class="quota">${target ? `${quotaBlocks(uploadedToday, target)} ${uploadedToday}/${target} today` : `${uploadedToday} today`}</span>
           ${winChip}
         </div>
+        <div class="gen-controls">
+          <input class="topic-input" type="text" placeholder="Topic (optional) — blank = AI picks">
+          <button class="ghost small" data-action="suggest-trends" data-brand="${esc(id)}" title="Suggest a topic from current Google Trends for this brand's niche">✨ Trends</button>
+          <select class="provider-select" title="Image provider for this run only — leave on Default to use the brand's configured provider">
+            <option value="">Image: default</option>
+            <option value="gemini">Image: Gemini</option>
+            <option value="fal">Image: fal.ai (cheap)</option>
+          </select>
+        </div>
         <div class="actions">
           <button data-action="generate" data-brand="${esc(id)}" data-upload="0">Generate only</button>
           <button class="gold" data-action="generate" data-brand="${esc(id)}" data-upload="1">Generate &amp; Post now</button>
@@ -276,10 +285,13 @@
   }
 
   async function generate(brandId, upload, btn) {
+    const card = btn && btn.closest(".card");
+    const topic = ((card && card.querySelector(".topic-input")?.value) || "").trim();
+    const imageProvider = ((card && card.querySelector(".provider-select")?.value) || "").trim();
     if (
       upload &&
       !confirm(
-        `Generate AND upload a new Short for "${brandName(brandId)}" now?\n\nThis launches the full pipeline (LLM → TTS → images → video → Selenium upload).`
+        `Generate AND upload a new Short for "${brandName(brandId)}" now?\n\nThis launches the full pipeline (LLM → TTS → images → video → Selenium upload).${topic ? `\n\nTopic: ${topic}` : ""}`
       )
     ) {
       return;
@@ -289,10 +301,13 @@
       btn.dataset.busy = "1";
     }
     try {
+      const body = { brand_id: brandId, upload };
+      if (topic) body.topic = topic;
+      if (imageProvider) body.image_provider = imageProvider;
       const job = await api("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ brand_id: brandId, upload }),
+        body: JSON.stringify(body),
       });
       toast(`Started: ${job.label}`);
       if (M.selectJob) M.selectJob(job.id);
@@ -305,6 +320,29 @@
         btn.disabled = false;
         delete btn.dataset.busy;
       }
+    }
+  }
+
+  async function suggestTrends(brandId, btn) {
+    const card = btn && btn.closest(".card");
+    const input = card && card.querySelector(".topic-input");
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api(`/api/brands/${encodeURIComponent(brandId)}/trending-topics`, { method: "POST" });
+      const topics = res.topics || [];
+      if (!topics.length) {
+        toast("No trending topics found for this brand's niche right now.", true);
+        return;
+      }
+      if (input) {
+        input.value = topics[0];
+        input.title = topics.length > 1 ? `Other candidates:\n${topics.slice(1).join("\n")}` : "";
+      }
+      toast(`Suggested: ${topics[0]}`);
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -357,6 +395,7 @@
     renderRecentPosts,
     renderBrands,
     generate,
+    suggestTrends,
     saveSlots,
     openOutput,
     openEpisode,

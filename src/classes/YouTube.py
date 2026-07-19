@@ -4,6 +4,7 @@ import time
 import os
 import shutil
 import assemblyai as aai
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils import *
 from cache import *
@@ -11,6 +12,7 @@ from .Tts import TTS
 from llm_provider import generate_text
 from config import *
 from status import *
+from pipeline_stage import emit_stage
 from content_funnel import build_description
 from asset_gen import AssetResult, generate_image as gen_image, generate_asset_with_fallback
 from asset_strategy import shot_role_for_index, tier_for_shot_role
@@ -285,6 +287,7 @@ class YouTube:
                 f" => Grounded research: {len(brief['claims'])} claims across "
                 f"{len(brief['cited_source_ids'])} cited sources."
             )
+            emit_stage("research")
             return self.research_notes
 
         prompt = f"""
@@ -299,6 +302,7 @@ class YouTube:
         self.research_notes = notes
         if get_verbose():
             info(f" => Research notes:\n{notes[:300]}...")
+        emit_stage("research")
         return notes
 
     @staticmethod
@@ -372,6 +376,7 @@ class YouTube:
             self.subject = preset
             if get_verbose():
                 info(f" => Using preset topic: {self.subject}")
+            emit_stage("topic", topic=self.subject)
             return self.subject
 
         style = get_content_style()
@@ -418,6 +423,32 @@ class YouTube:
         except Exception as e:
             warning(f"Performance insights skipped: {e}")
 
+        # Opt-in trend seeds (production.use_trending_topics or
+        # MPV2_USE_TRENDING_TOPICS=1). Failures degrade to normal generation.
+        trend_candidates: list[str] = []
+        try:
+            from topic_discovery_loop import (
+                build_trend_seed_block,
+                fetch_trend_seeds_for_niche,
+                trending_topics_enabled,
+            )
+
+            production = active_brand.get("production") if isinstance(active_brand, dict) else None
+            if trending_topics_enabled(
+                production if isinstance(production, dict) else None
+            ):
+                trend_candidates = fetch_trend_seeds_for_niche(self.niche)
+                seed_block = build_trend_seed_block(trend_candidates)
+                if seed_block:
+                    prompt += "\n\n" + seed_block
+                    if get_verbose():
+                        info(
+                            f" => Topic prompt includes {len(trend_candidates)} trend seed(s)."
+                        )
+        except Exception as e:
+            warning(f"Trend topic seeds skipped: {e}")
+            trend_candidates = []
+
         candidate_count = max(1, int(style.get("topic_candidate_count", 1) or 1))
 
         candidates = []
@@ -449,13 +480,19 @@ class YouTube:
                 "No novel topic candidate passed generation and duplicate checks."
             )
 
-        if len(candidates) > 1:
-            self.subject = pick_best(candidates)
+        if trend_candidates or len(candidates) > 1:
+            from topic_discovery_loop import select_topic_from_pools
+
+            self.subject = select_topic_from_pools(candidates, trend_candidates)
             if get_verbose():
-                info(f" => Picked best of {len(candidates)} topic candidates: {self.subject}")
+                info(
+                    f" => Picked topic from {len(candidates)} LLM + "
+                    f"{len(trend_candidates)} trend candidate(s): {self.subject}"
+                )
         else:
             self.subject = candidates[0]
 
+        emit_stage("topic", topic=self.subject)
         return self.subject
 
     def _short_speech_wps(self) -> float:
@@ -1093,6 +1130,7 @@ Return ONLY the prompt sentence.""",
         Returns:
             path (str): The path to the generated MP4 File.
         """
+        emit_stage("compose")
         combined_image_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".mp4")
         threads = get_threads()
         tts_clip = AudioFileClip(self.tts_path)
@@ -1222,6 +1260,27 @@ Return ONLY the prompt sentence.""",
             except Exception as e:
                 warning(f"Failed to generate subtitles: {e}")
 
+        # Stashed for later regardless of caption backend — the API upload
+        # path (see upload_video()) attaches this as a caption track.
+        self.subtitles_path = subtitles_path or ""
+
+        use_ass_captions = (
+            get_caption_backend() == "ass_karaoke"
+            and bool(subtitles_path)
+            and get_word_captions_enabled()
+            and normalize_audio_mode(getattr(self, "audio_mode", None))
+            != AUDIO_MODE_ARCHIVE_SONG
+        )
+        if use_ass_captions:
+            from caption_ass import ffmpeg_available
+
+            if not ffmpeg_available():
+                warning(
+                    "caption_backend=ass_karaoke selected but ffmpeg is not on "
+                    "PATH; falling back to MoviePy word captions for this run."
+                )
+                use_ass_captions = False
+
         if normalize_audio_mode(getattr(self, "audio_mode", None)) == AUDIO_MODE_ARCHIVE_SONG:
             # The imported track is the complete musical mix. Adding the normal
             # background library track would double the music and damage clarity.
@@ -1237,7 +1296,9 @@ Return ONLY the prompt sentence.""",
         final_clip = final_clip.with_audio(comp_audio)
         final_clip = final_clip.with_duration(tts_clip.duration)
 
-        if subtitles_path and get_word_captions_enabled():
+        if use_ass_captions:
+            pass  # burned into the file after write_videofile, below.
+        elif subtitles_path and get_word_captions_enabled():
             try:
                 if normalize_audio_mode(getattr(self, "audio_mode", None)) == AUDIO_MODE_ARCHIVE_SONG:
                     final_clip = composite_lyric_captions_on_video(
@@ -1272,14 +1333,50 @@ Return ONLY the prompt sentence.""",
         else:
             final_clip.write_videofile(combined_image_path, threads=threads)
 
+        if use_ass_captions:
+            combined_image_path = self._burn_ass_captions(
+                combined_image_path, subtitles_path
+            )
+
         success(f'Wrote Video to "{combined_image_path}"')
 
         return combined_image_path
 
+    def _burn_ass_captions(self, video_path: str, subtitles_path: str) -> str:
+        """Burn FFmpeg ASS karaoke captions onto the rendered video.
+
+        Post-render step (opt-in via ``caption_backend: ass_karaoke``), not a
+        MoviePy composite — see ``caption_ass.py``. Any failure ships the
+        video without burned captions rather than blocking the run.
+        """
+        from caption_ass import burn_captions, write_ass_from_srt
+
+        ass_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".ass")
+        burned_path = os.path.join(ROOT_DIR, ".mp", str(uuid4()) + ".mp4")
+        try:
+            write_ass_from_srt(subtitles_path, ass_path)
+            burn_captions(video_path, ass_path, burned_path)
+            return burned_path
+        except Exception as e:
+            warning(f"ASS caption burn-in failed ({e}); shipping video without burned captions.")
+            return video_path
+
     def _generate_shot_asset(
-        self, prompt: str, tier: str, *, per_shot_seconds: float
+        self,
+        prompt: str,
+        tier: str,
+        *,
+        per_shot_seconds: float,
+        fallback_path: str | None = None,
     ) -> AssetResult:
-        """Generate one shot asset; fall back to a safe prompt or prior frame on block."""
+        """Generate one shot asset; fall back to a safe prompt or a supplied
+        prior-frame path on block.
+
+        `fallback_path` is passed in explicitly (rather than read from
+        `self.images`) so this method has no shared-state dependency and is
+        safe to call concurrently from multiple worker threads — see the
+        parallel shot loop in `_generate_pipeline`.
+        """
         kwargs = {
             "aspect_ratio": get_nanobanana2_aspect_ratio(),
             "video_duration_seconds": min(
@@ -1303,15 +1400,81 @@ Return ONLY the prompt sentence.""",
             try:
                 return generate_asset_with_fallback(safe_prompt, "standard", **kwargs)
             except RuntimeError:
-                if self.images:
+                if fallback_path:
                     warning("Safe fallback also failed; reusing previous shot image.")
                     return AssetResult(
-                        path=self.images[-1],
+                        path=fallback_path,
                         modality="image",
                         tier="standard",
                         provider="reuse",
                     )
                 raise
+
+    def _generate_shot_assets_parallel(
+        self, prompts: List[str], *, per_shot_seconds: float
+    ) -> List[AssetResult]:
+        """Generate all shot assets concurrently, preserving prompt order.
+
+        Shots are independent, so this runs on a small bounded thread pool:
+        each shot's network call can retry up to 6x with backoff on a 429
+        (asset_gen.py), and a strictly sequential loop meant one throttled
+        shot could stall the entire run for minutes. Bounded (not unbounded)
+        to avoid making rate-limit throttling worse with a thundering herd.
+        """
+        n_shots = len(prompts)
+        results: list[AssetResult | None] = [None] * n_shots
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(4, max(1, n_shots))) as pool:
+            futures = {
+                pool.submit(
+                    self._generate_shot_asset,
+                    prompt,
+                    tier_for_shot_role(shot_role_for_index(i)),
+                    per_shot_seconds=per_shot_seconds,
+                    # No well-defined "previous shot" while running
+                    # concurrently — see the backfill pass below for what
+                    # happens if a shot fails outright.
+                    fallback_path=None,
+                ): i
+                for i, prompt in enumerate(prompts)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    results[i] = future.result()
+                except RuntimeError:
+                    results[i] = None  # backfilled below
+                completed += 1
+                emit_stage("assets", index=completed, total=n_shots)
+
+        # Backfill any shot whose primary + safe-prompt generation both
+        # failed by reusing the nearest successfully-generated neighbor
+        # (closest match to the old sequential "reuse previous shot"
+        # resilience guarantee, without the shared-state race that would
+        # make this unsafe if _generate_shot_asset read self.images itself).
+        for i in range(n_shots):
+            if results[i] is not None:
+                continue
+            neighbor = next(
+                (results[j] for j in range(i - 1, -1, -1) if results[j] is not None),
+                None,
+            ) or next(
+                (results[j] for j in range(i + 1, n_shots) if results[j] is not None),
+                None,
+            )
+            if neighbor is None:
+                raise RuntimeError(
+                    f"Shot {i} failed and no other shot succeeded to reuse as a fallback."
+                )
+            warning(f"Shot {i} failed after retries; reusing an adjacent shot's image.")
+            results[i] = AssetResult(
+                path=neighbor.path,
+                modality=neighbor.modality,
+                tier="standard",
+                provider="reuse",
+            )
+
+        return results
 
     def _build_experiment_metadata(self) -> dict:
         brand = load_active_brand() or {}
@@ -1653,7 +1816,10 @@ Return ONLY the prompt sentence.""",
                 else audio_duration / max(len(self.image_prompts), 1)
             )
             result = self._generate_shot_asset(
-                prompt, tier, per_shot_seconds=per_shot_seconds
+                prompt,
+                tier,
+                per_shot_seconds=per_shot_seconds,
+                fallback_path=self.images[-1] if self.images else None,
             )
             durable_path = copy_checkpoint_asset(
                 result.path, self.archive_song_episode_dir, index
@@ -2006,19 +2172,17 @@ Return ONLY the prompt sentence.""",
         self.generate_script()
         self.generate_metadata()
         self.generate_prompts()
+        emit_stage("script")
 
         # Per-shot asset tier (see asset_strategy.py): brand-configurable,
         # defaults to "standard" for every shot unless a brand manifest
         # opts in (e.g. production.asset_strategy.hook = "premium_video").
         per_shot_seconds = self._short_target_duration() / max(len(self.image_prompts), 1)
-        for i, prompt in enumerate(self.image_prompts):
+        shot_assets = self._generate_shot_assets_parallel(
+            self.image_prompts, per_shot_seconds=per_shot_seconds
+        )
+        for i, result in enumerate(shot_assets):
             role = shot_role_for_index(i)
-            tier = tier_for_shot_role(role)
-            result = self._generate_shot_asset(
-                prompt,
-                tier,
-                per_shot_seconds=per_shot_seconds,
-            )
             self.images.append(result.path)
             self.asset_modalities.append(result.modality)
             self.asset_results.append(result)
@@ -2481,6 +2645,10 @@ Return ONLY the prompt sentence.""",
         Returns:
             success (bool): Whether the upload was successful or not.
         """
+        if get_upload_backend() == "api":
+            return self._upload_video_api()
+
+        emit_stage("upload")
         try:
             self.get_channel_id()
 
@@ -2684,6 +2852,77 @@ Return ONLY the prompt sentence.""",
             if get_verbose():
                 traceback.print_exc()
             self.close_browser()
+            return False
+
+    def _upload_video_api(self) -> bool:
+        """Upload via the YouTube Data API (opt-in — see get_upload_backend()).
+
+        No Selenium/browser involved. Requires an OAuth token already minted
+        via youtube_api_upload.load_or_refresh_credentials() (interactive
+        first-run consent, then silent refresh on unattended runs).
+        """
+        emit_stage("upload")
+        try:
+            from youtube_api_upload import (
+                build_api_upload_request,
+                load_or_refresh_credentials,
+                upload_video_resumable,
+            )
+
+            request = build_api_upload_request(
+                video_path=self.video_path,
+                title=self.metadata["title"],
+                description=self.metadata["description"],
+                category_id=get_youtube_api_category_id(),
+                publishing=get_publishing_config(),
+                made_for_kids=get_is_for_kids(),
+                srt_path=getattr(self, "subtitles_path", "") or None,
+                thumbnail_path=getattr(self, "thumbnail_path", "") or None,
+            )
+            credentials = load_or_refresh_credentials(
+                get_youtube_api_client_secrets_path(), get_youtube_api_token_path()
+            )
+            result = upload_video_resumable(request, credentials=credentials, execute=True)
+
+            url = result.watch_url()
+            self.uploaded_video_url = url
+
+            upload_brand = load_active_brand()
+            log_video(
+                title=self.metadata.get("title", ""),
+                format_type=getattr(self, "format_type", "short"),
+                niche=self.niche,
+                video_path=self.video_path,
+                url=url,
+                subject=getattr(self, "subject", ""),
+                brand_id=upload_brand.get("brand_id", ""),
+                status="uploaded",
+                experiment=self._build_experiment_metadata(),
+                research=self._research_metadata(),
+                production=self.production_metadata,
+            )
+
+            if get_verbose():
+                success(f" => Uploaded Video via API: {url}")
+
+            self.add_video(
+                {
+                    "title": self.metadata["title"],
+                    "description": self.metadata["description"],
+                    "url": url,
+                    "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+
+            return True
+        except Exception as e:
+            import traceback
+
+            self.last_upload_error = f"{type(e).__name__}: {e}"
+            self.last_upload_traceback = traceback.format_exc()
+            error(f"YouTube API upload failed: {e}")
+            if get_verbose():
+                traceback.print_exc()
             return False
 
     def get_videos(self) -> List[dict]:

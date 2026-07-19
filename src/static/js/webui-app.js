@@ -218,6 +218,8 @@
       const action = btn.dataset.action;
       if (action === "generate") {
         M.generate(btn.dataset.brand, btn.dataset.upload === "1", btn);
+      } else if (action === "suggest-trends") {
+        M.suggestTrends(btn.dataset.brand, btn);
       } else if (action === "save-slots") {
         M.saveSlots(btn.dataset.brand, btn);
       } else if (action === "cancel-job") {

@@ -9,6 +9,7 @@ from kittentts import KittenTTS as KittenModel
 from config import (
     ROOT_DIR,
     get_audio_provider_settings,
+    get_edge_tts_voice,
     get_elevenlabs_api_key,
     get_elevenlabs_model,
     get_elevenlabs_voice_id,
@@ -117,6 +118,34 @@ class TTS:
         self.last_model_used = KITTEN_MODEL
         return output_file
 
+    def _synthesize_edge_tts(self, text: str, output_file: str) -> str:
+        """Free Microsoft Edge neural TTS (unofficial; best-effort cost floor)."""
+        import asyncio
+
+        try:
+            import edge_tts
+        except ImportError as exc:
+            raise RuntimeError(
+                "edge_tts provider selected but the edge-tts package is not installed. "
+                "Run: pip install edge-tts"
+            ) from exc
+
+        voice = get_edge_tts_voice()
+        mp3_path = (
+            output_file if output_file.endswith(".mp3") else output_file.replace(".wav", ".mp3")
+        )
+        if mp3_path == output_file and not output_file.endswith(".mp3"):
+            mp3_path = output_file + ".mp3"
+
+        async def _run() -> None:
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(mp3_path)
+
+        asyncio.run(_run())
+        self.last_provider_used = "edge_tts"
+        self.last_model_used = voice
+        return mp3_path
+
     def sanitize_text(self, text: str) -> str:
         """Keep legacy cleanup exact while preserving verified Voicebox tags."""
 
@@ -210,6 +239,8 @@ class TTS:
             return self._synthesize_elevenlabs(text, output_file)
         if provider == "fishaudio":
             return self._synthesize_fishaudio(text, output_file)
+        if provider == "edge_tts":
+            return self._synthesize_edge_tts(text, output_file)
         if provider == "kittentts":
             return self._synthesize_kitten(text, output_file)
         raise RuntimeError(f"Unsupported explicit Voicebox fallback provider {provider!r}.")
@@ -315,4 +346,9 @@ class TTS:
                 return self._synthesize_elevenlabs(text, output_file)
             except Exception as e:
                 return self._fallback_to_kitten("ElevenLabs", e, output_file, text)
+        if self._provider == "edge_tts":
+            try:
+                return self._synthesize_edge_tts(text, output_file)
+            except Exception as e:
+                return self._fallback_to_kitten("edge_tts", e, output_file, text)
         return self._synthesize_kitten(text, output_file)

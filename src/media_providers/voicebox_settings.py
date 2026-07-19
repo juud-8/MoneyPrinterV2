@@ -28,7 +28,7 @@ _VOICEBOX_KEYS = {
     "crossfade_ms",
     "normalize",
 }
-_LEGACY_PROVIDERS = {"kittentts", "elevenlabs", "fishaudio"}
+_LEGACY_PROVIDERS = {"kittentts", "elevenlabs", "fishaudio", "edge_tts"}
 
 
 def _config_error(message: str) -> ProviderConfigurationError:
@@ -316,7 +316,8 @@ def resolve_audio_provider_settings(
         )
     if provider not in _LEGACY_PROVIDERS | {"voicebox"}:
         raise _config_error(
-            f"Unknown audio.provider {provider!r}. Choose voicebox, elevenlabs, fishaudio, or kittentts."
+            f"Unknown audio.provider {provider!r}. Choose voicebox, elevenlabs, "
+            "fishaudio, edge_tts, or kittentts."
         )
 
     allow_fallback = data.get("allow_fallback", False)
@@ -333,7 +334,7 @@ def resolve_audio_provider_settings(
         if fallback not in _LEGACY_PROVIDERS:
             raise _config_error(
                 "When audio.allow_fallback is true, audio.fallback_provider must be "
-                "elevenlabs, fishaudio, or kittentts."
+                "elevenlabs, fishaudio, edge_tts, or kittentts."
             )
         if fallback == provider:
             raise _config_error("audio.fallback_provider must differ from audio.provider.")

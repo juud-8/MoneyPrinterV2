@@ -715,6 +715,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 .stats .delta.down { color: var(--red); }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.gen-controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 0; align-items: center; }
+.gen-controls .topic-input { flex: 1 1 220px; min-width: 160px; }
+.gen-controls .provider-select { flex: 0 0 auto; }
 .brands-grid { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
 .brand-head { display: flex; align-items: center; gap: 12px; }
 
@@ -1055,14 +1058,20 @@ ul.plain a { word-break: break-all; }
 
 .stamp-pulse {
   position: absolute; right: 8px; top: -6px; width: 18px; height: 18px;
-  border-radius: 50%; border: 2px solid rgba(201, 162, 39, 0.7);
-  animation: stampPulse 2.4s ease-out infinite;
+  border-radius: 50%; border: 2px solid rgba(201, 162, 39, 0.35);
+}
+
+/* Fires once per real stage advance (see pipeline-theater.js's
+   justAdvanced) instead of looping unconditionally — the ring only pulses
+   when something actually happened. */
+.stamp-pulse.fire {
+  animation: stampPulse 0.9s ease-out 1;
 }
 
 @keyframes stampPulse {
-  0% { box-shadow: 0 0 0 0 rgba(201, 162, 39, 0.35); opacity: 1; }
-  70% { box-shadow: 0 0 0 12px rgba(201, 162, 39, 0); opacity: 0.6; }
-  100% { opacity: 0.3; }
+  0% { box-shadow: 0 0 0 0 rgba(201, 162, 39, 0.45); opacity: 1; border-color: rgba(201, 162, 39, 0.9); }
+  70% { box-shadow: 0 0 0 12px rgba(201, 162, 39, 0); opacity: 0.8; }
+  100% { box-shadow: 0 0 0 0 rgba(201, 162, 39, 0); opacity: 1; border-color: rgba(201, 162, 39, 0.35); }
 }
 
 .theater-rail { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 14px; max-width: calc(100% - 140px); }
@@ -1083,6 +1092,19 @@ ul.plain a { word-break: break-all; }
 
 .stage-pill.done { color: var(--green); border-color: rgba(62, 207, 142, 0.45); background: var(--green-soft); }
 .stage-sep { width: 14px; height: 1px; background: var(--line-bright); }
+
+/* Plays once when a pill freshly becomes active (see pipeline-theater.js's
+   justAdvanced) — a CSS `animation` (unlike `transition`) plays on any
+   newly-inserted element that already carries the class, which is exactly
+   what happens here since the whole rail is rebuilt each log tick; the
+   one-shot feel comes from JS only adding this class on the tick where the
+   stage actually changed, not from the CSS itself. */
+.stage-pill.just-activated { animation: stagePillGlow 0.55s var(--ease); }
+@keyframes stagePillGlow {
+  0% { box-shadow: 0 0 0 0 rgba(201, 162, 39, 0.75); transform: scale(1.08); }
+  60% { box-shadow: 0 0 0 7px rgba(201, 162, 39, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(201, 162, 39, 0); transform: scale(1); }
+}
 
 .render-bar {
   position: relative; height: 8px; border-radius: 999px;
@@ -1114,6 +1136,24 @@ ul.plain a { word-break: break-all; }
 }
 
 #log-view[hidden], #pipeline-theater[hidden] { display: none !important; }
+
+/* Theater/terminal toggle, styled as a two-state switch (track + thumb)
+   instead of a generic button. Slides right + brass when in terminal mode
+   (class set by pipeline-theater.js's applyView()). */
+#toggle-pipeline-view { position: relative; padding-left: 46px; text-align: left; min-width: 128px; }
+#toggle-pipeline-view::before {
+  content: ""; position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+  width: 26px; height: 15px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08); border: 1px solid var(--line-bright);
+  transition: background 0.2s var(--ease), border-color 0.2s var(--ease);
+}
+#toggle-pipeline-view::after {
+  content: ""; position: absolute; left: 12px; top: 50%; transform: translate(0, -50%);
+  width: 11px; height: 11px; border-radius: 50%; background: var(--muted);
+  transition: transform 0.2s var(--ease), background 0.2s var(--ease);
+}
+#toggle-pipeline-view.is-terminal::before { background: rgba(201, 162, 39, 0.28); border-color: var(--brass); }
+#toggle-pipeline-view.is-terminal::after { transform: translate(11px, -50%); background: var(--brass); }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: #2a2e35; border-radius: 6px; border: 2px solid var(--bg); }

@@ -115,6 +115,28 @@ class ImageAndTtsProviderConfigTests(unittest.TestCase):
             with patch.object(config, "ROOT_DIR", temp_dir):
                 self.assertEqual(config.get_standard_image_provider(), "fal")
 
+    def test_standard_image_provider_env_override_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {"standard_image_provider": "gemini"})
+            with patch.object(config, "ROOT_DIR", temp_dir), patch.dict(
+                os.environ, {"MPV2_IMAGE_PROVIDER_OVERRIDE": "fal"}
+            ):
+                self.assertEqual(config.get_standard_image_provider(), "fal")
+
+    def test_standard_image_provider_invalid_env_override_falls_through(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {"standard_image_provider": "fal"})
+            with patch.object(config, "ROOT_DIR", temp_dir), patch.dict(
+                os.environ, {"MPV2_IMAGE_PROVIDER_OVERRIDE": "bogus"}
+            ):
+                self.assertEqual(config.get_standard_image_provider(), "fal")
+
+    def test_trend_provider_defaults_to_google_trends(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertEqual(config.get_trend_provider(), "google_trends")
+
     def test_fal_image_model_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             self.write_config(temp_dir, {})
@@ -138,6 +160,68 @@ class ImageAndTtsProviderConfigTests(unittest.TestCase):
                 os.environ, {"FISH_AUDIO_API_KEY": "env-key"}
             ):
                 self.assertEqual(config.get_fishaudio_api_key(), "env-key")
+
+
+class CaptionBackendAndApiUploadConfigTests(unittest.TestCase):
+    def write_config(self, directory: str, payload: dict) -> None:
+        with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def test_caption_backend_defaults_to_moviepy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir), patch(
+                "brand_switcher.get_production_setting", return_value=None
+            ):
+                self.assertEqual(config.get_caption_backend(), "moviepy")
+
+    def test_caption_backend_reads_config_and_normalizes_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {"caption_backend": "ASS_Karaoke"})
+            with patch.object(config, "ROOT_DIR", temp_dir), patch(
+                "brand_switcher.get_production_setting", return_value=None
+            ):
+                self.assertEqual(config.get_caption_backend(), "ass_karaoke")
+
+    def test_caption_backend_brand_override_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {"caption_backend": "moviepy"})
+            with patch.object(config, "ROOT_DIR", temp_dir), patch(
+                "brand_switcher.get_production_setting", return_value="ass_karaoke"
+            ):
+                self.assertEqual(config.get_caption_backend(), "ass_karaoke")
+
+    def test_youtube_api_client_secrets_path_empty_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertEqual(config.get_youtube_api_client_secrets_path(), "")
+
+    def test_youtube_api_client_secrets_path_resolved_against_root_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(
+                temp_dir, {"youtube_api_client_secrets_path": "secrets/oauth.json"}
+            )
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertEqual(
+                    config.get_youtube_api_client_secrets_path(),
+                    os.path.join(temp_dir, "secrets/oauth.json"),
+                )
+
+    def test_youtube_api_token_path_default_resolved_against_root_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertEqual(
+                    config.get_youtube_api_token_path(),
+                    os.path.join(temp_dir, ".mp/youtube_api_token.json"),
+                )
+
+    def test_youtube_api_category_id_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.write_config(temp_dir, {})
+            with patch.object(config, "ROOT_DIR", temp_dir):
+                self.assertEqual(config.get_youtube_api_category_id(), "22")
 
 
 if __name__ == "__main__":

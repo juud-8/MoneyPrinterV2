@@ -98,6 +98,11 @@ def start_job(
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    # Lets classes/YouTube.py and scripts/run_brand_short.py emit machine-
+    # parseable stage markers (pipeline_stage.emit_stage) for this job's log,
+    # which the dashboard's pipeline-theater view prefers over regex-guessing
+    # at raw print text. Harmless no-op for jobs that never call emit_stage.
+    env["MPV2_STAGE_EVENTS"] = "1"
     if env_extra:
         env.update(env_extra)
 

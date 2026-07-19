@@ -18,6 +18,7 @@ from archive_song import (
     AwaitingSongAudio,
     normalize_audio_mode,
 )
+from pipeline_stage import emit_stage
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -134,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except ArchiveSongError as exc:
         print(f"ERROR: {exc}")
+        emit_stage("done", status="failed")
         youtube.close_browser()
         return 2
 
@@ -161,11 +163,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"UPLOAD: {'success' if ok else 'failed'}")
             if ok and getattr(youtube, "uploaded_video_url", None):
                 print(f"URL: {youtube.uploaded_video_url}")
+            emit_stage("done", status="success" if ok else "failed")
         else:
             print("UPLOAD: skipped")
+            emit_stage("done", status="skipped")
     else:
         youtube.close_browser()
         print("(Upload skipped — pass --upload to upload automatically)")
+        emit_stage("done", status="success")
     return 0
 
 

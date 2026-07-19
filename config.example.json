@@ -81,6 +81,12 @@
     "show_source_on_screen": false,
     "enforce_duration": true
   },
+  "upload_backend": "selenium",
+  "youtube_api_client_secrets_path": "",
+  "youtube_api_token_path": ".mp/youtube_api_token.json",
+  "youtube_api_category_id": "22",
+  "caption_backend": "moviepy",
+  "edge_tts_voice": "en-US-GuyNeural",
   "review_before_upload": true,
   "longform_target_minutes": 8,
   "channel_config_file": "brands/the_strange_archive/manifest.json",
