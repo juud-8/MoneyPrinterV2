@@ -2648,6 +2648,16 @@ Return ONLY the prompt sentence.""",
         if get_upload_backend() == "api":
             return self._upload_video_api()
 
+        if getattr(self, "publish_at", ""):
+            # Scheduled publishing needs the Data API's publishAt — the
+            # Selenium Studio wizard has no schedule support here.
+            self.last_upload_error = (
+                "Scheduled publishing requires upload_backend: \"api\" in "
+                "config.json (Selenium backend cannot schedule)."
+            )
+            error(self.last_upload_error)
+            return False
+
         emit_stage("upload")
         try:
             self.get_channel_id()
@@ -2878,6 +2888,7 @@ Return ONLY the prompt sentence.""",
                 made_for_kids=get_is_for_kids(),
                 srt_path=getattr(self, "subtitles_path", "") or None,
                 thumbnail_path=getattr(self, "thumbnail_path", "") or None,
+                publish_at=getattr(self, "publish_at", "") or None,
             )
             credentials = load_or_refresh_credentials(
                 get_youtube_api_client_secrets_path(), get_youtube_api_token_path()
@@ -2896,14 +2907,17 @@ Return ONLY the prompt sentence.""",
                 url=url,
                 subject=getattr(self, "subject", ""),
                 brand_id=upload_brand.get("brand_id", ""),
-                status="uploaded",
+                status="scheduled" if result.publish_at else "uploaded",
                 experiment=self._build_experiment_metadata(),
                 research=self._research_metadata(),
                 production=self.production_metadata,
             )
 
             if get_verbose():
-                success(f" => Uploaded Video via API: {url}")
+                if result.publish_at:
+                    success(f" => Scheduled via API for {result.publish_at} (UTC): {url}")
+                else:
+                    success(f" => Uploaded Video via API: {url}")
 
             self.add_video(
                 {

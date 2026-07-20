@@ -19,9 +19,62 @@ from youtube_api_upload import (
     estimate_daily_upload_capacity,
     load_oauth_client_secrets,
     load_or_refresh_credentials,
+    normalize_publish_at,
     resolve_upload_backend,
     upload_video_resumable,
 )
+
+
+class NormalizePublishAtTests(unittest.TestCase):
+    def test_naive_local_time_converts_to_utc_z(self):
+        from datetime import datetime, timezone
+
+        past_now = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        result = normalize_publish_at("2026-07-21T18:30", now=past_now)
+        self.assertTrue(result.endswith("Z"))
+        self.assertRegex(result, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_space_separator_accepted(self):
+        from datetime import datetime, timezone
+
+        past_now = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        self.assertTrue(normalize_publish_at("2026-07-21 18:30", now=past_now).endswith("Z"))
+
+    def test_past_time_rejected(self):
+        with self.assertRaises(ValueError):
+            normalize_publish_at("2001-01-01T00:00")
+
+    def test_garbage_rejected(self):
+        with self.assertRaises(ValueError):
+            normalize_publish_at("tomorrow at 6")
+        with self.assertRaises(ValueError):
+            normalize_publish_at("")
+
+    def test_build_request_with_publish_at_forces_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = os.path.join(tmp, "v.mp4")
+            with open(video, "wb") as handle:
+                handle.write(b"fake")
+            req = build_api_upload_request(
+                video_path=video,
+                title="Scheduled Short",
+                privacy_status="public",
+                publish_at="2099-01-01T12:00",
+            )
+            self.assertEqual(req.privacy_status, "private")
+            body = req.to_videos_insert_body()
+            self.assertEqual(body["status"]["privacyStatus"], "private")
+            self.assertTrue(body["status"]["publishAt"].endswith("Z"))
+            result = dry_run_upload(req)
+            self.assertEqual(result.publish_at, req.publish_at)
+
+    def test_no_publish_at_omits_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = os.path.join(tmp, "v.mp4")
+            with open(video, "wb") as handle:
+                handle.write(b"fake")
+            req = build_api_upload_request(video_path=video, title="T")
+            self.assertNotIn("publishAt", req.to_videos_insert_body()["status"])
 
 
 class YoutubeApiUploadTests(unittest.TestCase):

@@ -269,6 +269,10 @@
             <option value="fal">Image: fal.ai (cheap)</option>
           </select>
         </div>
+        <div class="gen-controls">
+          <input class="schedule-input" type="datetime-local" title="Publish time for Generate &amp; Schedule (local time)">
+          <button class="ghost" data-action="generate" data-brand="${esc(id)}" data-upload="1" data-schedule="1" title="Generate now, upload private, and let YouTube publish it at the chosen time (requires upload_backend: api)">Generate &amp; Schedule</button>
+        </div>
         <div class="actions">
           <button data-action="generate" data-brand="${esc(id)}" data-upload="0">Generate only</button>
           <button class="gold" data-action="generate" data-brand="${esc(id)}" data-upload="1">Generate &amp; Post now</button>
@@ -288,12 +292,23 @@
     const card = btn && btn.closest(".card");
     const topic = ((card && card.querySelector(".topic-input")?.value) || "").trim();
     const imageProvider = ((card && card.querySelector(".provider-select")?.value) || "").trim();
-    if (
-      upload &&
-      !confirm(
-        `Generate AND upload a new Short for "${brandName(brandId)}" now?\n\nThis launches the full pipeline (LLM → TTS → images → video → Selenium upload).${topic ? `\n\nTopic: ${topic}` : ""}`
-      )
-    ) {
+    const isSchedule = btn && btn.dataset.schedule === "1";
+    let publishAt = "";
+    if (isSchedule) {
+      publishAt = ((card && card.querySelector(".schedule-input")?.value) || "").trim();
+      if (!publishAt) {
+        toast("Pick a publish date/time first (the field next to Generate & Schedule).", true);
+        return;
+      }
+      if (new Date(publishAt) <= new Date()) {
+        toast("Publish time must be in the future.", true);
+        return;
+      }
+    }
+    const confirmMsg = isSchedule
+      ? `Generate a new Short for "${brandName(brandId)}" and schedule it to publish at ${new Date(publishAt).toLocaleString()}?\n\nIt uploads private via the YouTube API and goes public automatically at that time.${topic ? `\n\nTopic: ${topic}` : ""}`
+      : `Generate AND upload a new Short for "${brandName(brandId)}" now?\n\nThis launches the full pipeline (LLM → TTS → images → video → Selenium upload).${topic ? `\n\nTopic: ${topic}` : ""}`;
+    if (upload && !confirm(confirmMsg)) {
       return;
     }
     if (btn) {
@@ -302,6 +317,7 @@
     }
     try {
       const body = { brand_id: brandId, upload };
+      if (publishAt) body.publish_at = publishAt;
       if (topic) body.topic = topic;
       if (imageProvider) body.image_provider = imageProvider;
       const job = await api("/api/generate", {

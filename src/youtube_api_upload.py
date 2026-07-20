@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from youtube_upload_flow import VALID_VISIBILITIES, resolve_upload_visibility
@@ -44,8 +45,17 @@ class ApiUploadRequest:
     made_for_kids: bool
     srt_path: str | None = None
     thumbnail_path: str | None = None
+    publish_at: str | None = None  # RFC3339 UTC; requires privacy_status=private
 
     def to_videos_insert_body(self) -> dict[str, Any]:
+        status: dict[str, Any] = {
+            "privacyStatus": self.privacy_status,
+            "selfDeclaredMadeForKids": bool(self.made_for_kids),
+        }
+        if self.publish_at:
+            # YouTube publishes the video itself at this time; until then it
+            # stays private (the only privacy the API accepts with publishAt).
+            status["publishAt"] = self.publish_at
         return {
             "snippet": {
                 "title": self.title,
@@ -53,10 +63,7 @@ class ApiUploadRequest:
                 "tags": list(self.tags),
                 "categoryId": self.category_id,
             },
-            "status": {
-                "privacyStatus": self.privacy_status,
-                "selfDeclaredMadeForKids": bool(self.made_for_kids),
-            },
+            "status": status,
         }
 
 
@@ -67,6 +74,7 @@ class ApiUploadResult:
     backend: str = "api"
     caption_uploaded: bool = False
     dry_run: bool = False
+    publish_at: str | None = None
 
     def watch_url(self) -> str:
         return f"https://www.youtube.com/watch?v={self.video_id}"
@@ -100,6 +108,31 @@ def estimate_daily_upload_capacity(
     return max(0, int(daily_quota) // int(units_per_upload))
 
 
+def normalize_publish_at(raw: str, *, now: datetime | None = None) -> str:
+    """Parse an operator-supplied schedule time into RFC3339 UTC.
+
+    Accepts local-time ``YYYY-MM-DDTHH:MM`` / ``YYYY-MM-DD HH:MM`` (what an
+    HTML datetime-local input produces) or any ISO-8601 string with an offset.
+    Naive inputs are interpreted in the machine's local timezone. The result
+    must be in the future — YouTube rejects past publishAt times.
+    """
+    text = str(raw or "").strip().replace(" ", "T")
+    if not text:
+        raise ValueError("publish_at is empty")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"publish_at must be ISO format like 2026-07-21T18:30, got {raw!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()  # attach local timezone
+    reference = now if now is not None else datetime.now(timezone.utc)
+    if parsed <= reference:
+        raise ValueError(f"publish_at must be in the future, got {raw!r}")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def build_api_upload_request(
     *,
     video_path: str,
@@ -113,6 +146,7 @@ def build_api_upload_request(
     srt_path: str | None = None,
     thumbnail_path: str | None = None,
     fallback_visibility: str = "private",
+    publish_at: str | None = None,
 ) -> ApiUploadRequest:
     """Build a validated upload request. Defaults to private for review safety."""
     if not video_path or not str(video_path).strip():
@@ -120,6 +154,11 @@ def build_api_upload_request(
     title_clean = (title or "").strip()
     if not title_clean:
         raise ValueError("title is required")
+    publish_at_utc = normalize_publish_at(publish_at) if publish_at else None
+    if publish_at_utc:
+        # Scheduled videos must be uploaded private; YouTube flips them
+        # public at publishAt.
+        privacy_status = "private"
     if privacy_status is None:
         visibility = resolve_upload_visibility(
             dict(publishing or {}), fallback=fallback_visibility
@@ -141,6 +180,7 @@ def build_api_upload_request(
         made_for_kids=bool(made_for_kids),
         srt_path=os.path.abspath(srt_path) if srt_path else None,
         thumbnail_path=os.path.abspath(thumbnail_path) if thumbnail_path else None,
+        publish_at=publish_at_utc,
     )
 
 
@@ -157,6 +197,7 @@ def dry_run_upload(request: ApiUploadRequest) -> ApiUploadResult:
         privacy_status=request.privacy_status,
         caption_uploaded=bool(request.srt_path),
         dry_run=True,
+        publish_at=request.publish_at,
     )
 
 
@@ -280,6 +321,7 @@ def upload_video_resumable(
         privacy_status=request.privacy_status,
         caption_uploaded=caption_uploaded,
         dry_run=False,
+        publish_at=request.publish_at,
     )
 
 

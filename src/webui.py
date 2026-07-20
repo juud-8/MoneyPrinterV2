@@ -514,9 +514,30 @@ def api_generate():
     upload = bool(payload.get("upload", False))
     topic = str(payload.get("topic") or "").strip()
     image_provider = str(payload.get("image_provider") or "").strip().lower()
+    publish_at = str(payload.get("publish_at") or "").strip()
 
     if not load_brand(brand_id):
         return jsonify({"error": f"Unknown brand: {brand_id}"}), 404
+
+    if publish_at:
+        from config import get_upload_backend
+        from youtube_api_upload import normalize_publish_at
+
+        try:
+            normalize_publish_at(publish_at)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        if get_upload_backend() != "api":
+            return (
+                jsonify(
+                    {
+                        "error": 'Scheduling requires upload_backend: "api" in '
+                        "config.json — the Selenium upload path cannot schedule."
+                    }
+                ),
+                400,
+            )
+        upload = True
 
     from archived_brands import is_brand_archived
 
@@ -532,11 +553,16 @@ def api_generate():
         env_extra["MPV2_PILOT_UPLOAD_CONFIRMED"] = "1"
     if topic:
         args += ["--topic", topic]
+    if publish_at:
+        args += ["--publish-at", publish_at]
     if image_provider in ("gemini", "fal"):
         # One-off override for this run only — see config.get_standard_image_provider().
         env_extra["MPV2_IMAGE_PROVIDER_OVERRIDE"] = image_provider
 
-    label = f"{'Generate & post' if upload else 'Generate'} — {brand_id}"
+    if publish_at:
+        label = f"Generate & schedule ({publish_at}) — {brand_id}"
+    else:
+        label = f"{'Generate & post' if upload else 'Generate'} — {brand_id}"
     try:
         job = webui_jobs.run_python_script(
             "generate",

@@ -30,6 +30,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("brand_id", nargs="?", default="the_strange_archive")
     parser.add_argument("--upload", action="store_true", help="upload after review gates")
+    parser.add_argument(
+        "--publish-at",
+        metavar="WHEN",
+        help=(
+            "schedule the upload to go public at this local time "
+            "(e.g. 2026-07-21T18:30). Implies --upload; requires "
+            'upload_backend: "api" in config.json'
+        ),
+    )
     parser.add_argument("--episode", help="stable episode id/number (recommended for resume)")
     parser.add_argument("--topic", help="operator-selected historical topic")
     parser.add_argument(
@@ -63,9 +72,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     brand_id = args.brand_id
-    do_upload = args.upload
+    do_upload = args.upload or bool(args.publish_at)
     episode = args.episode
     topic = args.topic
+
+    publish_at = ""
+    if args.publish_at:
+        from config import get_upload_backend
+        from youtube_api_upload import normalize_publish_at
+
+        try:
+            publish_at = normalize_publish_at(args.publish_at)
+        except ValueError as exc:
+            build_parser().error(str(exc))
+        if get_upload_backend() != "api":
+            print(
+                'ERROR: --publish-at requires upload_backend: "api" in config.json '
+                "(the Selenium Studio wizard cannot schedule)."
+            )
+            return 2
+        print(f"Scheduled publish time: {args.publish_at} (UTC: {publish_at})")
     try:
         audio_mode = normalize_audio_mode(args.audio_mode)
     except ValueError as exc:
@@ -117,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     if topic:
         youtube.subject = topic.strip()
         print(f"Topic: {youtube.subject}")
+    youtube.publish_at = publish_at
     youtube.audio_mode = audio_mode
     youtube.archive_song_resume = args.resume
     youtube.archive_song_audio_path = args.song_audio or ""
@@ -160,7 +187,11 @@ def main(argv: list[str] | None = None) -> int:
             interactive=False,
         ):
             ok = youtube.upload_video()
-            print(f"UPLOAD: {'success' if ok else 'failed'}")
+            if publish_at:
+                print(f"UPLOAD: {'scheduled' if ok else 'failed'}"
+                      + (f" (goes public at {publish_at} UTC)" if ok else ""))
+            else:
+                print(f"UPLOAD: {'success' if ok else 'failed'}")
             if ok and getattr(youtube, "uploaded_video_url", None):
                 print(f"URL: {youtube.uploaded_video_url}")
             emit_stage("done", status="success" if ok else "failed")

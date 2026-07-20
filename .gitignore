@@ -29,3 +29,6 @@ outreach_message.html
 
 # Logs
 *.log
+# Google OAuth client secrets for YouTube API upload
+secrets/
+i-have-adhd/
