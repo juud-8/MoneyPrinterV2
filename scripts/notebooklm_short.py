@@ -131,6 +131,15 @@ def slugify(text: str) -> str:
     return slug[:60] or "episode"
 
 
+def episode_dir_for(brand_id: str, topic: str, day: datetime.date | None = None) -> str:
+    """Staging directory for one episode — shared with the batch runner so
+    both sides agree on where a topic's artifacts live."""
+    stamp = (day or datetime.date.today()).isoformat()
+    return os.path.join(
+        ROOT, "output", brand_id, "notebooklm", f"{stamp}_{slugify(topic)}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -162,13 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         or DEFAULT_PROMPT
     )
 
-    episode_dir = os.path.join(
-        ROOT,
-        "output",
-        args.brand_id,
-        "notebooklm",
-        f"{datetime.date.today().isoformat()}_{slugify(args.topic)}",
-    )
+    episode_dir = episode_dir_for(args.brand_id, args.topic)
     video_path = os.path.join(episode_dir, "notebooklm_short.mp4")
 
     print(f"NotebookLM short for '{args.topic}' [{args.brand_id}] - review-only, no upload.")
@@ -278,6 +281,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    (suggestions failed, continuing: {exc})")
 
     if not args.dry_run:
+        with open(os.path.join(episode_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "topic": args.topic,
+                    "brand_id": args.brand_id,
+                    "notebook_id": notebook_id,
+                    "format": args.video_format,
+                    "prompt": prompt,
+                    "suggestions": suggestions,
+                    "final_path": final_path,
+                    "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+                },
+                f,
+                indent=2,
+            )
         notes_path = os.path.join(episode_dir, "NOTES.md")
         with open(notes_path, "w", encoding="utf-8") as f:
             f.write(
