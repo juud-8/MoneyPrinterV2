@@ -297,16 +297,38 @@ def check_songs_library(
 
 
 def check_firefox_profile_lock(profile_path: str) -> list[HealthIssue]:
+    """Fail only when a running Firefox actually holds the profile lock.
+
+    On Windows, parent.lock persists after Firefox exits — the lock is the
+    exclusive file handle, not the file's existence. Removing the file is the
+    real test: it succeeds for a stale leftover and raises PermissionError
+    while Firefox holds it open.
+    """
     issues: list[HealthIssue] = []
     if not profile_path:
         return issues
     lock_path = os.path.join(profile_path, "parent.lock")
-    if os.path.isfile(lock_path):
+    if not os.path.isfile(lock_path):
+        return issues
+    try:
+        os.remove(lock_path)
+    except FileNotFoundError:
+        pass
+    except PermissionError:
         issues.append(
             HealthIssue(
                 "fail",
-                "Firefox parent.lock is present in the automation profile.",
+                "Firefox is currently running with the automation profile "
+                "(parent.lock is held open).",
                 "Close all Firefox windows using the mpv2 profile before automated upload.",
+            )
+        )
+    except OSError as exc:
+        issues.append(
+            HealthIssue(
+                "warn",
+                f"Could not probe the automation profile's parent.lock: {exc}",
+                "If Firefox fails to start during upload, delete the file manually.",
             )
         )
     return issues
