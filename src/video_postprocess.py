@@ -73,7 +73,9 @@ def build_debrand_filter(
         steps.append(f"drawbox=x=0:y=ih-{strip}:w=iw:h={strip}:color=0x{color}:t=fill")
 
     steps += [
-        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase",
+        # lanczos matters here: NotebookLM shorts download at 406x720 and get
+        # upscaled ~2.7x to hit the 1080x1920 Shorts spec.
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos",
         f"crop={target_w}:{target_h}",
         f"fps={fps}",
         "setsar=1",
@@ -112,7 +114,7 @@ def build_finish_command(
                 "-af", AUDIO_NORMALIZE] + encode
 
     normalize_outro = (
-        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,"
         f"crop={target_w}:{target_h},fps={fps},setsar=1,format=yuv420p"
     )
     if outro_has_audio:
