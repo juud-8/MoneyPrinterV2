@@ -3,9 +3,9 @@
 manual review — this script NEVER uploads or posts anywhere.
 
 Flow: create notebook -> add sources / run research -> generate video overview
--> download MP4 into output/<brand_id>/notebooklm/<date>_<slug>/ alongside a
-NOTES.md with suggested titles and a finishing checklist (Canva pass to remove
-NotebookLM branding, add brand outro, manual upload).
+-> download MP4 into output/<brand_id>/notebooklm/<date>_<slug>/ -> auto-finish
+(strip NotebookLM watermark + append brand outro via video_postprocess) -> write
+NOTES.md with suggested titles and a review checklist (manual upload only).
 
 Requires the notebooklm CLI (unofficial notebooklm-py package):
     uv tool install "notebooklm-py[browser]"
@@ -28,6 +28,7 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
+import video_postprocess
 from archived_brands import is_brand_archived
 from brand_switcher import load_brand
 
@@ -81,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="seconds per phase (default: 1800; 3600 for cinematic)",
+    )
+    parser.add_argument(
+        "--no-finish",
+        action="store_true",
+        help="skip the automatic de-brand + outro pass (keep the raw download only)",
     )
     parser.add_argument("--cli", default="notebooklm", help="notebooklm executable")
     parser.add_argument(
@@ -224,6 +230,33 @@ def main(argv: list[str] | None = None) -> int:
         args.dry_run,
     )
 
+    final_path = None
+    if not args.no_finish and not args.dry_run:
+        print(" => Finishing: stripping NotebookLM branding + appending brand outro...")
+        production = brand.get("production", {})
+        outro = production.get("outro_clip")
+        if outro and not os.path.isabs(outro):
+            outro = os.path.join(ROOT, outro)
+        final_path = os.path.join(episode_dir, "final.mp4")
+        try:
+            finished = video_postprocess.run_finish(
+                video_path,
+                final_path,
+                crop_bottom_frac=production.get(
+                    "notebooklm_crop_bottom_frac",
+                    video_postprocess.DEFAULT_CROP_BOTTOM_FRAC,
+                ),
+                cover_color=brand.get("color_palette", {}).get("secondary", "#000000"),
+                outro_path=outro if outro and os.path.isfile(outro) else None,
+            )
+            print(
+                f"    final.mp4: {finished['width']}x{finished['height']}, "
+                f"{finished['duration']:.2f}s"
+            )
+        except RuntimeError as exc:
+            final_path = None
+            print(f"    (finish failed, raw download kept: {exc})")
+
     print(" => Asking notebook for title/description suggestions...")
     suggestions = ""
     try:
@@ -256,10 +289,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"- Generation prompt: {prompt}\n\n"
                 "## Title / description suggestions\n\n"
                 f"{suggestions or '(none — ask step failed)'}\n\n"
-                "## Finishing checklist (manual)\n\n"
-                "- [ ] Canva: remove NotebookLM watermark/branding\n"
-                "- [ ] Canva: add brand intro/outro + captions styling\n"
-                "- [ ] Upload manually; set the AI-disclosure toggle in Studio\n"
+                "## Review checklist (manual)\n\n"
+                + (
+                    "- [ ] QC final.mp4 (watermark fully gone? outro clean? "
+                    "re-run scripts/notebooklm_finish.py --inspect to recalibrate crop)\n"
+                    if final_path
+                    else "- [ ] Finish failed - run scripts/notebooklm_finish.py "
+                    "on the raw download (or Canva fallback)\n"
+                )
+                + "- [ ] Upload manually; set the AI-disclosure toggle in Studio\n"
                 "- [ ] Add episode to analytics tracker\n"
             )
         print(f"\nDone. Staged for review at:\n  {episode_dir}")
