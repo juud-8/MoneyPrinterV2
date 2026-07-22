@@ -228,13 +228,20 @@ def main(argv: list[str] | None = None) -> int:
         index = topics.index(topic) + 1
         print(f"\n[{index}/{len(topics)}] {topic}")
 
-        # Keepalive: Google rotates the session cookie every few hours; refreshing
-        # while it is still valid keeps a long batch alive. A failed refresh is
-        # non-fatal — the per-episode auth check below reports the real state.
-        subprocess.run(
-            ["notebooklm", "auth", "refresh", "--quiet"],
-            capture_output=True, timeout=120,
+        # Keepalive: Google rotates session cookies fast under heavy generation
+        # load. With a stored master token, re-minting cookies headlessly is
+        # authoritative; the cookie-refresh fallback covers profiles without
+        # one. A failed keepalive is non-fatal — the per-episode auth check
+        # reports the real state.
+        remint = subprocess.run(
+            ["notebooklm", "login", "--master-token-refresh"],
+            capture_output=True, timeout=180,
         )
+        if remint.returncode != 0:
+            subprocess.run(
+                ["notebooklm", "auth", "refresh", "--quiet"],
+                capture_output=True, timeout=120,
+            )
 
         try:
             if not rec.get("episode_dir") or not os.path.isdir(rec["episode_dir"]):
