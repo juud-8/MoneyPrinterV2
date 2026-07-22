@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import traceback
 
@@ -225,6 +226,14 @@ def main(argv: list[str] | None = None) -> int:
         processed += 1
         index = topics.index(topic) + 1
         print(f"\n[{index}/{len(topics)}] {topic}")
+
+        # Keepalive: Google rotates the session cookie every few hours; refreshing
+        # while it is still valid keeps a long batch alive. A failed refresh is
+        # non-fatal — the per-episode auth check below reports the real state.
+        subprocess.run(
+            ["notebooklm", "auth", "refresh", "--quiet"],
+            capture_output=True, timeout=120,
+        )
 
         try:
             if not rec.get("episode_dir") or not os.path.isdir(rec["episode_dir"]):
