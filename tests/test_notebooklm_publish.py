@@ -72,6 +72,22 @@ class PublishSlotTests(unittest.TestCase):
     def test_zero_count_returns_empty(self) -> None:
         self.assertEqual(pub.compute_publish_slots(0, "18:30", "UTC"), [])
 
+    def test_extend_continues_from_last_slot(self) -> None:
+        base = ["2026-07-21T22:30:00Z", "2026-07-22T22:30:00Z"]
+        extended = pub.extend_publish_slots(
+            base, 2, "18:30", "America/New_York", now=self.NOW
+        )
+        self.assertEqual(
+            extended, base + ["2026-07-23T22:30:00Z", "2026-07-24T22:30:00Z"]
+        )
+
+    def test_extend_from_empty_behaves_like_compute(self) -> None:
+        self.assertEqual(
+            pub.extend_publish_slots([], 1, "18:30", "America/New_York",
+                                     min_lead_hours=20, now=self.NOW),
+            ["2026-07-21T22:30:00Z"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

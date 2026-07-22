@@ -50,6 +50,7 @@ from content_funnel import build_description
 from notebooklm_publish import (
     build_metadata_prompt,
     compute_publish_slots,
+    extend_publish_slots,
     parse_llm_metadata,
     sanitize_description,
     sanitize_title,
@@ -272,6 +273,10 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             if not rec.get("publish_at"):
+                if state["next_slot"] >= len(state["slots"]):
+                    state["slots"] = extend_publish_slots(
+                        state["slots"], 7, slot_time, tz_name
+                    )
                 rec["publish_at"] = state["slots"][state["next_slot"]]
                 state["next_slot"] += 1
             url = upload_scheduled(final_path, title, description, brand, rec["publish_at"])

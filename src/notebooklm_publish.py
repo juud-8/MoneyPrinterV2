@@ -102,6 +102,29 @@ def compute_publish_slots(
     return slots
 
 
+def extend_publish_slots(
+    slots: list[str],
+    count: int,
+    slot_time: str,
+    tz_name: str,
+    min_lead_hours: float = 20.0,
+    now: datetime | None = None,
+) -> list[str]:
+    """Append ``count`` more daily slots after the last existing one, so a
+    rolling batch never runs out of publish dates."""
+    if not slots:
+        return compute_publish_slots(
+            count, slot_time, tz_name, min_lead_hours=min_lead_hours, now=now
+        )
+    last = datetime.strptime(slots[-1], "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    next_day = last.astimezone(ZoneInfo(tz_name)).date() + timedelta(days=1)
+    return slots + compute_publish_slots(
+        count, slot_time, tz_name, start_day=next_day, min_lead_hours=0, now=now
+    )
+
+
 def build_metadata_prompt(topic: str, suggestions: str, channel_tagline: str) -> str:
     """Prompt for the quality LLM to pick final upload metadata."""
     return (
