@@ -19,8 +19,9 @@ MPV2 (MoneyPrinter Version 2) is, as the name suggests, the second version of th
 
 ## Features
 
-- [x] Twitter Bot (with CRON Jobs => `scheduler`)
+- [x] Twitter/X Bot (with CRON Jobs => `scheduler`)
 - [x] YouTube Shorts Automator (with CRON Jobs => `scheduler`)
+- [x] TikTok + Instagram cross-posting of uploaded Shorts via [Post Bridge](docs/PostBridge.md)
 - [x] Affiliate Marketing (Amazon + Twitter)
 - [x] Find local businesses & cold outreach
 
@@ -67,6 +68,10 @@ python src/main.py
 
 All relevant documents can be found [here](docs/).
 
+- [Post Bridge cross-posting](docs/PostBridge.md) — optional TikTok/Instagram
+  distribution of successfully uploaded YouTube Shorts (confirmed working
+  end-to-end; includes `scripts/resolve_post_bridge_accounts.py` for one-shot
+  account-ID setup).
 - [Archive Song episodes](docs/ArchiveSong.md) — optional manual Suno handoff,
   factual packages, local audio validation, and resumable rendering.
 - [Voicebox local narration](docs/VOICEBOX_INTEGRATION.md) — optional,

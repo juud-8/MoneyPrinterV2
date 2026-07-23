@@ -2,6 +2,9 @@
 
 MoneyPrinterV2 can optionally hand off a successfully uploaded YouTube Short to [Post Bridge](https://post-bridge.com?atp=MoneyPrinter), which then publishes the same asset to connected TikTok and Instagram accounts.
 
+> **Status:** confirmed working end-to-end — connected-account resolution via the
+> Post Bridge API has been tested successfully against a live paid account.
+
 ## What Post Bridge Does
 
 Post Bridge is a publishing API for social platforms. In this integration, MoneyPrinterV2 uses it to:
@@ -41,6 +44,20 @@ MoneyPrinterV2 still owns video generation and the initial YouTube upload. Post 
 | `platforms` | `string[]` | `["tiktok", "instagram"]` when omitted | Platform filters used when looking up connected accounts. Unsupported values inside the list are ignored. |
 | `account_ids` | `number[]` | `[]` | Exact Post Bridge account IDs to post to. When provided, MoneyPrinterV2 uses these directly and skips account lookup. |
 | `auto_crosspost` | `boolean` | `false` | Automatically cross-post after a successful YouTube upload. |
+
+### Resolving `account_ids` automatically
+
+Instead of copying IDs by hand, run the one-time helper after connecting your
+accounts in the Post Bridge dashboard:
+
+```powershell
+.\venv\Scripts\python.exe scripts\resolve_post_bridge_accounts.py
+```
+
+It reads `post_bridge.api_key` from `config.json`, fetches the connected
+accounts for your configured `platforms`, prints them, and writes the matching
+`account_ids` back into `config.json`. With `account_ids` populated, both the
+interactive flow and cron skip account lookup entirely.
 
 ## How The Integration Works
 

@@ -129,6 +129,12 @@ In-app quick start mirroring this guide, plus the path to this file.
 6. After the upload is live: **Refresh YouTube metrics**.
 7. Check Overview / Performance; use **Review** weekly.
 
+When `post_bridge.enabled` (and `auto_crosspost`) are set in `config.json`, a
+successful YouTube upload is also cross-posted to connected TikTok/Instagram
+accounts, and the Twitter/X bot can run alongside via its own scheduler slot —
+see `docs/PostBridge.md`. Both are optional; the dashboard and pipeline work
+identically with neither configured.
+
 CLI equivalents are documented in `COMMANDS.md` (`run_brand_short.py`, `upload_brand_short.py`).
 
 ---
