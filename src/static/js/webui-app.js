@@ -302,6 +302,7 @@
   M.fetchHealth().catch(() => {});
   M.refreshJobs().catch(() => {});
   M.loadArchiveSongs().catch(() => {});
+  M.loadCrossPlatform().catch(() => {});
   M.jobsLoop();
   setInterval(() => {
     if (!state.logSource) M.pollLog();
@@ -313,6 +314,7 @@
     }
   }, 45000);
   setInterval(() => M.fetchHealth().catch(() => {}), 90000);
+  setInterval(() => M.loadCrossPlatform().catch(() => {}), 120000);
   setInterval(renderSyncLabel, 5000);
   setInterval(() => {
     if (!document.hidden && (state.overviewCache || state.opsCache)) M.renderOpsBrief();
