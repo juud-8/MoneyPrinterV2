@@ -3,9 +3,9 @@
 manual review — this script NEVER uploads or posts anywhere.
 
 Flow: create notebook -> add sources / run research -> generate video overview
--> download MP4 into output/<brand_id>/notebooklm/<date>_<slug>/ alongside a
-NOTES.md with suggested titles and a finishing checklist (Canva pass to remove
-NotebookLM branding, add brand outro, manual upload).
+-> download MP4 into output/<brand_id>/notebooklm/<date>_<slug>/ -> auto-finish
+(strip NotebookLM watermark + append brand outro via video_postprocess) -> write
+NOTES.md with suggested titles and a review checklist (manual upload only).
 
 Requires the notebooklm CLI (unofficial notebooklm-py package):
     uv tool install "notebooklm-py[browser]"
@@ -28,6 +28,7 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
+import video_postprocess
 from archived_brands import is_brand_archived
 from brand_switcher import load_brand
 
@@ -82,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="seconds per phase (default: 1800; 3600 for cinematic)",
     )
+    parser.add_argument(
+        "--no-finish",
+        action="store_true",
+        help="skip the automatic de-brand + outro pass (keep the raw download only)",
+    )
     parser.add_argument("--cli", default="notebooklm", help="notebooklm executable")
     parser.add_argument(
         "--dry-run",
@@ -125,6 +131,15 @@ def slugify(text: str) -> str:
     return slug[:60] or "episode"
 
 
+def episode_dir_for(brand_id: str, topic: str, day: datetime.date | None = None) -> str:
+    """Staging directory for one episode — shared with the batch runner so
+    both sides agree on where a topic's artifacts live."""
+    stamp = (day or datetime.date.today()).isoformat()
+    return os.path.join(
+        ROOT, "output", brand_id, "notebooklm", f"{stamp}_{slugify(topic)}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -156,13 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         or DEFAULT_PROMPT
     )
 
-    episode_dir = os.path.join(
-        ROOT,
-        "output",
-        args.brand_id,
-        "notebooklm",
-        f"{datetime.date.today().isoformat()}_{slugify(args.topic)}",
-    )
+    episode_dir = episode_dir_for(args.brand_id, args.topic)
     video_path = os.path.join(episode_dir, "notebooklm_short.mp4")
 
     print(f"NotebookLM short for '{args.topic}' [{args.brand_id}] - review-only, no upload.")
@@ -224,6 +233,33 @@ def main(argv: list[str] | None = None) -> int:
         args.dry_run,
     )
 
+    final_path = None
+    if not args.no_finish and not args.dry_run:
+        print(" => Finishing: stripping NotebookLM branding + appending brand outro...")
+        production = brand.get("production", {})
+        outro = production.get("outro_clip")
+        if outro and not os.path.isabs(outro):
+            outro = os.path.join(ROOT, outro)
+        final_path = os.path.join(episode_dir, "final.mp4")
+        try:
+            finished = video_postprocess.run_finish(
+                video_path,
+                final_path,
+                crop_bottom_frac=production.get(
+                    "notebooklm_crop_bottom_frac",
+                    video_postprocess.DEFAULT_CROP_BOTTOM_FRAC,
+                ),
+                cover_color=brand.get("color_palette", {}).get("secondary", "#000000"),
+                outro_path=outro if outro and os.path.isfile(outro) else None,
+            )
+            print(
+                f"    final.mp4: {finished['width']}x{finished['height']}, "
+                f"{finished['duration']:.2f}s"
+            )
+        except RuntimeError as exc:
+            final_path = None
+            print(f"    (finish failed, raw download kept: {exc})")
+
     print(" => Asking notebook for title/description suggestions...")
     suggestions = ""
     try:
@@ -245,6 +281,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    (suggestions failed, continuing: {exc})")
 
     if not args.dry_run:
+        with open(os.path.join(episode_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "topic": args.topic,
+                    "brand_id": args.brand_id,
+                    "notebook_id": notebook_id,
+                    "format": args.video_format,
+                    "prompt": prompt,
+                    "suggestions": suggestions,
+                    "final_path": final_path,
+                    "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+                },
+                f,
+                indent=2,
+            )
         notes_path = os.path.join(episode_dir, "NOTES.md")
         with open(notes_path, "w", encoding="utf-8") as f:
             f.write(
@@ -256,10 +307,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"- Generation prompt: {prompt}\n\n"
                 "## Title / description suggestions\n\n"
                 f"{suggestions or '(none — ask step failed)'}\n\n"
-                "## Finishing checklist (manual)\n\n"
-                "- [ ] Canva: remove NotebookLM watermark/branding\n"
-                "- [ ] Canva: add brand intro/outro + captions styling\n"
-                "- [ ] Upload manually; set the AI-disclosure toggle in Studio\n"
+                "## Review checklist (manual)\n\n"
+                + (
+                    "- [ ] QC final.mp4 (watermark fully gone? outro clean? "
+                    "re-run scripts/notebooklm_finish.py --inspect to recalibrate crop)\n"
+                    if final_path
+                    else "- [ ] Finish failed - run scripts/notebooklm_finish.py "
+                    "on the raw download (or Canva fallback)\n"
+                )
+                + "- [ ] Upload manually; set the AI-disclosure toggle in Studio\n"
                 "- [ ] Add episode to analytics tracker\n"
             )
         print(f"\nDone. Staged for review at:\n  {episode_dir}")
