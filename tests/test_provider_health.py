@@ -27,6 +27,27 @@ class ProviderHealthTests(unittest.TestCase):
             issues = provider_health.check_songs_library(temp_dir, min_tracks=15)
             self.assertTrue(any(issue.level == "fail" for issue in issues))
 
+    def test_check_firefox_profile_lock_passes_and_removes_stale_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as profile_dir:
+            lock_path = os.path.join(profile_dir, "parent.lock")
+            open(lock_path, "wb").close()
+            issues = provider_health.check_firefox_profile_lock(profile_dir)
+            self.assertEqual(issues, [])
+            self.assertFalse(os.path.exists(lock_path))
+
+    def test_check_firefox_profile_lock_fails_when_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as profile_dir:
+            lock_path = os.path.join(profile_dir, "parent.lock")
+            open(lock_path, "wb").close()
+            with patch.object(provider_health.os, "remove", side_effect=PermissionError):
+                issues = provider_health.check_firefox_profile_lock(profile_dir)
+            self.assertTrue(any(issue.level == "fail" for issue in issues))
+
+    def test_check_firefox_profile_lock_passes_without_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory() as profile_dir:
+            issues = provider_health.check_firefox_profile_lock(profile_dir)
+            self.assertEqual(issues, [])
+
     def test_assert_pilot_providers_ready_raises_on_low_elevenlabs(self) -> None:
         brand = {
             "brand_id": "the_strange_archive",

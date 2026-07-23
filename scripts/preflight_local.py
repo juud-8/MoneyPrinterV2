@@ -347,14 +347,25 @@ def main() -> int:
                 if profile_path and os.path.isdir(profile_path):
                     lock_path = os.path.join(profile_path, "parent.lock")
                     if os.path.isfile(lock_path):
-                        warn(
-                            f"{b['channel_name']} ({b['brand_id']}): a Firefox "
-                            "'parent.lock' file is present in its profile.",
-                            "Firefox may currently be open with this profile — "
-                            "close all Firefox windows using it before running "
-                            "an automated upload, or the run will fail with a "
-                            "WebDriverException.",
-                        )
+                        # parent.lock persists after Firefox exits on Windows;
+                        # the lock is the held file handle. Probe with an
+                        # exclusive-ish open: a running Firefox holds the file
+                        # with no sharing, so open() raises PermissionError.
+                        # A stale leftover opens fine and is harmless.
+                        try:
+                            with open(lock_path, "a"):
+                                pass
+                        except PermissionError:
+                            warn(
+                                f"{b['channel_name']} ({b['brand_id']}): Firefox "
+                                "is currently running with this profile "
+                                "(parent.lock is held open).",
+                                "Close all Firefox windows using it before "
+                                "running an automated upload, or the run will "
+                                "fail with a WebDriverException.",
+                            )
+                        except OSError:
+                            pass
         else:
             ok("Skipping Windows-specific Firefox profile-lock checks (non-Windows OS)")
 
