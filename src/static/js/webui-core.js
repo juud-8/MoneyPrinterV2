@@ -9,6 +9,7 @@
     jobsCache: [],
     alertsCache: [],
     archiveSongs: [],
+    crossPlatformCache: null,
     weeklyCache: null,
     selectedJob: null,
     logOffset: 0,

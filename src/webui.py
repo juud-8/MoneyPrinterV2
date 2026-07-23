@@ -68,6 +68,69 @@ def _read_config() -> dict:
         return {}
 
 
+def _post_bridge_status(config: dict) -> dict:
+    """Sanitized post_bridge block for status displays. Never raises."""
+    pb = config.get("post_bridge")
+    if not isinstance(pb, dict):
+        pb = {}
+    api_key = str(pb.get("api_key", "") or "").strip() or os.environ.get(
+        "POST_BRIDGE_API_KEY", ""
+    ).strip()
+    platforms = pb.get("platforms")
+    if not isinstance(platforms, list):
+        platforms = ["tiktok", "instagram"] if platforms is None else []
+    account_ids = pb.get("account_ids")
+    return {
+        "enabled": bool(pb.get("enabled", False)),
+        "auto_crosspost": bool(pb.get("auto_crosspost", False)),
+        "api_key_present": bool(api_key),
+        "platforms": [str(p).strip().lower() for p in platforms],
+        "account_ids_count": len(account_ids) if isinstance(account_ids, list) else 0,
+    }
+
+
+def _twitter_status() -> dict:
+    """Twitter/X bot wiring from .mp/twitter.json + config. Never raises."""
+    accounts = []
+    path = os.path.join(ROOT_DIR, ".mp", "twitter.json")
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw = data.get("accounts") if isinstance(data, dict) else None
+            if isinstance(raw, list):
+                accounts = [a for a in raw if isinstance(a, dict)]
+        except (OSError, json.JSONDecodeError):
+            accounts = []
+    profiles_ok = 0
+    for account in accounts:
+        profile = str(account.get("firefox_profile", "") or "")
+        if profile and os.path.isdir(profile):
+            profiles_ok += 1
+    return {
+        "configured": bool(accounts),
+        "accounts": len(accounts),
+        "profiles_ok": profiles_ok,
+    }
+
+
+@app.get("/api/crossplatform")
+def api_crossplatform():
+    """Cross-platform distribution status for the Command Deck card.
+
+    Everything here is optional wiring — the payload degrades to
+    disabled/zero states rather than erroring when config.json or
+    .mp/twitter.json are missing or partial.
+    """
+    config = _read_config()
+    return jsonify(
+        {
+            "post_bridge": _post_bridge_status(config),
+            "twitter": _twitter_status(),
+        }
+    )
+
+
 def _check_ollama(base_url: str) -> dict:
     # Two attempts: a busy Ollama (mid-generation) can miss a short timeout,
     # and one flaky probe shouldn't paint the whole panel CRITICAL.
@@ -98,7 +161,10 @@ def _build_health() -> dict:
         "fish_audio": key_present("fish_audio_api_key", "FISH_AUDIO_API_KEY"),
         "elevenlabs": key_present("elevenlabs_api_key", "ELEVENLABS_API_KEY"),
         "fal": key_present("fal_api_key", "FAL_KEY"),
-        "post_bridge": key_present("post_bridge_api_key", "POST_BRIDGE_API_KEY"),
+        # post_bridge lives in a nested block, not a flat key — the flat
+        # lookup is kept only as a legacy fallback.
+        "post_bridge": bool(_post_bridge_status(config)["api_key_present"])
+        or key_present("post_bridge_api_key", "POST_BRIDGE_API_KEY"),
     }
 
     imagemagick = str(config.get("imagemagick_path", "") or "")

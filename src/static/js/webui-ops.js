@@ -543,6 +543,61 @@
         .join("");
   }
 
+  function xpRow(label, stateCls, stateText, detail) {
+    return `
+      <div class="xp-row">
+        <span class="xp-dot ${stateCls}"></span>
+        <span class="xp-name">${esc(label)}</span>
+        ${detail ? `<span class="muted small xp-detail">${esc(detail)}</span>` : ""}
+        <span class="xp-state ${stateCls}">${esc(stateText)}</span>
+      </div>`;
+  }
+
+  function renderCrossPlatform() {
+    const el = $("ops-distribution");
+    if (!el) return;
+    const xp = state.crossPlatformCache;
+    if (!xp) {
+      el.innerHTML = `<div class="muted small">Distribution status unavailable.</div>`;
+      return;
+    }
+    const pb = xp.post_bridge || {};
+    const tw = xp.twitter || {};
+    const rows = [];
+
+    rows.push(xpRow("YouTube", "on", "primary", "Selenium / API upload"));
+
+    if (tw.configured) {
+      const profNote = tw.profiles_ok < tw.accounts ? `${tw.profiles_ok}/${tw.accounts} profiles resolve` : `${tw.accounts} account${tw.accounts === 1 ? "" : "s"}`;
+      rows.push(xpRow("X / Twitter bot", tw.profiles_ok > 0 ? "on" : "warn", tw.profiles_ok > 0 ? "wired" : "profile?", profNote));
+    } else {
+      rows.push(xpRow("X / Twitter bot", "off", "not set up", "add account via main menu"));
+    }
+
+    const pbReady = pb.enabled && pb.api_key_present;
+    const platforms = (pb.platforms || []).length ? pb.platforms.join(" + ") : "tiktok + instagram";
+    if (pbReady) {
+      const mode = pb.auto_crosspost ? "auto" : "manual";
+      const ids = pb.account_ids_count ? `${pb.account_ids_count} account id${pb.account_ids_count === 1 ? "" : "s"} pinned` : "ids resolved per run";
+      rows.push(xpRow(`Post Bridge → ${platforms}`, "on", mode, ids));
+    } else if (pb.enabled) {
+      rows.push(xpRow(`Post Bridge → ${platforms}`, "warn", "no API key", "set post_bridge.api_key"));
+    } else {
+      rows.push(xpRow("Post Bridge cross-post", "off", "disabled", "optional — docs/PostBridge.md"));
+    }
+
+    el.innerHTML = rows.join("");
+  }
+
+  async function loadCrossPlatform() {
+    try {
+      state.crossPlatformCache = await api("/api/crossplatform");
+    } catch (e) {
+      state.crossPlatformCache = null;
+    }
+    renderCrossPlatform();
+  }
+
   async function loadArchiveSongs() {
     try {
       state.archiveSongs = await api("/api/archive-songs");
@@ -610,6 +665,8 @@
     renderDeckCtas,
     renderReviewBay,
     renderSongBay,
+    renderCrossPlatform,
+    loadCrossPlatform,
     loadArchiveSongs,
     runPreflight,
     loadWeekly,
