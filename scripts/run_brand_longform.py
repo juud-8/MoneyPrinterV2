@@ -14,9 +14,34 @@ from classes.Tts import TTS
 from classes.YouTube import YouTube
 
 
+def build_theme_preset(niche: str) -> dict | None:
+    """Themed compilation subject from the back catalogue (see longform_theme)."""
+    import json
+
+    from longform_theme import build_theme_subject
+
+    analytics_path = os.path.join(ROOT, ".mp", "analytics.json")
+    if not os.path.isfile(analytics_path):
+        print("ERROR: .mp/analytics.json not found — cannot build a theme")
+        return None
+    with open(analytics_path, encoding="utf-8") as handle:
+        analytics = json.load(handle)
+    used = {
+        str(entry.get("longform_theme") or "")
+        for entry in (analytics.get("videos") or [])
+        if isinstance(entry, dict) and entry.get("longform_theme")
+    }
+    niche_key = "history" if "history" in (niche or "").lower() else (niche or "").split()[0]
+    return build_theme_subject(analytics, niche_key, used_themes=used)
+
+
 def main():
     brand_id = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "the_strange_archive"
     do_upload = "--upload" in sys.argv
+    # The shorts topic generator hunts for one novel incident and saturates once
+    # the niche is well covered. --theme instead compiles already-researched
+    # episodes into a chaptered subject, fed in as a preset topic.
+    use_theme = "--theme" in sys.argv
 
     model = get_ollama_model()
     if not model:
@@ -50,6 +75,18 @@ def main():
         account["niche"],
         account["language"],
     )
+    if use_theme:
+        theme = build_theme_preset(account["niche"])
+        if not theme:
+            print("ERROR: no unused theme with enough published episodes yet")
+            sys.exit(1)
+        print(f"Theme: {theme['theme']} ({len(theme['chapters'])} chapters)")
+        for index, chapter in enumerate(theme["chapters"], 1):
+            print(f"  {index}. {chapter}")
+        # Preset subject: skips topic generation and the duplicate guard, but
+        # generate_research() still runs, so the material stays grounded.
+        youtube.subject = theme["subject"]
+
     tts = TTS()
     path = youtube.generate_longform_video(tts, interactive=False)
 
