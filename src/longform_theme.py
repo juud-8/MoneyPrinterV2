@@ -83,6 +83,13 @@ def rank_clusters(clusters: dict[str, list[dict]], used_themes: set[str] | None 
     return [(word, members) for word, members, _ in ranked]
 
 
+def fallback_theme_title(theme: dict) -> str:
+    """Deterministic title when the LLM is unavailable or returns nonsense."""
+    word = str(theme.get("theme") or "history").strip()
+    count = len(theme.get("chapters") or []) or MIN_CLUSTER
+    return f"{count} True Cases From the Archive: {word.title()}"
+
+
 def build_theme_subject(
     analytics: dict,
     niche_contains: str,

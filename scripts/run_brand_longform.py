@@ -35,6 +35,30 @@ def build_theme_preset(niche: str) -> dict | None:
     return build_theme_subject(analytics, niche_key, used_themes=used)
 
 
+def build_theme_title(theme: dict) -> str:
+    """A title describing the whole compilation, not one of its chapters."""
+    from llm_provider import generate_text
+    from longform_theme import fallback_theme_title
+
+    chapters = "\n".join(f"- {title}" for title in theme["chapters"])
+    prompt = (
+        f"Write ONE YouTube title for a documentary compilation episode.\n"
+        f"It covers {len(theme['chapters'])} separate true historical cases "
+        f"linked by the theme '{theme['theme']}':\n{chapters}\n\n"
+        "Rules: describe the COLLECTION, never a single case. Include the number "
+        f"{len(theme['chapters'])}. Under 70 characters. No quotes, no emoji, no "
+        "hashtags, no clickbait punctuation. Output only the title."
+    )
+    try:
+        title = (generate_text(prompt, quality=True) or "").strip().strip('"').splitlines()[0]
+    except Exception as error:  # noqa: BLE001 - a title must never fail the run
+        print(f"  WARN: theme title generation failed ({error}); using fallback")
+        return fallback_theme_title(theme)
+    if not title or len(title) > 100:
+        return fallback_theme_title(theme)
+    return title
+
+
 def main():
     brand_id = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "the_strange_archive"
     do_upload = "--upload" in sys.argv
@@ -86,6 +110,13 @@ def main():
         # Preset subject: skips topic generation and the duplicate guard, but
         # generate_research() still runs, so the material stays grounded.
         youtube.subject = theme["subject"]
+        # Without this the title generator names the episode after whichever
+        # single chapter it liked best, which both misdescribes a compilation
+        # and collides with the short that chapter came from.
+        title = build_theme_title(theme)
+        if title:
+            youtube.preset_title = title
+            print(f"Title: {title}")
 
     tts = TTS()
     path = youtube.generate_longform_video(tts, interactive=False)
