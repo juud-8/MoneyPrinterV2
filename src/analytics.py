@@ -159,36 +159,41 @@ def log_video(
     experiment: dict | None = None,
     research: dict | None = None,
     production: dict | None = None,
+    longform_theme: str = "",
 ) -> None:
     """Log a published or generated video for later weekly review."""
     data = _load()
-    data["videos"].append(
-        {
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "title": title,
-            "format": format_type,
-            "niche": niche,
-            "subject": subject,
-            "video_path": video_path,
-            "url": url,
-            "brand_id": brand_id,
-            "status": status,
-            "views": None,
-            "engaged_views": None,
-            "ctr": None,
-            "avg_view_duration": None,
-            "avg_view_pct": None,
-            "subscribers_gained": None,
-            "subscribers_lost": None,
-            "shares": None,
-            "rpm": None,
-            "affiliate_clicks": None,
-            "experiment": dict(experiment or {}),
-            "research": dict(research or {}),
-            "production": dict(production or {}),
-            "notes": "",
-        }
-    )
+    entry = {
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "title": title,
+        "format": format_type,
+        "niche": niche,
+        "subject": subject,
+        "video_path": video_path,
+        "url": url,
+        "brand_id": brand_id,
+        "status": status,
+        "views": None,
+        "engaged_views": None,
+        "ctr": None,
+        "avg_view_duration": None,
+        "avg_view_pct": None,
+        "subscribers_gained": None,
+        "subscribers_lost": None,
+        "shares": None,
+        "rpm": None,
+        "affiliate_clicks": None,
+        "experiment": dict(experiment or {}),
+        "research": dict(research or {}),
+        "production": dict(production or {}),
+        "notes": "",
+    }
+    # Only themed long-form compilations carry this. It is what stops the next
+    # --theme run from rebuilding the same cluster, so it has to survive on the
+    # row; keeping it off every other entry avoids writing a dead field 3x/day.
+    if longform_theme:
+        entry["longform_theme"] = longform_theme
+    data["videos"].append(entry)
     _save(data)
 
 

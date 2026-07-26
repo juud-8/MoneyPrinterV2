@@ -110,6 +110,10 @@ def main():
         # Preset subject: skips topic generation and the duplicate guard, but
         # generate_research() still runs, so the material stays grounded.
         youtube.subject = theme["subject"]
+        # Recorded on the analytics row so build_theme_preset() can exclude this
+        # cluster next time. Without it every --theme run re-picks the same
+        # top-ranked theme and rebuilds the compilation it just made.
+        youtube.longform_theme = theme["theme"]
         # Without this the title generator names the episode after whichever
         # single chapter it liked best, which both misdescribes a compilation
         # and collides with the short that chapter came from.

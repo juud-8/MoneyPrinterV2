@@ -298,6 +298,45 @@ class AnalyticsDashboardTests(unittest.TestCase):
         self.assertIn("engaged_views", entry)
         self.assertIn("subscribers_gained", entry)
 
+    def test_log_video_records_longform_theme_when_given(self) -> None:
+        analytics.log_video(
+            title="6 True Cases From the Archive: Presidents",
+            format_type="longform",
+            niche="history",
+            longform_theme="president",
+        )
+        entry = analytics._load()["videos"][0]
+        self.assertEqual(entry["longform_theme"], "president")
+
+    def test_log_video_omits_longform_theme_for_unthemed_videos(self) -> None:
+        analytics.log_video(title="A short", format_type="short", niche="history")
+        self.assertNotIn("longform_theme", analytics._load()["videos"][0])
+
+    def test_longform_theme_survives_dedupe(self) -> None:
+        """The generate row carries the theme; the upload row is the canonical
+        one after dedupe. Both must keep it or the used-theme guard goes blind.
+        """
+        analytics.log_video(
+            title="6 True Cases From the Archive: Presidents",
+            format_type="longform",
+            niche="history",
+            brand_id="alpha",
+            status="generated",
+            longform_theme="president",
+        )
+        analytics.log_video(
+            title="6 True Cases From the Archive: Presidents",
+            format_type="longform",
+            niche="history",
+            brand_id="alpha",
+            url="https://youtu.be/abc123",
+            status="uploaded",
+            longform_theme="president",
+        )
+        merged = analytics.dedupe_videos()
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["longform_theme"], "president")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -83,6 +83,46 @@ class ThemeSelectionTests(unittest.TestCase):
         second = longform_theme.build_theme_subject(analytics, "history", used_themes={first["theme"]})
         self.assertNotEqual(first["theme"], second["theme"])
 
+    def test_recorded_theme_from_a_previous_run_is_excluded(self):
+        """End-to-end guard: a theme logged onto an analytics row by a previous
+        --theme run must not be offered again. This is the pairing that broke —
+        build_theme_preset() reads `longform_theme` off the entries, so if
+        log_video() ever stops writing it, every run rebuilds the same episode.
+        """
+        videos = [
+            episode("President One", views=10),
+            episode("President Two", views=10),
+            episode("President Three", views=10),
+            episode("Rabbits Attack Napoleon", views=90),
+            episode("Rabbits Beat an Emperor", views=90),
+            episode("Rabbits Overwhelm a Hunt", views=90),
+        ]
+        analytics = {"videos": videos}
+        first = longform_theme.build_theme_subject(analytics, "history")
+
+        # Simulate what log_video() now persists for the episode just built.
+        videos.append({
+            "title": f"3 True Cases: {first['theme']}",
+            "niche": "weird but true history",
+            "format": "longform",
+            "url": "https://youtu.be/compilation1",
+            "views": 5,
+            "date": "2026-07-26",
+            "longform_theme": first["theme"],
+        })
+
+        # The same read build_theme_preset() performs in run_brand_longform.py.
+        used = {
+            str(entry.get("longform_theme") or "")
+            for entry in analytics["videos"]
+            if isinstance(entry, dict) and entry.get("longform_theme")
+        }
+        self.assertEqual(used, {first["theme"]})
+
+        second = longform_theme.build_theme_subject(analytics, "history", used_themes=used)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second["theme"], first["theme"])
+
     def test_channel_furniture_words_do_not_become_themes(self):
         analytics = {"videos": [
             episode("Weird History Facts One"),

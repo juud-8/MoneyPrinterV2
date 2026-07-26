@@ -2149,6 +2149,7 @@ Return ONLY the prompt sentence.""",
             experiment=self._build_experiment_metadata(),
             research=self._research_metadata(),
             production=self.production_metadata,
+            longform_theme=getattr(self, "longform_theme", ""),
         )
         return self.output_video_path
 
@@ -2273,6 +2274,7 @@ Return ONLY the prompt sentence.""",
             experiment=self._build_experiment_metadata(),
             research=self._research_metadata(),
             production=self.production_metadata,
+            longform_theme=getattr(self, "longform_theme", ""),
         )
         return path
 
@@ -2831,6 +2833,7 @@ Return ONLY the prompt sentence.""",
                 experiment=self._build_experiment_metadata(),
                 research=self._research_metadata(),
                 production=self.production_metadata,
+                longform_theme=getattr(self, "longform_theme", ""),
             )
 
             if verbose:
@@ -2911,6 +2914,7 @@ Return ONLY the prompt sentence.""",
                 experiment=self._build_experiment_metadata(),
                 research=self._research_metadata(),
                 production=self.production_metadata,
+                longform_theme=getattr(self, "longform_theme", ""),
             )
 
             if get_verbose():
