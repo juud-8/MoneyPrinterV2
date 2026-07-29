@@ -14,9 +14,58 @@ from classes.Tts import TTS
 from classes.YouTube import YouTube
 
 
+def build_theme_preset(niche: str) -> dict | None:
+    """Themed compilation subject from the back catalogue (see longform_theme)."""
+    import json
+
+    from longform_theme import build_theme_subject
+
+    analytics_path = os.path.join(ROOT, ".mp", "analytics.json")
+    if not os.path.isfile(analytics_path):
+        print("ERROR: .mp/analytics.json not found — cannot build a theme")
+        return None
+    with open(analytics_path, encoding="utf-8") as handle:
+        analytics = json.load(handle)
+    used = {
+        str(entry.get("longform_theme") or "")
+        for entry in (analytics.get("videos") or [])
+        if isinstance(entry, dict) and entry.get("longform_theme")
+    }
+    niche_key = "history" if "history" in (niche or "").lower() else (niche or "").split()[0]
+    return build_theme_subject(analytics, niche_key, used_themes=used)
+
+
+def build_theme_title(theme: dict) -> str:
+    """A title describing the whole compilation, not one of its chapters."""
+    from llm_provider import generate_text
+    from longform_theme import fallback_theme_title
+
+    chapters = "\n".join(f"- {title}" for title in theme["chapters"])
+    prompt = (
+        f"Write ONE YouTube title for a documentary compilation episode.\n"
+        f"It covers {len(theme['chapters'])} separate true historical cases "
+        f"linked by the theme '{theme['theme']}':\n{chapters}\n\n"
+        "Rules: describe the COLLECTION, never a single case. Include the number "
+        f"{len(theme['chapters'])}. Under 70 characters. No quotes, no emoji, no "
+        "hashtags, no clickbait punctuation. Output only the title."
+    )
+    try:
+        title = (generate_text(prompt, quality=True) or "").strip().strip('"').splitlines()[0]
+    except Exception as error:  # noqa: BLE001 - a title must never fail the run
+        print(f"  WARN: theme title generation failed ({error}); using fallback")
+        return fallback_theme_title(theme)
+    if not title or len(title) > 100:
+        return fallback_theme_title(theme)
+    return title
+
+
 def main():
     brand_id = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "the_strange_archive"
     do_upload = "--upload" in sys.argv
+    # The shorts topic generator hunts for one novel incident and saturates once
+    # the niche is well covered. --theme instead compiles already-researched
+    # episodes into a chaptered subject, fed in as a preset topic.
+    use_theme = "--theme" in sys.argv
 
     model = get_ollama_model()
     if not model:
@@ -50,6 +99,29 @@ def main():
         account["niche"],
         account["language"],
     )
+    if use_theme:
+        theme = build_theme_preset(account["niche"])
+        if not theme:
+            print("ERROR: no unused theme with enough published episodes yet")
+            sys.exit(1)
+        print(f"Theme: {theme['theme']} ({len(theme['chapters'])} chapters)")
+        for index, chapter in enumerate(theme["chapters"], 1):
+            print(f"  {index}. {chapter}")
+        # Preset subject: skips topic generation and the duplicate guard, but
+        # generate_research() still runs, so the material stays grounded.
+        youtube.subject = theme["subject"]
+        # Recorded on the analytics row so build_theme_preset() can exclude this
+        # cluster next time. Without it every --theme run re-picks the same
+        # top-ranked theme and rebuilds the compilation it just made.
+        youtube.longform_theme = theme["theme"]
+        # Without this the title generator names the episode after whichever
+        # single chapter it liked best, which both misdescribes a compilation
+        # and collides with the short that chapter came from.
+        title = build_theme_title(theme)
+        if title:
+            youtube.preset_title = title
+            print(f"Title: {title}")
+
     tts = TTS()
     path = youtube.generate_longform_video(tts, interactive=False)
 

@@ -32,3 +32,6 @@ outreach_message.html
 # Google OAuth client secrets for YouTube API upload
 secrets/
 i-have-adhd/
+
+# MoviePy scratch files that can land in the repo root during a render
+*TEMP_MPY_*
