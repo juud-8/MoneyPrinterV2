@@ -12,8 +12,36 @@ SRC_DIR = os.path.join(ROOT_DIR, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+import post_bridge_integration
+from post_bridge_integration import build_platform_configurations
 from post_bridge_integration import maybe_crosspost_youtube_short
 from post_bridge_integration import resolve_social_account_ids
+
+
+class BuildPlatformConfigurationsTests(unittest.TestCase):
+    def test_instagram_always_gets_a_cover_past_the_opening_fade(self) -> None:
+        """Reels default their cover to frame 0, which is mid-fade here."""
+        config = build_platform_configurations("A title")
+        self.assertEqual(
+            config["instagram"]["video_cover_timestamp_ms"],
+            post_bridge_integration.INSTAGRAM_COVER_TIMESTAMP_MS,
+        )
+        self.assertGreater(config["instagram"]["video_cover_timestamp_ms"], 0)
+
+    def test_no_placement_key_is_sent_for_instagram(self) -> None:
+        """Post Bridge's only placement value is "story"; omitting it yields a
+        Reel. Sending anything else would make the post a Story by accident."""
+        self.assertNotIn("placement", build_platform_configurations("A title")["instagram"])
+
+    def test_blank_title_still_configures_instagram_but_omits_tiktok(self) -> None:
+        config = build_platform_configurations("   ")
+        self.assertIn("instagram", config)
+        self.assertNotIn("tiktok", config)
+
+    def test_tiktok_title_is_passed_through_trimmed(self) -> None:
+        self.assertEqual(
+            build_platform_configurations("  My title  ")["tiktok"], {"title": "My title"}
+        )
 
 
 class PostBridgeIntegrationTests(unittest.TestCase):
@@ -110,7 +138,14 @@ class PostBridgeIntegrationTests(unittest.TestCase):
             caption="My title",
             social_account_ids=[12, 34],
             media_ids=["media-123"],
-            platform_configurations={"tiktok": {"title": "My title"}},
+            platform_configurations={
+                "instagram": {
+                    "video_cover_timestamp_ms": (
+                        post_bridge_integration.INSTAGRAM_COVER_TIMESTAMP_MS
+                    )
+                },
+                "tiktok": {"title": "My title"},
+            },
         )
 
     @patch("post_bridge_integration.PostBridge")
@@ -144,7 +179,14 @@ class PostBridgeIntegrationTests(unittest.TestCase):
             caption="My title",
             social_account_ids=[12, 34],
             media_ids=["media-123"],
-            platform_configurations={"tiktok": {"title": "My title"}},
+            platform_configurations={
+                "instagram": {
+                    "video_cover_timestamp_ms": (
+                        post_bridge_integration.INSTAGRAM_COVER_TIMESTAMP_MS
+                    )
+                },
+                "tiktok": {"title": "My title"},
+            },
         )
 
 
