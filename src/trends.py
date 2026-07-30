@@ -77,6 +77,7 @@ def _settings(manifest: dict[str, Any], name: str) -> ProviderSettings:
     return ProviderSettings(
         enabled=bool(raw.get("enabled", False)),
         timeout_seconds=float(raw.get("timeout_seconds", 12)),
+        min_request_interval_seconds=max(0.0, float(raw.get("min_request_interval_seconds", 0))),
         cache_ttl_minutes=max(0, int(raw.get("cache_ttl_minutes", 180))),
         daily_cost_limit_usd=max(0.0, float(raw.get("daily_cost_limit_usd", 0))),
         monthly_cost_limit_usd=max(0.0, float(raw.get("monthly_cost_limit_usd", 0))),
@@ -139,15 +140,31 @@ def _collect(args, store: TrendStore) -> int:
 
     for signal in signals:
         store.save_signal(signal)
+    reference_now = args.now or utc_now()
     clusters = cluster_signals(
-        signals, now=args.now or utc_now(), brand_id=args.brand,
+        signals, now=reference_now, brand_id=args.brand,
         collection_horizon_hours=args.window_hours,
     ) if signals else []
+    notes = []
+    if signals and not clusters:
+        # Clustering drops expired signals, so a stale fixture yields signals
+        # and no clusters with nothing on screen explaining the gap.
+        expired = sum(
+            1 for signal in signals
+            if signal.expires_at and signal.expires_at <= reference_now
+        )
+        if expired:
+            notes.append(
+                f"{expired} of {len(signals)} signal(s) had already expired at {reference_now} "
+                "and cannot cluster. Collect fresh signals, or pass --now inside their validity "
+                "window when replaying a fixture."
+            )
     for cluster in clusters:
         store.save_cluster(cluster)
     _print_json(
         {
             "dry_run": not args.live,
+            "notes": notes,
             "signals_saved": len(signals),
             "clusters_saved": len(clusters),
             "clusters": [
