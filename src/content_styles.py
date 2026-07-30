@@ -316,7 +316,17 @@ CONTENT_STYLES: dict[str, ContentStyle] = {
         # Generate a few candidate topics/titles and keep the highest-scored
         # one (see topic_scoring.py) — favors specificity, numbers, and
         # absurd contrast over the first draft the LLM happens to produce.
-        "topic_candidate_count": 3,
+        # Bumped 3->5 (2026-07-22): at this channel's actual velocity
+        # (45 uploads in 20 days), the 30-day recent_topic_days fallback in
+        # content_strategy.recent_topic_labels() makes nearly the whole
+        # back catalog count as "recent" for near-duplicate rejection, so
+        # generate_topic()'s attempt budget (now candidate_count + 4) was
+        # exhausting itself with zero survivors. More attempts per call
+        # buys better odds without loosening the duplicate guardrail itself.
+        # Since 2026-07-26 the prompt also lists already-published titles and
+        # within-call rejections (content_strategy.build_topic_avoid_block),
+        # so attempts land on genuinely new stories instead of rewordings.
+        "topic_candidate_count": 5,
         "title_candidate_count": 3,
         "title_rules": """
 - The title MUST contain at least one specific number (a year, a count, or a quantity)
