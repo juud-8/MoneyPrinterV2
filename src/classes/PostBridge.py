@@ -102,6 +102,10 @@ class PostBridge:
         mime_type = self._guess_mime_type(file_path)
         file_size = os.path.getsize(file_path)
 
+        # This endpoint returns 201 Created (not 200) on success — without
+        # expected_statuses the shared _request() default of {200} treats
+        # every successful upload-URL creation as an HTTP error and throws
+        # the valid media_id/upload_url payload away.
         upload_response = self._request_json(
             "POST",
             f"{self.API_BASE}/media/create-upload-url",
@@ -110,6 +114,7 @@ class PostBridge:
                 "mime_type": mime_type,
                 "size_bytes": file_size,
             },
+            expected_statuses={200, 201},
         )
 
         media_id = upload_response.get("media_id")
@@ -169,10 +174,14 @@ class PostBridge:
         if scheduled_at:
             payload["scheduled_at"] = scheduled_at
 
+        # Like create-upload-url, this creates a resource and can answer
+        # 201 rather than 200 — accept both so a successful post isn't
+        # reported as a failure.
         return self._request_json(
             "POST",
             f"{self.API_BASE}/posts",
             json=payload,
+            expected_statuses={200, 201},
         )
 
     def _guess_mime_type(self, file_path: str) -> str:

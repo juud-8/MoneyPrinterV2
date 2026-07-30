@@ -5,6 +5,7 @@ import os
 import shutil
 import assemblyai as aai
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.auth.exceptions import RefreshError
 
 from utils import *
 from cache import *
@@ -61,17 +62,29 @@ from analytics import (
     log_asset_spend,
     log_duration_rejection,
     log_topic_rejection,
+    recent_research_gate_rejections,
 )
 from brand_switcher import get_production_setting, load_active_brand
-from channel_branding import get_publishing_config
+from channel_branding import get_publishing_config, load_channel_config
 from content_styles import get_content_style, resolve_style_name, DEFAULT_SCRIPT_RULES
 from youtube_upload_flow import (
+    PUBLISH_CHECKS_MAX_WAIT_SECONDS,
+    is_unattended_upload,
+    publish_blocked_by_checks,
     radio_matches_visibility,
     resolve_upload_visibility,
     visibility_radios_present,
 )
+from youtube_tags import (
+    build_tags_from_llm_response,
+    format_studio_tags,
+    generate_tags_prompt,
+    merge_video_tags,
+    topic_hashtags_for_description,
+)
 from topic_scoring import pick_best
 from content_strategy import (
+    build_topic_avoid_block,
     build_topic_strategy_block,
     recent_topic_labels,
     script_engagement_instruction,
@@ -113,6 +126,25 @@ from datetime import datetime
 
 # MoviePy 2.x uses IMAGEMAGICK_BINARY env var (no change_settings API)
 os.environ["IMAGEMAGICK_BINARY"] = get_imagemagick_path()
+
+DENYLIST_KEYWORDS = (
+    "president",
+    "senator",
+    "congress",
+    "prime minister",
+    "trump",
+    "biden",
+)
+
+
+def _denylist_match(subject: str, title: str) -> str:
+    text = f"{subject or ''} {title or ''}".lower()
+    return next((keyword for keyword in DENYLIST_KEYWORDS if keyword in text), "")
+
+
+def _is_denylisted(subject: str, title: str) -> bool:
+    """Blunt safety filter for living-person/political topic candidates."""
+    return bool(_denylist_match(subject, title))
 
 
 class YouTube:
@@ -168,6 +200,7 @@ class YouTube:
         self.experiment_metadata = {}
         self.production_metadata = {}
         self.last_upload_error = None
+        self.uploaded_privacy_status = ""
         self.chapters = []
         self.audio_mode = AUDIO_MODE_NARRATION
         self.archive_song_resume = False
@@ -323,6 +356,16 @@ class YouTube:
         preset = (getattr(self, "subject", None) or "").strip()
         attempts = 1 if preset else max(1, int(max_attempts))
         rejected: list[str] = list(getattr(self, "_research_rejected_topics", []) or [])
+        if not preset:
+            # Cross-run memory: block topics that recently failed the research
+            # gate so a fresh job doesn't re-pick the same unverifiable story.
+            try:
+                brand_id = (load_active_brand() or {}).get("brand_id", "")
+                for topic in recent_research_gate_rejections(brand_id):
+                    if topic not in rejected:
+                        rejected.append(topic)
+            except Exception as error:
+                warning(f"Could not load prior research-gate rejections: {error}")
         last_error: BaseException | None = None
 
         for attempt in range(1, attempts + 1):
@@ -402,7 +445,7 @@ class YouTube:
             t for t in (getattr(self, "_research_rejected_topics", None) or []) if t
         ]
         if rejected:
-            blocked = "\n".join(f"- {t}" for t in rejected[-5:])
+            blocked = "\n".join(f"- {t}" for t in rejected[-10:])
             prompt += (
                 "\n\nDo NOT reuse any of these rejected topics (research could not "
                 "verify them). Pick a completely different historical incident:\n"
@@ -453,11 +496,29 @@ class YouTube:
 
         candidates = []
         recent_labels = recent_topic_labels(active_brand)
-        max_attempts = candidate_count + 2 if recent_labels else candidate_count
+        max_attempts = candidate_count + 4
+        duplicates_this_call: list[str] = []
         for _ in range(max_attempts):
-            completion = self.generate_response(prompt, quality=True)
+            # Rebuilt every attempt: the avoid-block grows as candidates are
+            # rejected, so the LLM stops regenerating the same idea verbatim.
+            avoid_block = build_topic_avoid_block(recent_labels, duplicates_this_call)
+            attempt_prompt = prompt + ("\n\n" + avoid_block if avoid_block else "")
+            completion = self.generate_response(attempt_prompt, quality=True)
             if completion:
                 candidate = completion.strip().strip('"').strip("'")
+                if _is_denylisted(candidate, ""):
+                    denylist_match = _denylist_match(candidate, "")
+                    warning(
+                        f"Rejected denylisted topic candidate "
+                        f"(matched {denylist_match!r}): {candidate}"
+                    )
+                    log_topic_rejection(
+                        candidate=candidate,
+                        matched=f"denylist:{denylist_match}",
+                        similarity=1.0,
+                        brand_id=active_brand.get("brand_id", ""),
+                    )
+                    continue
                 duplicate = find_near_duplicate(candidate, recent_labels)
                 if duplicate:
                     warning(
@@ -470,6 +531,7 @@ class YouTube:
                         similarity=duplicate[1],
                         brand_id=active_brand.get("brand_id", ""),
                     )
+                    duplicates_this_call.append(candidate)
                     continue
                 candidates.append(candidate)
                 if len(candidates) >= candidate_count:
@@ -658,6 +720,27 @@ class YouTube:
 
         return self.script
 
+    def _generate_video_tags(self, title: str) -> list[str]:
+        """Generate Studio tags from brand staples plus topic-specific LLM tags."""
+        channel = load_channel_config()
+        default_tags = channel.get("default_tags") or []
+        if get_production_setting("tag_generation", True) is False:
+            return merge_video_tags(default_tags, [])
+
+        prompt = generate_tags_prompt(
+            subject=self.subject,
+            title=title,
+            script=self.script,
+            niche=self.niche,
+            default_tags=default_tags,
+        )
+        raw = self.generate_response(prompt, quality=True)
+        generated = build_tags_from_llm_response(raw)
+        merged = merge_video_tags(default_tags, generated)
+        if get_verbose() and merged:
+            info(f" => Generated {len(merged)} YouTube tag(s): {format_studio_tags(merged[:8])}")
+        return merged
+
     def generate_metadata(self, _attempt: int = 0) -> dict:
         """
         Generates Video metadata for the to-be-uploaded YouTube video.
@@ -745,14 +828,20 @@ Script:
             quality=True,
         )
 
+        channel = load_channel_config()
+        default_tags = channel.get("default_tags") or []
+        tags = self._generate_video_tags(title)
+        extra_hashtags = topic_hashtags_for_description(tags, default_tags)
+
         description = build_description(
             raw_description,
             subject=self.subject,
             format_type=self.format_type,
             include_affiliate=True,
+            extra_hashtags=extra_hashtags,
         )
 
-        self.metadata = {"title": title, "description": description}
+        self.metadata = {"title": title, "description": description, "tags": tags}
 
         return self.metadata
 
@@ -2345,6 +2434,74 @@ Return ONLY the prompt sentence.""",
             )
         return elements
 
+    def _expand_show_more(self, driver) -> None:
+        """Expand the upload dialog's optional Details section when collapsed."""
+        show_more = driver.find_elements(
+            By.XPATH, "//*[self::button or self::div][contains(., 'Show more')]"
+        )
+        for el in show_more:
+            try:
+                if not el.is_displayed():
+                    continue
+                el.click()
+                time.sleep(0.5)
+                return
+            except Exception:
+                continue
+
+    def _set_studio_tags(self, driver, tags: list[str]) -> None:
+        """Best-effort: fill YouTube Studio's Tags field on the Details step."""
+        tags_str = format_studio_tags(tags)
+        if not tags_str:
+            return
+        try:
+            self._expand_show_more(driver)
+            tag_input = None
+            selectors = [
+                (By.XPATH, "//input[contains(@aria-label, 'Tags') or contains(@aria-label, 'tags')]"),
+                (By.XPATH, "//ytcp-chip-bar//input"),
+                (By.XPATH, "//*[contains(normalize-space(.), 'Tags')]/following::input[1]"),
+                (By.XPATH, "//input[@placeholder='Add tag' or @placeholder='Add a tag']"),
+            ]
+            for by, value in selectors:
+                for candidate in driver.find_elements(by, value):
+                    try:
+                        if candidate.is_displayed() and candidate.is_enabled():
+                            tag_input = candidate
+                            break
+                    except Exception:
+                        continue
+                if tag_input:
+                    break
+
+            if not tag_input:
+                warning(
+                    "Could not find the YouTube Studio Tags input (UI may have changed). "
+                    "Tags were generated in metadata but not applied in Studio."
+                )
+                return
+
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", tag_input
+            )
+            time.sleep(0.3)
+            tag_input.click()
+            time.sleep(0.2)
+
+            # Chip inputs usually accept one tag per Enter; comma paste is unreliable.
+            for tag in tags:
+                tag_input.send_keys(tag)
+                tag_input.send_keys(Keys.ENTER)
+                time.sleep(0.15)
+
+            if get_verbose():
+                info(f"\t=> Set {len(tags)} Studio tag(s).")
+        except Exception as exc:
+            warning(
+                f"Tags step failed ({exc}). Tags were generated in metadata but may "
+                "not appear in Studio — verify manually if needed."
+            )
+
     def _set_ai_disclosure(self, driver, disclose: bool) -> None:
         """
         Best-effort: set YouTube Studio's AI-content disclosure ("Altered or
@@ -2359,16 +2516,7 @@ Return ONLY the prompt sentence.""",
         able to break uploads for every brand.
         """
         try:
-            show_more = driver.find_elements(
-                By.XPATH, "//*[self::button or self::div][contains(., 'Show more')]"
-            )
-            for el in show_more:
-                try:
-                    el.click()
-                    time.sleep(0.5)
-                    break
-                except Exception:
-                    continue
+            self._expand_show_more(driver)
 
             target_text = "Yes" if disclose else "No"
             disclosure_section = driver.find_elements(
@@ -2581,10 +2729,12 @@ Return ONLY the prompt sentence.""",
             "Studio UI may have changed — refusing to click a wrong index."
         )
 
-    def _wait_for_done_enabled(self, driver, timeout: float = 180) -> None:
-        """Wait until Done/Publish is clickable (Checks may block it)."""
+    def _wait_for_done_enabled(
+        self, driver, timeout: float = PUBLISH_CHECKS_MAX_WAIT_SECONDS
+    ) -> None:
+        """Wait until Done/Publish is clickable and Studio checks are clear."""
 
-        def _enabled(d):
+        def _ready(d):
             buttons = d.find_elements(By.ID, YOUTUBE_DONE_BUTTON_ID)
             if not buttons:
                 return False
@@ -2593,11 +2743,17 @@ Return ONLY the prompt sentence.""",
             if aria_disabled == "true":
                 return False
             try:
-                return btn.is_enabled() and btn.is_displayed()
+                if not (btn.is_enabled() and btn.is_displayed()):
+                    return False
             except Exception:
                 return False
+            try:
+                body = d.find_element(By.TAG_NAME, "body").text or ""
+            except Exception:
+                body = ""
+            return not publish_blocked_by_checks(body)
 
-        WebDriverWait(driver, timeout).until(_enabled)
+        WebDriverWait(driver, timeout).until(_ready)
 
     def _click_done_and_confirm(self, driver) -> None:
         """Click Done/Publish and dismiss common secondary confirmations."""
@@ -2719,6 +2875,12 @@ Return ONLY the prompt sentence.""",
                 description_el, self.metadata["description"], driver=driver
             )
 
+            studio_tags = self.metadata.get("tags") or []
+            if studio_tags:
+                if verbose:
+                    info(f"\t=> Setting {len(studio_tags)} tag(s)...")
+                self._set_studio_tags(driver, studio_tags)
+
             time.sleep(0.5)
 
             # Capture the assigned video id from the dialog's "Video link"
@@ -2752,7 +2914,10 @@ Return ONLY the prompt sentence.""",
             )
             self._set_ai_disclosure(driver, bool(disclose_ai))
 
-            visibility = resolve_upload_visibility(get_publishing_config())
+            visibility = resolve_upload_visibility(
+                get_publishing_config(),
+                unattended=is_unattended_upload(),
+            )
             if verbose:
                 info(f"\t=> Advancing to visibility step (target: {visibility})...")
             self._advance_to_visibility_step(driver, wait)
@@ -2763,7 +2928,7 @@ Return ONLY the prompt sentence.""",
 
             if verbose:
                 info("\t=> Waiting for Done/Publish to become enabled...")
-            self._wait_for_done_enabled(driver, timeout=180)
+            self._wait_for_done_enabled(driver)
 
             if verbose:
                 info("\t=> Clicking done/publish button...")
@@ -2819,6 +2984,7 @@ Return ONLY the prompt sentence.""",
 
             url = build_url(uploaded_video_id) if uploaded_video_id else ""
             self.uploaded_video_url = url
+            self.uploaded_privacy_status = visibility
 
             upload_brand = load_active_brand()
             log_video(
@@ -2892,6 +3058,7 @@ Return ONLY the prompt sentence.""",
                 srt_path=getattr(self, "subtitles_path", "") or None,
                 thumbnail_path=getattr(self, "thumbnail_path", "") or None,
                 publish_at=getattr(self, "publish_at", "") or None,
+                unattended=is_unattended_upload(),
             )
             credentials = load_or_refresh_credentials(
                 get_youtube_api_client_secrets_path(), get_youtube_api_token_path()
@@ -2900,6 +3067,7 @@ Return ONLY the prompt sentence.""",
 
             url = result.watch_url()
             self.uploaded_video_url = url
+            self.uploaded_privacy_status = result.privacy_status
 
             upload_brand = load_active_brand()
             log_video(
@@ -2933,6 +3101,17 @@ Return ONLY the prompt sentence.""",
             )
 
             return True
+        except RefreshError as e:
+            import traceback
+
+            from run_status import write_run_status
+
+            reason = f"AUTH_EXPIRED: {e}"
+            write_run_status(False, reason)
+            self.last_upload_error = reason
+            self.last_upload_traceback = traceback.format_exc()
+            error(f"YouTube API authentication expired: {e}")
+            raise
         except Exception as e:
             import traceback
 

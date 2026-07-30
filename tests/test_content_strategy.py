@@ -12,10 +12,46 @@ if SRC_DIR not in sys.path:
 
 import analytics
 from content_strategy import (
+    build_topic_avoid_block,
     build_topic_strategy_block,
     recent_topic_labels,
     script_engagement_instruction,
 )
+
+
+class TopicAvoidBlockTests(unittest.TestCase):
+    def test_empty_inputs_produce_empty_block(self):
+        self.assertEqual(build_topic_avoid_block([], []), "")
+        self.assertEqual(build_topic_avoid_block([], None), "")
+
+    def test_lists_published_titles(self):
+        block = build_topic_avoid_block(["The Emu War", "The Pastry War"])
+        self.assertIn("ALREADY PUBLISHED", block)
+        self.assertIn("- The Emu War", block)
+        self.assertIn("- The Pastry War", block)
+        self.assertNotIn("REJECTED", block)
+
+    def test_lists_within_call_rejections(self):
+        block = build_topic_avoid_block(
+            ["The Emu War"], ["How 1 soup kettle defeated a flagship in 1784"]
+        )
+        self.assertIn("REJECTED as near-duplicates", block)
+        self.assertIn("- How 1 soup kettle defeated a flagship in 1784", block)
+
+    def test_caps_published_and_rejected_counts(self):
+        published = [f"published {i}" for i in range(30)]
+        rejected = [f"rejected {i}" for i in range(12)]
+        block = build_topic_avoid_block(published, rejected)
+        self.assertIn("published 19", block)
+        self.assertNotIn("published 20", block)
+        # Rejected list keeps the most recent entries.
+        self.assertIn("rejected 11", block)
+        self.assertNotIn("rejected 3\n", block)
+
+    def test_skips_blank_entries(self):
+        block = build_topic_avoid_block(["", "Real Title"], ["", None])
+        self.assertIn("- Real Title", block)
+        self.assertNotIn("REJECTED", block)
 
 
 class ContentStrategyTests(unittest.TestCase):
@@ -105,6 +141,32 @@ class ContentStrategyTests(unittest.TestCase):
         videos = [self._uploaded(1, "event", "Title")]
         with patch.object(analytics, "dedupe_videos", lambda: videos):
             self.assertEqual(recent_topic_labels(manifest), [])
+
+    def test_recent_topic_labels_warns_when_dedupe_cap_is_reached(self):
+        manifest = {
+            "brand_id": "alpha",
+            "production": {
+                "content_strategy": {
+                    "recent_topic_lookback": 400,
+                    "recent_topic_days": 0,
+                }
+            },
+        }
+        videos = [
+            self._uploaded(1, f"event {index}", f"title {index}")
+            for index in range(300)
+        ]
+        with patch.object(analytics, "dedupe_videos", return_value=videos), patch(
+            "content_strategy.logger.warning"
+        ) as warning_mock:
+            labels = recent_topic_labels(manifest)
+
+        self.assertEqual(len(labels), 600)
+        warning_mock.assert_called_once_with(
+            "Dedupe corpus at cap (%d) — older episodes are no longer "
+            "protected from republication.",
+            600,
+        )
 
 
 if __name__ == "__main__":

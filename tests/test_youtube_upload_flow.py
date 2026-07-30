@@ -5,8 +5,10 @@ import unittest
 from youtube_upload_flow import (
     extract_outcome_signals,
     parse_moviepy_progress,
+    publish_blocked_by_checks,
     radio_matches_visibility,
     resolve_upload_visibility,
+    upload_ready_to_publish,
     visibility_radios_present,
 )
 
@@ -30,6 +32,15 @@ class ResolveVisibilityTests(unittest.TestCase):
         self.assertEqual(
             resolve_upload_visibility({"default_visibility": "friends"}, "unlisted"),
             "unlisted",
+        )
+
+    def test_unattended_always_resolves_private(self):
+        self.assertEqual(
+            resolve_upload_visibility(
+                {"default_visibility": "public"},
+                unattended=True,
+            ),
+            "private",
         )
 
 
@@ -60,6 +71,29 @@ class OutcomeSignalTests(unittest.TestCase):
         self.assertTrue(draft["mentions_draft"])
         live = extract_outcome_signals("Video published successfully")
         self.assertTrue(live["mentions_published"])
+
+    def test_checks_incomplete_and_strike_warning(self):
+        blocked = extract_outcome_signals(
+            "Checks incomplete. Publishing now could cause a strike. 5 minutes remaining."
+        )
+        self.assertTrue(blocked["mentions_checks_incomplete"])
+        clear = extract_outcome_signals("Checks complete. Video published.")
+        self.assertFalse(clear["mentions_checks_incomplete"])
+
+
+class PublishReadinessTests(unittest.TestCase):
+    def test_publish_blocked_by_checks(self):
+        self.assertTrue(
+            publish_blocked_by_checks("Publishing now could cause a strike")
+        )
+        self.assertFalse(publish_blocked_by_checks("Checks complete"))
+
+    def test_upload_ready_to_publish(self):
+        body = "Checks complete"
+        self.assertFalse(upload_ready_to_publish(body, done_enabled=False))
+        self.assertTrue(upload_ready_to_publish(body, done_enabled=True))
+        blocked = "Copyright check in progress"
+        self.assertFalse(upload_ready_to_publish(blocked, done_enabled=True))
 
 
 class MoviePyProgressTests(unittest.TestCase):

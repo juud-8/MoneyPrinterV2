@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 # Uploads within this many days count toward the near-duplicate topic check
 # unless the manifest sets `content_strategy.recent_topic_days` (0 disables
 # the time window and falls back to entry-count lookback only).
 DEFAULT_RECENT_TOPIC_DAYS = 30
-_MAX_DEDUPE_LABELS = 150
+_MAX_DEDUPE_LABELS = 600
 
 
 def _strategy(manifest: dict) -> dict:
@@ -63,12 +66,53 @@ def recent_topic_labels(manifest: dict, limit: int | None = None) -> list[str]:
         if not in_lookback and not in_window:
             break  # _recent_videos is sorted newest-first
         for field in ("subject", "title"):
+            if len(labels) >= _MAX_DEDUPE_LABELS:
+                break
             label = (video.get(field) or "").strip()
             if label and label[:180] not in labels:
                 labels.append(label[:180])
         if len(labels) >= _MAX_DEDUPE_LABELS:
             break
+    if len(labels) >= _MAX_DEDUPE_LABELS:
+        logger.warning(
+            "Dedupe corpus at cap (%d) — older episodes are no longer "
+            "protected from republication.",
+            _MAX_DEDUPE_LABELS,
+        )
     return labels
+
+
+def build_topic_avoid_block(
+    published: list[str],
+    rejected_this_call: list[str] | None = None,
+    max_published: int = 20,
+    max_rejected: int = 8,
+) -> str:
+    """Prompt block listing stories the topic LLM must not pitch again.
+
+    `published` labels were previously only used to reject candidates after
+    generation, which let the LLM burn every attempt re-pitching the channel's
+    existing catalog. Showing them in the prompt prevents the loop at the
+    source. `rejected_this_call` adds within-run feedback so an idea rejected
+    on attempt 1 isn't regenerated verbatim on attempts 2-7.
+    """
+    parts: list[str] = []
+    published_clean = [p for p in (published or []) if p][:max_published]
+    if published_clean:
+        parts.append(
+            "ALREADY PUBLISHED on this channel — do NOT pitch any of these "
+            "events again, or reworded versions of them:\n"
+            + "\n".join(f"- {p}" for p in published_clean)
+        )
+    rejected_clean = [r for r in (rejected_this_call or []) if r]
+    if rejected_clean:
+        parts.append(
+            "These pitches were just REJECTED as near-duplicates of the list "
+            "above — pick a COMPLETELY different historical incident, not "
+            "another rewording:\n"
+            + "\n".join(f"- {r}" for r in rejected_clean[-max_rejected:])
+        )
+    return "\n\n".join(parts)
 
 
 def _choose_lane(lanes: list[dict], rng=None) -> dict | None:

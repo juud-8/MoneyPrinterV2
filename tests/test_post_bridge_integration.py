@@ -101,6 +101,7 @@ class PostBridgeIntegrationTests(unittest.TestCase):
                 video_path=media_file.name,
                 title="My title",
                 interactive=False,
+                youtube_privacy_status="public",
             )
 
         self.assertIsNone(result)
@@ -129,6 +130,7 @@ class PostBridgeIntegrationTests(unittest.TestCase):
                 video_path=media_file.name,
                 title="My title",
                 interactive=True,
+                youtube_privacy_status="public",
                 prompt_fn=lambda _: "yes",
             )
 
@@ -171,6 +173,7 @@ class PostBridgeIntegrationTests(unittest.TestCase):
                 video_path=media_file.name,
                 title="My title",
                 interactive=False,
+                youtube_privacy_status="public",
             )
 
         self.assertTrue(result)
@@ -188,6 +191,32 @@ class PostBridgeIntegrationTests(unittest.TestCase):
                 "tiktok": {"title": "My title"},
             },
         )
+
+    @patch("post_bridge_integration.PostBridge")
+    @patch("post_bridge_integration.get_post_bridge_config")
+    def test_private_youtube_upload_never_crossposts(
+        self,
+        get_config_mock,
+        post_bridge_cls_mock,
+    ) -> None:
+        get_config_mock.return_value = {
+            "enabled": True,
+            "api_key": "token",
+            "platforms": ["tiktok", "instagram"],
+            "account_ids": [12, 34],
+            "auto_crosspost": True,
+        }
+
+        result = maybe_crosspost_youtube_short(
+            video_path="video.mp4",
+            title="Private staging upload",
+            interactive=False,
+            youtube_privacy_status="private",
+        )
+
+        self.assertIsNone(result)
+        get_config_mock.assert_not_called()
+        post_bridge_cls_mock.assert_not_called()
 
 
 if __name__ == "__main__":

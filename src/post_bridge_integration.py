@@ -139,6 +139,7 @@ def maybe_crosspost_youtube_short(
     video_path: str,
     title: str,
     interactive: bool,
+    youtube_privacy_status: str | None = None,
     prompt_fn: Optional[Callable[[str], str]] = None,
 ) -> Optional[bool]:
     """
@@ -148,12 +149,22 @@ def maybe_crosspost_youtube_short(
         video_path (str): Path to generated video file.
         title (str): Generated YouTube title.
         interactive (bool): Whether prompting is allowed.
+        youtube_privacy_status (str | None): Visibility confirmed by the
+            completed YouTube upload. Cross-posting fails closed unless public.
         prompt_fn (Callable | None): Optional prompt function override for tests.
 
     Returns:
         result (bool | None): True when posted, False when attempted and failed,
             None when skipped.
     """
+    visibility = str(youtube_privacy_status or "").strip().lower()
+    if visibility != "public":
+        info(
+            "Skipping Post Bridge cross-post until the corresponding YouTube "
+            f"video is public (current visibility: {visibility or 'unknown'})."
+        )
+        return None
+
     config = get_post_bridge_config()
 
     if not config["enabled"]:

@@ -17,6 +17,11 @@ PHASE0_SETUP_NOTES.txt
 COMMANDS.md
 SETUP_CHECKLIST.md
 
+# Channel audits — traffic/revenue figures and strategy for a live brand.
+# origin is a public fork, so these stay local.
+AUDIT.md
+AUDIT_PROMPT.md
+
 # Private brand data — channel manifests, assets, and brand-pinned scripts
 # (the engine is brand-agnostic; brands/ is private by convention)
 brands/

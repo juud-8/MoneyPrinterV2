@@ -114,6 +114,7 @@ class UploadVideoApiTests(unittest.TestCase):
         self.assertEqual(kwargs["video_path"], "video.mp4")
         self.assertEqual(kwargs["title"], "Title")
         self.assertEqual(kwargs["srt_path"], "subs.srt")
+        self.assertFalse(kwargs["unattended"])
         load_creds.assert_called_once()
         resumable.assert_called_once()
         _, resumable_kwargs = resumable.call_args
@@ -142,6 +143,36 @@ class UploadVideoApiTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertIn("no client secrets configured", yt.last_upload_error)
+
+    def test_refresh_error_writes_auth_status_and_reraises(self):
+        from google.auth.exceptions import RefreshError
+
+        yt = _make_youtube(subtitles_path="", thumbnail_path="")
+        refresh_error = RefreshError("invalid_grant")
+
+        with patch("classes.YouTube.emit_stage"), patch(
+            "classes.YouTube.get_youtube_api_category_id", return_value="22"
+        ), patch("classes.YouTube.get_publishing_config", return_value={}), patch(
+            "classes.YouTube.get_is_for_kids", return_value=False
+        ), patch(
+            "classes.YouTube.get_youtube_api_client_secrets_path", return_value=""
+        ), patch(
+            "classes.YouTube.get_youtube_api_token_path", return_value=""
+        ), patch(
+            "youtube_api_upload.build_api_upload_request"
+        ), patch(
+            "youtube_api_upload.load_or_refresh_credentials",
+            side_effect=refresh_error,
+        ), patch("run_status.write_run_status") as write_status, patch(
+            "classes.YouTube.error"
+        ):
+            with self.assertRaises(RefreshError):
+                yt._upload_video_api()
+
+        write_status.assert_called_once_with(
+            False, "AUTH_EXPIRED: invalid_grant"
+        )
+        self.assertEqual(yt.last_upload_error, "AUTH_EXPIRED: invalid_grant")
 
 
 if __name__ == "__main__":

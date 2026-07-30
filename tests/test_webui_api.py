@@ -54,6 +54,10 @@ class WebuiApiTests(unittest.TestCase):
             webui, "get_latest_channel_snapshots", return_value={}
         ), patch.object(webui, "list_brands", return_value=[]), patch.object(
             webui, "get_insights_summary", return_value={"active": False, "sample_size": 0, "min_sample": 5}
+        ), patch.object(
+            webui,
+            "get_run_status_alert",
+            return_value={"alert": False, "ok": True, "stale": False},
         ):
             res = self.client.get("/api/ops?days=7")
         self.assertEqual(res.status_code, 200)
@@ -61,6 +65,7 @@ class WebuiApiTests(unittest.TestCase):
         self.assertIn("totals", data)
         self.assertIn("brands_meta", data)
         self.assertIn("videos", data)
+        self.assertIn("run_status", data)
         self.assertEqual(data["window_days"], 7)
 
     def test_generate_passes_topic_and_image_provider_override(self):

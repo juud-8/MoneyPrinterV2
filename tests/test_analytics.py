@@ -338,5 +338,55 @@ class AnalyticsDashboardTests(unittest.TestCase):
         self.assertEqual(merged[0]["longform_theme"], "president")
 
 
+class ResearchGateRejectionMemoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.analytics_path = os.path.join(self._tmp.name, "analytics.json")
+        self._patcher = patch.object(
+            analytics, "_analytics_path", return_value=self.analytics_path
+        )
+        self._patcher.start()
+
+    def tearDown(self) -> None:
+        self._patcher.stop()
+        self._tmp.cleanup()
+
+    def _write(self, rejections: list[dict]) -> None:
+        with open(self.analytics_path, "w", encoding="utf-8") as f:
+            json.dump({"videos": [], "topic_rejections": rejections}, f)
+
+    def test_returns_recent_brand_scoped_research_gate_topics(self) -> None:
+        now = datetime.now()
+        stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        old_stamp = "2020-01-01 00:00:00"
+        self._write(
+            [
+                {"date": stamp, "candidate": "old but wrong brand", "matched": "research_gate", "brand_id": "beta"},
+                {"date": old_stamp, "candidate": "too old", "matched": "research_gate", "brand_id": "alpha"},
+                {"date": stamp, "candidate": "near duplicate", "matched": "Some Existing Title", "brand_id": "alpha"},
+                {"date": stamp, "candidate": "unverifiable cats", "matched": "research_gate", "brand_id": "alpha"},
+                {"date": stamp, "candidate": "unverifiable cats", "matched": "research_gate", "brand_id": "alpha"},
+                {"date": stamp, "candidate": "unverifiable kettle", "matched": "research_gate", "brand_id": "alpha"},
+            ]
+        )
+        topics = analytics.recent_research_gate_rejections("alpha")
+        self.assertEqual(topics, ["unverifiable kettle", "unverifiable cats"])
+
+    def test_missing_file_returns_empty(self) -> None:
+        self.assertEqual(analytics.recent_research_gate_rejections("alpha"), [])
+
+    def test_limit_is_respected(self) -> None:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._write(
+            [
+                {"date": stamp, "candidate": f"topic {i}", "matched": "research_gate", "brand_id": "alpha"}
+                for i in range(30)
+            ]
+        )
+        topics = analytics.recent_research_gate_rejections("alpha", limit=5)
+        self.assertEqual(len(topics), 5)
+        self.assertEqual(topics[0], "topic 29")
+
+
 if __name__ == "__main__":
     unittest.main()

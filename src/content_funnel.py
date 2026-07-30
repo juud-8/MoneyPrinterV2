@@ -24,6 +24,7 @@ def build_description(
     subject: str = "",
     format_type: str = "short",
     include_affiliate: bool = True,
+    extra_hashtags: str = "",
 ) -> str:
     """
     Build a monetization-optimized YouTube description.
@@ -78,7 +79,11 @@ def build_description(
         parts.append("(Auto-generated — edit timestamps after upload)")
 
     tags = channel.get("default_hashtags", "#Shorts")
+    hashtag_line = tags.strip()
+    extra = (extra_hashtags or "").strip()
+    if extra:
+        hashtag_line = f"{hashtag_line} {extra}".strip()
     parts.append("")
-    parts.append(tags.strip())
+    parts.append(hashtag_line)
 
     return "\n".join(parts)

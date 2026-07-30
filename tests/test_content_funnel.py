@@ -105,6 +105,16 @@ class BuildDescriptionTests(unittest.TestCase):
 
         self.assertTrue(description.strip().endswith("#Foo #Bar"))
 
+    def test_extra_hashtags_appended_after_defaults(self) -> None:
+        p1, p2, p3 = self._patched(channel_cfg={"default_hashtags": "#Foo"})
+        with p1, p2, p3:
+            description = content_funnel.build_description(
+                "Body.",
+                extra_hashtags="#Bastille #FrenchRevolution",
+            )
+
+        self.assertTrue(description.strip().endswith("#Foo #Bastille #FrenchRevolution"))
+
 
 if __name__ == "__main__":
     unittest.main()
