@@ -65,13 +65,22 @@ from analytics import (
     recent_research_gate_rejections,
 )
 from brand_switcher import get_production_setting, load_active_brand
-from channel_branding import get_publishing_config
+from channel_branding import get_publishing_config, load_channel_config
 from content_styles import get_content_style, resolve_style_name, DEFAULT_SCRIPT_RULES
 from youtube_upload_flow import (
+    PUBLISH_CHECKS_MAX_WAIT_SECONDS,
     is_unattended_upload,
+    publish_blocked_by_checks,
     radio_matches_visibility,
     resolve_upload_visibility,
     visibility_radios_present,
+)
+from youtube_tags import (
+    build_tags_from_llm_response,
+    format_studio_tags,
+    generate_tags_prompt,
+    merge_video_tags,
+    topic_hashtags_for_description,
 )
 from topic_scoring import pick_best
 from content_strategy import (
@@ -711,6 +720,27 @@ class YouTube:
 
         return self.script
 
+    def _generate_video_tags(self, title: str) -> list[str]:
+        """Generate Studio tags from brand staples plus topic-specific LLM tags."""
+        channel = load_channel_config()
+        default_tags = channel.get("default_tags") or []
+        if get_production_setting("tag_generation", True) is False:
+            return merge_video_tags(default_tags, [])
+
+        prompt = generate_tags_prompt(
+            subject=self.subject,
+            title=title,
+            script=self.script,
+            niche=self.niche,
+            default_tags=default_tags,
+        )
+        raw = self.generate_response(prompt, quality=True)
+        generated = build_tags_from_llm_response(raw)
+        merged = merge_video_tags(default_tags, generated)
+        if get_verbose() and merged:
+            info(f" => Generated {len(merged)} YouTube tag(s): {format_studio_tags(merged[:8])}")
+        return merged
+
     def generate_metadata(self, _attempt: int = 0) -> dict:
         """
         Generates Video metadata for the to-be-uploaded YouTube video.
@@ -798,14 +828,20 @@ Script:
             quality=True,
         )
 
+        channel = load_channel_config()
+        default_tags = channel.get("default_tags") or []
+        tags = self._generate_video_tags(title)
+        extra_hashtags = topic_hashtags_for_description(tags, default_tags)
+
         description = build_description(
             raw_description,
             subject=self.subject,
             format_type=self.format_type,
             include_affiliate=True,
+            extra_hashtags=extra_hashtags,
         )
 
-        self.metadata = {"title": title, "description": description}
+        self.metadata = {"title": title, "description": description, "tags": tags}
 
         return self.metadata
 
@@ -2398,6 +2434,74 @@ Return ONLY the prompt sentence.""",
             )
         return elements
 
+    def _expand_show_more(self, driver) -> None:
+        """Expand the upload dialog's optional Details section when collapsed."""
+        show_more = driver.find_elements(
+            By.XPATH, "//*[self::button or self::div][contains(., 'Show more')]"
+        )
+        for el in show_more:
+            try:
+                if not el.is_displayed():
+                    continue
+                el.click()
+                time.sleep(0.5)
+                return
+            except Exception:
+                continue
+
+    def _set_studio_tags(self, driver, tags: list[str]) -> None:
+        """Best-effort: fill YouTube Studio's Tags field on the Details step."""
+        tags_str = format_studio_tags(tags)
+        if not tags_str:
+            return
+        try:
+            self._expand_show_more(driver)
+            tag_input = None
+            selectors = [
+                (By.XPATH, "//input[contains(@aria-label, 'Tags') or contains(@aria-label, 'tags')]"),
+                (By.XPATH, "//ytcp-chip-bar//input"),
+                (By.XPATH, "//*[contains(normalize-space(.), 'Tags')]/following::input[1]"),
+                (By.XPATH, "//input[@placeholder='Add tag' or @placeholder='Add a tag']"),
+            ]
+            for by, value in selectors:
+                for candidate in driver.find_elements(by, value):
+                    try:
+                        if candidate.is_displayed() and candidate.is_enabled():
+                            tag_input = candidate
+                            break
+                    except Exception:
+                        continue
+                if tag_input:
+                    break
+
+            if not tag_input:
+                warning(
+                    "Could not find the YouTube Studio Tags input (UI may have changed). "
+                    "Tags were generated in metadata but not applied in Studio."
+                )
+                return
+
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", tag_input
+            )
+            time.sleep(0.3)
+            tag_input.click()
+            time.sleep(0.2)
+
+            # Chip inputs usually accept one tag per Enter; comma paste is unreliable.
+            for tag in tags:
+                tag_input.send_keys(tag)
+                tag_input.send_keys(Keys.ENTER)
+                time.sleep(0.15)
+
+            if get_verbose():
+                info(f"\t=> Set {len(tags)} Studio tag(s).")
+        except Exception as exc:
+            warning(
+                f"Tags step failed ({exc}). Tags were generated in metadata but may "
+                "not appear in Studio — verify manually if needed."
+            )
+
     def _set_ai_disclosure(self, driver, disclose: bool) -> None:
         """
         Best-effort: set YouTube Studio's AI-content disclosure ("Altered or
@@ -2412,16 +2516,7 @@ Return ONLY the prompt sentence.""",
         able to break uploads for every brand.
         """
         try:
-            show_more = driver.find_elements(
-                By.XPATH, "//*[self::button or self::div][contains(., 'Show more')]"
-            )
-            for el in show_more:
-                try:
-                    el.click()
-                    time.sleep(0.5)
-                    break
-                except Exception:
-                    continue
+            self._expand_show_more(driver)
 
             target_text = "Yes" if disclose else "No"
             disclosure_section = driver.find_elements(
@@ -2634,10 +2729,12 @@ Return ONLY the prompt sentence.""",
             "Studio UI may have changed — refusing to click a wrong index."
         )
 
-    def _wait_for_done_enabled(self, driver, timeout: float = 180) -> None:
-        """Wait until Done/Publish is clickable (Checks may block it)."""
+    def _wait_for_done_enabled(
+        self, driver, timeout: float = PUBLISH_CHECKS_MAX_WAIT_SECONDS
+    ) -> None:
+        """Wait until Done/Publish is clickable and Studio checks are clear."""
 
-        def _enabled(d):
+        def _ready(d):
             buttons = d.find_elements(By.ID, YOUTUBE_DONE_BUTTON_ID)
             if not buttons:
                 return False
@@ -2646,11 +2743,17 @@ Return ONLY the prompt sentence.""",
             if aria_disabled == "true":
                 return False
             try:
-                return btn.is_enabled() and btn.is_displayed()
+                if not (btn.is_enabled() and btn.is_displayed()):
+                    return False
             except Exception:
                 return False
+            try:
+                body = d.find_element(By.TAG_NAME, "body").text or ""
+            except Exception:
+                body = ""
+            return not publish_blocked_by_checks(body)
 
-        WebDriverWait(driver, timeout).until(_enabled)
+        WebDriverWait(driver, timeout).until(_ready)
 
     def _click_done_and_confirm(self, driver) -> None:
         """Click Done/Publish and dismiss common secondary confirmations."""
@@ -2772,6 +2875,12 @@ Return ONLY the prompt sentence.""",
                 description_el, self.metadata["description"], driver=driver
             )
 
+            studio_tags = self.metadata.get("tags") or []
+            if studio_tags:
+                if verbose:
+                    info(f"\t=> Setting {len(studio_tags)} tag(s)...")
+                self._set_studio_tags(driver, studio_tags)
+
             time.sleep(0.5)
 
             # Capture the assigned video id from the dialog's "Video link"
@@ -2819,7 +2928,7 @@ Return ONLY the prompt sentence.""",
 
             if verbose:
                 info("\t=> Waiting for Done/Publish to become enabled...")
-            self._wait_for_done_enabled(driver, timeout=180)
+            self._wait_for_done_enabled(driver)
 
             if verbose:
                 info("\t=> Clicking done/publish button...")

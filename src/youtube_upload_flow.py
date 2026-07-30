@@ -12,6 +12,33 @@ from typing import Mapping
 VALID_VISIBILITIES = ("private", "unlisted", "public")
 UNATTENDED_UPLOAD_ENV = "MPV2_UNATTENDED_UPLOAD"
 
+# YouTube copyright/ad checks can take several minutes on Shorts.
+PUBLISH_CHECKS_MAX_WAIT_SECONDS = 900
+
+PUBLISH_BLOCK_PHRASES = (
+    "checks incomplete",
+    "copyright check in progress",
+    "checking your video",
+    "check in progress",
+    "still running checks",
+    "review in progress",
+    "we'll notify you when",
+    "we will notify you when",
+    "publishing now could",
+    "publish now could",
+    "could result in a strike",
+    "could cause a strike",
+    "may result in a strike",
+    "copyright claim",
+    "content id",
+    "minutes remaining",
+    "minute remaining",
+    "min remaining",
+    "wait for checks",
+    "checks are running",
+    "checks still running",
+)
+
 
 def is_unattended_upload(env: Mapping[str, str] | None = None) -> bool:
     """Whether this process is an explicitly marked scheduled/cron upload."""
@@ -85,15 +112,21 @@ def extract_outcome_signals(log_or_page_text: str) -> dict:
                 "uploaded video",
             )
         ),
-        "mentions_checks_incomplete": any(
-            phrase in text
-            for phrase in (
-                "checks incomplete",
-                "copyright check in progress",
-                "checking your video",
-            )
-        ),
+        "mentions_checks_incomplete": publish_blocked_by_checks(log_or_page_text),
     }
+
+
+def publish_blocked_by_checks(page_text: str) -> bool:
+    """True when Studio copy indicates copyright/ad checks are still running."""
+    text = (page_text or "").lower()
+    return any(phrase in text for phrase in PUBLISH_BLOCK_PHRASES)
+
+
+def upload_ready_to_publish(page_text: str, *, done_enabled: bool) -> bool:
+    """True when Done/Publish is enabled and checks no longer block publishing."""
+    if not done_enabled:
+        return False
+    return not publish_blocked_by_checks(page_text)
 
 
 def parse_moviepy_progress(chunk: str) -> float | None:
