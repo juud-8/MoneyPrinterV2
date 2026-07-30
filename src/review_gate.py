@@ -6,6 +6,7 @@ from config import get_ai_disclosure_default, get_review_before_upload
 from brand_switcher import get_production_setting
 from channel_branding import get_publishing_config
 from status import info, question, warning
+from youtube_upload_flow import is_unattended_upload
 
 
 def should_proceed_with_upload(
@@ -34,6 +35,18 @@ def should_proceed_with_upload(
             # Non-pilot brands keep prior behavior: review_before_upload has
             # no automated-run effect (there's no one to ask), so scheduled
             # uploads proceed as before.
+            return True
+
+        if is_unattended_upload():
+            warning(
+                "Pilot mode active: unattended upload will be staged private "
+                "for human review before publication."
+            )
+            info(
+                "Review gate approved a private staging upload; public release "
+                "still requires a human visibility change.",
+                False,
+            )
             return True
 
         confirmed = os.environ.get("MPV2_PILOT_UPLOAD_CONFIRMED", "").strip() == "1"

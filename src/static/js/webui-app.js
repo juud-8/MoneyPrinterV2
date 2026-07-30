@@ -14,7 +14,13 @@
   async function refreshOps() {
     try {
       const ops = await api(opsUrl());
-      const hash = JSON.stringify([ops.generated_at, ops.totals, ops.spend_alert, state.windowDays]);
+      const hash = JSON.stringify([
+        ops.generated_at,
+        ops.totals,
+        ops.spend_alert,
+        ops.run_status,
+        state.windowDays,
+      ]);
       state.opsCache = ops;
       state.lastSyncAt = new Date();
       renderSyncLabel();

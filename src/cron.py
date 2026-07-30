@@ -1,4 +1,5 @@
 # RUN THIS N AMOUNT OF TIMES
+import os
 import sys
 
 from status import *
@@ -54,6 +55,8 @@ def main():
 
     rem_temp_files()
     verbose = get_verbose()
+    prior_unattended = os.environ.get("MPV2_UNATTENDED_UPLOAD")
+    prior_run_task = os.environ.get("MPV2_RUN_TASK")
 
     try:
         if purpose == "twitter":
@@ -81,6 +84,8 @@ def main():
                         twitter.close_browser()
                     break
         elif purpose == "youtube":
+            os.environ["MPV2_UNATTENDED_UPLOAD"] = "1"
+            os.environ["MPV2_RUN_TASK"] = "cron"
             tts = TTS()
 
             accounts = get_accounts("youtube")
@@ -126,6 +131,9 @@ def main():
                                     video_path=youtube.video_path,
                                     title=youtube.metadata.get("title", ""),
                                     interactive=False,
+                                    youtube_privacy_status=getattr(
+                                        youtube, "uploaded_privacy_status", ""
+                                    ),
                                 )
                             else:
                                 warning("YouTube upload failed. Skipping Post Bridge cross-post.")
@@ -142,6 +150,15 @@ def main():
     except Exception as e:
         error(f"FATAL: cron run crashed ({type(e).__name__}): {e}")
         sys.exit(1)
+    finally:
+        if prior_unattended is None:
+            os.environ.pop("MPV2_UNATTENDED_UPLOAD", None)
+        else:
+            os.environ["MPV2_UNATTENDED_UPLOAD"] = prior_unattended
+        if prior_run_task is None:
+            os.environ.pop("MPV2_RUN_TASK", None)
+        else:
+            os.environ["MPV2_RUN_TASK"] = prior_run_task
 
 if __name__ == "__main__":
     main()

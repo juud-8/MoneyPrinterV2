@@ -6,17 +6,32 @@ YouTube class so they can be unit-tested without a browser.
 
 from __future__ import annotations
 
+import os
+from typing import Mapping
+
 VALID_VISIBILITIES = ("private", "unlisted", "public")
+UNATTENDED_UPLOAD_ENV = "MPV2_UNATTENDED_UPLOAD"
+
+
+def is_unattended_upload(env: Mapping[str, str] | None = None) -> bool:
+    """Whether this process is an explicitly marked scheduled/cron upload."""
+    env_map = env if env is not None else os.environ
+    return str(env_map.get(UNATTENDED_UPLOAD_ENV) or "").strip() == "1"
 
 
 def resolve_upload_visibility(
     publishing: dict | None = None,
     fallback: str = "unlisted",
+    *,
+    unattended: bool = False,
 ) -> str:
     """Pick Studio visibility from brand publishing config.
 
     Defaults to unlisted (safe for pilot / review) when unset or invalid.
+    Explicitly unattended uploads are always staged private for human review.
     """
+    if unattended:
+        return "private"
     raw = ""
     if isinstance(publishing, dict):
         raw = str(publishing.get("default_visibility") or "").strip().lower()

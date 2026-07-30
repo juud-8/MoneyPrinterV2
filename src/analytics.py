@@ -359,6 +359,36 @@ def log_topic_rejection(
     _save(data)
 
 
+def recent_research_gate_rejections(
+    brand_id: str = "", days: int = 14, limit: int = 20
+) -> list[str]:
+    """Topics that recently failed the grounded-research gate for a brand.
+
+    Research-gate rejections are only remembered in-process during a run, so
+    back-to-back jobs kept re-picking the same unverifiable stories. This
+    reads them back from the append-only log so a fresh run can block them
+    in its topic prompt.
+    """
+    data = _load()
+    cutoff = (datetime.now() - timedelta(days=max(int(days), 0))).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    topics: list[str] = []
+    for entry in reversed(data.get("topic_rejections") or []):
+        if not isinstance(entry, dict) or entry.get("matched") != "research_gate":
+            continue
+        if brand_id and entry.get("brand_id") != brand_id:
+            continue
+        if (entry.get("date") or "") < cutoff:
+            continue
+        candidate = (entry.get("candidate") or "").strip()
+        if candidate and candidate not in topics:
+            topics.append(candidate)
+        if len(topics) >= max(int(limit), 1):
+            break
+    return topics
+
+
 def log_duration_rejection(
     video_subject: str,
     audio_seconds: float,

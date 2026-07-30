@@ -242,6 +242,16 @@
     const videos = videosForOps();
     const spendAlert = (state.overviewCache && state.overviewCache.spend_alert) || (state.opsCache && state.opsCache.spend_alert) || {};
     const rej = (state.overviewCache && state.overviewCache.rejection_summary) || (state.opsCache && state.opsCache.rejection_summary) || {};
+    const runStatus = (state.opsCache && state.opsCache.run_status) || {};
+
+    if (runStatus.alert) {
+      alerts.push({
+        sev: runStatus.ok === false && !runStatus.stale ? "red" : "amber",
+        label: "SCHEDULE",
+        text: runStatus.reason || "The unattended production heartbeat needs attention.",
+        jump: "pipeline",
+      });
+    }
 
     const silent = videos.filter((v) => v.status === "uploaded" && !v.url);
     if (silent.length) {

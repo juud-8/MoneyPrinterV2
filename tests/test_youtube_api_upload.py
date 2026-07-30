@@ -103,6 +103,24 @@ class YoutubeApiUploadTests(unittest.TestCase):
             body = req.to_videos_insert_body()
             self.assertEqual(body["status"]["privacyStatus"], "private")
             self.assertEqual(body["snippet"]["tags"], ["history"])
+            self.assertIs(body["status"]["containsSyntheticMedia"], True)
+
+    def test_unattended_request_forces_private_over_public_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = os.path.join(tmp, "v.mp4")
+            with open(video, "wb") as handle:
+                handle.write(b"fake")
+            req = build_api_upload_request(
+                video_path=video,
+                title="Unattended Short",
+                publishing={"default_visibility": "public"},
+                privacy_status="public",
+                unattended=True,
+            )
+            self.assertEqual(req.privacy_status, "private")
+            self.assertEqual(
+                req.to_videos_insert_body()["status"]["privacyStatus"], "private"
+            )
 
     def test_dry_run_validates_paths(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,7 +22,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from youtube_upload_flow import VALID_VISIBILITIES, resolve_upload_visibility
+from youtube_upload_flow import (
+    VALID_VISIBILITIES,
+    is_unattended_upload,
+    resolve_upload_visibility,
+)
 
 # videos.insert costs ~1600 quota units; default project quota is 10_000/day.
 QUOTA_UNITS_PER_UPLOAD = 1600
@@ -51,6 +55,7 @@ class ApiUploadRequest:
         status: dict[str, Any] = {
             "privacyStatus": self.privacy_status,
             "selfDeclaredMadeForKids": bool(self.made_for_kids),
+            "containsSyntheticMedia": True,
         }
         if self.publish_at:
             # YouTube publishes the video itself at this time; until then it
@@ -147,6 +152,7 @@ def build_api_upload_request(
     thumbnail_path: str | None = None,
     fallback_visibility: str = "private",
     publish_at: str | None = None,
+    unattended: bool | None = None,
 ) -> ApiUploadRequest:
     """Build a validated upload request. Defaults to private for review safety."""
     if not video_path or not str(video_path).strip():
@@ -159,12 +165,19 @@ def build_api_upload_request(
         # Scheduled videos must be uploaded private; YouTube flips them
         # public at publishAt.
         privacy_status = "private"
+    unattended_upload = (
+        is_unattended_upload() if unattended is None else bool(unattended)
+    )
     if privacy_status is None:
         visibility = resolve_upload_visibility(
-            dict(publishing or {}), fallback=fallback_visibility
+            dict(publishing or {}),
+            fallback=fallback_visibility,
+            unattended=unattended_upload,
         )
     else:
         visibility = str(privacy_status).strip().lower()
+        if unattended_upload:
+            visibility = "private"
     if visibility not in VALID_VISIBILITIES:
         raise ValueError(
             f"privacy_status must be one of {VALID_VISIBILITIES}, got {visibility!r}"

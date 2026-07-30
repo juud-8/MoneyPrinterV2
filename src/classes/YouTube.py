@@ -5,6 +5,7 @@ import os
 import shutil
 import assemblyai as aai
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.auth.exceptions import RefreshError
 
 from utils import *
 from cache import *
@@ -61,17 +62,20 @@ from analytics import (
     log_asset_spend,
     log_duration_rejection,
     log_topic_rejection,
+    recent_research_gate_rejections,
 )
 from brand_switcher import get_production_setting, load_active_brand
 from channel_branding import get_publishing_config
 from content_styles import get_content_style, resolve_style_name, DEFAULT_SCRIPT_RULES
 from youtube_upload_flow import (
+    is_unattended_upload,
     radio_matches_visibility,
     resolve_upload_visibility,
     visibility_radios_present,
 )
 from topic_scoring import pick_best
 from content_strategy import (
+    build_topic_avoid_block,
     build_topic_strategy_block,
     recent_topic_labels,
     script_engagement_instruction,
@@ -113,6 +117,25 @@ from datetime import datetime
 
 # MoviePy 2.x uses IMAGEMAGICK_BINARY env var (no change_settings API)
 os.environ["IMAGEMAGICK_BINARY"] = get_imagemagick_path()
+
+DENYLIST_KEYWORDS = (
+    "president",
+    "senator",
+    "congress",
+    "prime minister",
+    "trump",
+    "biden",
+)
+
+
+def _denylist_match(subject: str, title: str) -> str:
+    text = f"{subject or ''} {title or ''}".lower()
+    return next((keyword for keyword in DENYLIST_KEYWORDS if keyword in text), "")
+
+
+def _is_denylisted(subject: str, title: str) -> bool:
+    """Blunt safety filter for living-person/political topic candidates."""
+    return bool(_denylist_match(subject, title))
 
 
 class YouTube:
@@ -168,6 +191,7 @@ class YouTube:
         self.experiment_metadata = {}
         self.production_metadata = {}
         self.last_upload_error = None
+        self.uploaded_privacy_status = ""
         self.chapters = []
         self.audio_mode = AUDIO_MODE_NARRATION
         self.archive_song_resume = False
@@ -323,6 +347,16 @@ class YouTube:
         preset = (getattr(self, "subject", None) or "").strip()
         attempts = 1 if preset else max(1, int(max_attempts))
         rejected: list[str] = list(getattr(self, "_research_rejected_topics", []) or [])
+        if not preset:
+            # Cross-run memory: block topics that recently failed the research
+            # gate so a fresh job doesn't re-pick the same unverifiable story.
+            try:
+                brand_id = (load_active_brand() or {}).get("brand_id", "")
+                for topic in recent_research_gate_rejections(brand_id):
+                    if topic not in rejected:
+                        rejected.append(topic)
+            except Exception as error:
+                warning(f"Could not load prior research-gate rejections: {error}")
         last_error: BaseException | None = None
 
         for attempt in range(1, attempts + 1):
@@ -402,7 +436,7 @@ class YouTube:
             t for t in (getattr(self, "_research_rejected_topics", None) or []) if t
         ]
         if rejected:
-            blocked = "\n".join(f"- {t}" for t in rejected[-5:])
+            blocked = "\n".join(f"- {t}" for t in rejected[-10:])
             prompt += (
                 "\n\nDo NOT reuse any of these rejected topics (research could not "
                 "verify them). Pick a completely different historical incident:\n"
@@ -453,11 +487,29 @@ class YouTube:
 
         candidates = []
         recent_labels = recent_topic_labels(active_brand)
-        max_attempts = candidate_count + 2 if recent_labels else candidate_count
+        max_attempts = candidate_count + 4
+        duplicates_this_call: list[str] = []
         for _ in range(max_attempts):
-            completion = self.generate_response(prompt, quality=True)
+            # Rebuilt every attempt: the avoid-block grows as candidates are
+            # rejected, so the LLM stops regenerating the same idea verbatim.
+            avoid_block = build_topic_avoid_block(recent_labels, duplicates_this_call)
+            attempt_prompt = prompt + ("\n\n" + avoid_block if avoid_block else "")
+            completion = self.generate_response(attempt_prompt, quality=True)
             if completion:
                 candidate = completion.strip().strip('"').strip("'")
+                if _is_denylisted(candidate, ""):
+                    denylist_match = _denylist_match(candidate, "")
+                    warning(
+                        f"Rejected denylisted topic candidate "
+                        f"(matched {denylist_match!r}): {candidate}"
+                    )
+                    log_topic_rejection(
+                        candidate=candidate,
+                        matched=f"denylist:{denylist_match}",
+                        similarity=1.0,
+                        brand_id=active_brand.get("brand_id", ""),
+                    )
+                    continue
                 duplicate = find_near_duplicate(candidate, recent_labels)
                 if duplicate:
                     warning(
@@ -470,6 +522,7 @@ class YouTube:
                         similarity=duplicate[1],
                         brand_id=active_brand.get("brand_id", ""),
                     )
+                    duplicates_this_call.append(candidate)
                     continue
                 candidates.append(candidate)
                 if len(candidates) >= candidate_count:
@@ -2752,7 +2805,10 @@ Return ONLY the prompt sentence.""",
             )
             self._set_ai_disclosure(driver, bool(disclose_ai))
 
-            visibility = resolve_upload_visibility(get_publishing_config())
+            visibility = resolve_upload_visibility(
+                get_publishing_config(),
+                unattended=is_unattended_upload(),
+            )
             if verbose:
                 info(f"\t=> Advancing to visibility step (target: {visibility})...")
             self._advance_to_visibility_step(driver, wait)
@@ -2819,6 +2875,7 @@ Return ONLY the prompt sentence.""",
 
             url = build_url(uploaded_video_id) if uploaded_video_id else ""
             self.uploaded_video_url = url
+            self.uploaded_privacy_status = visibility
 
             upload_brand = load_active_brand()
             log_video(
@@ -2892,6 +2949,7 @@ Return ONLY the prompt sentence.""",
                 srt_path=getattr(self, "subtitles_path", "") or None,
                 thumbnail_path=getattr(self, "thumbnail_path", "") or None,
                 publish_at=getattr(self, "publish_at", "") or None,
+                unattended=is_unattended_upload(),
             )
             credentials = load_or_refresh_credentials(
                 get_youtube_api_client_secrets_path(), get_youtube_api_token_path()
@@ -2900,6 +2958,7 @@ Return ONLY the prompt sentence.""",
 
             url = result.watch_url()
             self.uploaded_video_url = url
+            self.uploaded_privacy_status = result.privacy_status
 
             upload_brand = load_active_brand()
             log_video(
@@ -2933,6 +2992,17 @@ Return ONLY the prompt sentence.""",
             )
 
             return True
+        except RefreshError as e:
+            import traceback
+
+            from run_status import write_run_status
+
+            reason = f"AUTH_EXPIRED: {e}"
+            write_run_status(False, reason)
+            self.last_upload_error = reason
+            self.last_upload_traceback = traceback.format_exc()
+            error(f"YouTube API authentication expired: {e}")
+            raise
         except Exception as e:
             import traceback
 

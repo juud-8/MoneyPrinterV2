@@ -35,6 +35,7 @@ from analytics import (
 )
 from brand_switcher import list_brands, load_brand
 from performance_insights import get_insights_summary
+from run_status import get_run_status_alert
 from trend_discovery import fetch_trending_topics
 from youtube_metrics import get_latest_channel_snapshots
 
@@ -356,6 +357,7 @@ def api_ops():
             "videos": videos[:40],
             "insights": insights,
             "status_counts": data.get("status_counts"),
+            "run_status": get_run_status_alert(),
         }
     )
 

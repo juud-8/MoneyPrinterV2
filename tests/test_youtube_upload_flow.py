@@ -32,6 +32,15 @@ class ResolveVisibilityTests(unittest.TestCase):
             "unlisted",
         )
 
+    def test_unattended_always_resolves_private(self):
+        self.assertEqual(
+            resolve_upload_visibility(
+                {"default_visibility": "public"},
+                unattended=True,
+            ),
+            "private",
+        )
+
 
 class RadioMatchTests(unittest.TestCase):
     def test_matches_label_words(self):

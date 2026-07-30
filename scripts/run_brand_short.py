@@ -194,6 +194,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"UPLOAD: {'success' if ok else 'failed'}")
             if ok and getattr(youtube, "uploaded_video_url", None):
                 print(f"URL: {youtube.uploaded_video_url}")
+            if ok:
+                try:
+                    from post_bridge_integration import maybe_crosspost_youtube_short
+
+                    crosspost_result = maybe_crosspost_youtube_short(
+                        video_path=youtube.video_path,
+                        title=youtube.metadata.get("title", ""),
+                        interactive=False,
+                        youtube_privacy_status=getattr(
+                            youtube, "uploaded_privacy_status", ""
+                        ),
+                    )
+                    if crosspost_result is True:
+                        print("POST BRIDGE: cross-posted")
+                    elif crosspost_result is False:
+                        print("POST BRIDGE: cross-post failed (see warnings above)")
+                except Exception as exc:
+                    print(f"POST BRIDGE: error ({type(exc).__name__}: {exc})")
             emit_stage("done", status="success" if ok else "failed")
         else:
             print("UPLOAD: skipped")
