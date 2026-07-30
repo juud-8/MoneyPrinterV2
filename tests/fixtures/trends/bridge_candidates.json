@@ -1,0 +1,28 @@
+{
+  "bridges": [
+    {
+      "current_trigger_summary": "A safe fictional dance challenge fixture is circulating.",
+      "historical_event": "The dancing plague of 1518",
+      "relationship_type": "exact_entity",
+      "relationship_explanation": "Both concern sustained public dancing, separated by five centuries.",
+      "specific_number": "1518",
+      "absurd_contradiction": "Officials prescribed more dancing to people who could not stop.",
+      "first_spoken_sentence": "In 1518, officials prescribed more dancing to people who could not stop.",
+      "first_frame_text": "THE CURE WAS MORE DANCING",
+      "working_titles": [],
+      "central_payoff": "The attempted cure repeated the apparent symptom.",
+      "target_seconds": 55,
+      "archive_fit_score": 95,
+      "sourceability_score": 95,
+      "visual_potential_score": 80,
+      "competition_score": 20,
+      "duplicate_similarity": 5,
+      "risk_flags": [],
+      "unknowns": [],
+      "historical_sources": [
+        "https://history.test/dancing-plague",
+        "https://archive.test/strasbourg-1518"
+      ]
+    }
+  ]
+}

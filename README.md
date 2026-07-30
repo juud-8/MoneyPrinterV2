@@ -77,6 +77,7 @@ All relevant documents can be found [here](docs/).
 - [Voicebox local narration](docs/VOICEBOX_INTEGRATION.md) — optional,
   loopback-only Voicebox 0.5 provider with explicit fallback and offline-tested
   provenance. Voicebox remains a separate manual installation.
+- [Trend-to-Archive MVP operator guide](docs/Trend_Intelligence.md)
 
 ## Scripts
 

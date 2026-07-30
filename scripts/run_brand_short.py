@@ -3,6 +3,8 @@
 import argparse
 import os
 import sys
+import uuid
+from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
@@ -19,6 +21,49 @@ from archive_song import (
     normalize_audio_mode,
 )
 from pipeline_stage import emit_stage
+from trend_models import ValidationError
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _handle_trend_generation_failure(
+    store, seed, claim_id: str, error: Exception, failed_at: str, *, stage: str = "pre_production",
+) -> str:
+    """Release proven local failures; quarantine failures with uncertain side effects."""
+    classification = str(getattr(error, "trend_failure_class", "")).lower()
+    retryable_local = stage == "pre_production" and (
+        classification == "pre_production" or isinstance(
+            error, (ValidationError, FileNotFoundError, ModuleNotFoundError, ImportError)
+        )
+    )
+    if retryable_local:
+        reason = f"retryable_pre_production: {type(error).__name__}"
+        if not store.release_topic_seed(seed.seed_id, claim_id, failed_at, reason):
+            raise RuntimeError("Trend seed claim was lost before retryable release") from error
+        return "released_retryable"
+    if classification == "terminal":
+        reason = f"terminal: {type(error).__name__}"
+    else:
+        reason = f"uncertain_external_side_effect: {type(error).__name__}"
+    if not store.fail_topic_seed(seed.seed_id, claim_id, failed_at, reason):
+        raise RuntimeError("Trend seed claim was lost before failure quarantine") from error
+    return "failed_terminal" if classification == "terminal" else "failed_uncertain"
+
+
+def _fail_trend_claim(store, seed, claim_id, error, youtube) -> None:
+    """Hand a claimed seed back when generation ends without consuming it."""
+    if seed is None or store is None or not claim_id:
+        return
+    _handle_trend_generation_failure(
+        store,
+        seed,
+        claim_id,
+        error,
+        _utc_now(),
+        stage=str(getattr(youtube, "trend_generation_stage", "pre_production")),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--episode", help="stable episode id/number (recommended for resume)")
     parser.add_argument("--topic", help="operator-selected historical topic")
+    parser.add_argument(
+        "--trend-seed",
+        metavar="SEED_ID",
+        help="generate from an approved trend seed (mutually exclusive with --topic)",
+    )
     parser.add_argument(
         "--audio-mode",
         default="narration",
@@ -75,6 +125,11 @@ def main(argv: list[str] | None = None) -> int:
     do_upload = args.upload or bool(args.publish_at)
     episode = args.episode
     topic = args.topic
+    trend_seed_id = args.trend_seed
+
+    if trend_seed_id and topic:
+        print("ERROR: --trend-seed and --topic are mutually exclusive")
+        return 2
 
     publish_at = ""
     if args.publish_at:
@@ -136,6 +191,25 @@ def main(argv: list[str] | None = None) -> int:
         account["niche"],
         account["language"],
     )
+
+    trend_store = None
+    trend_seed = None
+    trend_claim_id = None
+    if trend_seed_id:
+        from trend_store import TrendStore
+
+        trend_store = TrendStore()
+        trend_seed = trend_store.get_topic_seed(trend_seed_id)
+        if trend_seed is None:
+            print(f"ERROR: Unknown trend seed: {trend_seed_id}")
+            return 2
+        youtube.use_topic_seed(trend_seed)
+        trend_claim_id = f"generation-{uuid.uuid4().hex}"
+        if not trend_store.claim_topic_seed(trend_seed.seed_id, trend_claim_id, _utc_now()):
+            print(f"ERROR: Trend seed is already claimed, completed, or failed: {trend_seed_id}")
+            return 2
+        print(f"Trend seed: {trend_seed.seed_id} ({trend_seed.historical_event})")
+
     if episode:
         youtube.episode_number = episode
         youtube.archive_song_episode_id = episode
@@ -153,6 +227,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         path = youtube.generate_video(tts, interactive=False)
     except AwaitingSongAudio as pause:
+        # A pause, not a failure: nothing rendered or published, so the seed is
+        # provably untouched and goes straight back on the queue for the resume.
+        if trend_seed is not None and trend_store is not None and trend_claim_id:
+            if not trend_store.release_topic_seed(
+                trend_seed.seed_id, trend_claim_id, _utc_now(), "paused_awaiting_song_audio"
+            ):
+                raise RuntimeError("Trend seed claim was lost before pause release") from pause
         print("\n=== ARCHIVE SONG PAUSED ===")
         print("STATUS: awaiting_song_audio")
         print(f"EPISODE_DIR: {pause.episode_dir}")
@@ -161,10 +242,31 @@ def main(argv: list[str] | None = None) -> int:
         youtube.close_browser()
         return 0
     except ArchiveSongError as exc:
+        _fail_trend_claim(trend_store, trend_seed, trend_claim_id, exc, youtube)
         print(f"ERROR: {exc}")
         emit_stage("done", status="failed")
         youtube.close_browser()
         return 2
+    except Exception as error:
+        _fail_trend_claim(trend_store, trend_seed, trend_claim_id, error, youtube)
+        raise
+
+    if trend_seed is not None and trend_store is not None:
+        if not trend_store.complete_topic_seed(
+            trend_seed.seed_id, trend_claim_id, _utc_now(), run_id=youtube.run_id
+        ):
+            raise RuntimeError("Trend seed claim was lost before generation completion")
+        attribution = dict(youtube.production_metadata.get("trend_attribution") or {})
+        trend_store.save_attribution(
+            seed_id=trend_seed.seed_id,
+            opportunity_id=trend_seed.approval_record.opportunity_id,
+            brand_id=trend_seed.brand_id,
+            run_id=youtube.run_id,
+            detected_at=trend_seed.detected_at,
+            approved_at=trend_seed.approval_record.decided_at,
+            status="generated",
+            payload=attribution,
+        )
 
     print("\n=== GENERATION COMPLETE ===")
     saved = getattr(youtube, "output_video_path", None) or path
@@ -194,6 +296,20 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"UPLOAD: {'success' if ok else 'failed'}")
             if ok and getattr(youtube, "uploaded_video_url", None):
                 print(f"URL: {youtube.uploaded_video_url}")
+            if ok and trend_seed is not None and trend_store is not None:
+                attribution = dict(youtube.production_metadata.get("trend_attribution") or {})
+                trend_store.save_attribution(
+                    seed_id=trend_seed.seed_id,
+                    opportunity_id=trend_seed.approval_record.opportunity_id,
+                    brand_id=trend_seed.brand_id,
+                    run_id=youtube.run_id,
+                    youtube_video_id=attribution.get("youtube_video_id", ""),
+                    detected_at=trend_seed.detected_at,
+                    approved_at=trend_seed.approval_record.decided_at,
+                    publication_time=attribution.get("publication_time", ""),
+                    status="uploaded",
+                    payload=attribution,
+                )
             if ok:
                 try:
                     from post_bridge_integration import maybe_crosspost_youtube_short

@@ -1,0 +1,878 @@
+"""Validated contracts for the Trend-to-Archive intelligence engine.
+
+The trend pipeline handles external API responses and LLM-generated bridge
+proposals.  Both are untrusted input, so objects enter the engine only through
+the explicit ``from_dict`` validators in this module.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import unicodedata
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Any
+from urllib.parse import parse_qsl, urlparse
+from uuid import uuid4
+
+
+SCHEMA_VERSION = 1
+
+_CREDENTIAL_METADATA_KEYS = {
+    "authorization", "access_token", "refresh_token", "api_key", "key", "token",
+    "bearer", "secret", "client_secret", "password", "cookie", "session",
+}
+_PROVIDER_METADATA_ALLOWLISTS = {
+    "manual": {"fixture_case", "active_tragedy", "import", "unique_domains", "article_count"},
+    "gdelt": {"unique_domains", "article_count", "active_tragedy"},
+    "wikimedia": {"baseline_daily_views", "recent_daily_views"},
+    "youtube": {
+        "result_count", "total_public_views", "median_views_per_hour_proxy", "quota_calls",
+        "fetched_at", "refresh_due_at", "delete_or_expire_at", "retention_policy",
+        "source_provenance",
+    },
+    "x": set(),
+    "google_trends": set(),
+}
+
+
+def _is_credential_key(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
+    return normalized in _CREDENTIAL_METADATA_KEYS or any(
+        normalized.endswith(f"_{suffix}")
+        for suffix in ("authorization", "token", "bearer", "secret", "password", "cookie", "session", "key")
+    )
+
+ALLOWED_RISK_FLAGS = {
+    "active_tragedy",
+    "living_person_allegation",
+    "exploitative_victims",
+    "unverified_breaking_claim",
+    "dangerous_misinformation",
+    "copyright_dependent",
+    "outside_brand_policy",
+    "suspected_manipulation",
+    "insufficient_lifetime",
+    "forced_connection",
+}
+
+
+class ValidationError(ValueError):
+    """Raised when an external or generated payload violates its contract."""
+
+
+class RelationshipType(str, Enum):
+    EXACT_ENTITY = "exact_entity"
+    SAME_PERSON = "same_person"
+    SAME_PLACE = "same_place"
+    SAME_SPECIES = "same_species"
+    SAME_INSTITUTION = "same_institution"
+    HISTORICAL_PRECEDENT = "historical_precedent"
+    IRONIC_PARALLEL = "ironic_parallel"
+    ANNIVERSARY = "anniversary"
+    ALTERNATE_ANGLE = "alternate_angle"
+
+
+class RecommendedAction(str, Enum):
+    NEW_VIDEO = "new_video"
+    ALTERNATE_ANGLE = "alternate_angle"
+    RESURFACE_EXISTING = "resurface_existing"
+    HUMAN_REVIEW_REQUIRED = "human_review_required"
+    SKIP = "skip"
+
+
+class TrendMode(str, Enum):
+    OFF = "off"
+    SUGGEST = "suggest"
+
+
+class ApprovalStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class CatalogDecision(str, Enum):
+    NEW_VIDEO = "new_video"
+    ALTERNATE_ANGLE = "alternate_angle"
+    RESURFACE_EXISTING = "resurface_existing"
+    HUMAN_REVIEW_REQUIRED = "human_review_required"
+    SKIP = "skip"
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex}"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _require_text(value: Any, name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValidationError(f"{name} is required")
+    return text
+
+
+def _text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _string_list(value: Any, name: str, *, required: bool = False) -> list[str]:
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        raise ValidationError(f"{name} must be a list")
+    result = list(dict.fromkeys(_text(item) for item in value if _text(item)))
+    if required and not result:
+        raise ValidationError(f"{name} must not be empty")
+    return result
+
+
+def _mapping(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValidationError(f"{name} must be an object")
+    return dict(value)
+
+
+def _clean_metadata_value(value: Any, name: str, *, depth: int = 0) -> Any:
+    if depth > 3:
+        raise ValidationError(f"{name} exceeds maximum nesting depth")
+    if value is None or type(value) in {bool, int, float}:
+        return value
+    if isinstance(value, str):
+        cleaned = "".join(character for character in value if unicodedata.category(character) != "Cc")
+        if len(cleaned) > 1000:
+            raise ValidationError(f"{name} contains an oversized string")
+        return cleaned
+    if isinstance(value, list):
+        if len(value) > 50:
+            raise ValidationError(f"{name} contains too many list items")
+        return [_clean_metadata_value(item, name, depth=depth + 1) for item in value]
+    if isinstance(value, dict):
+        if len(value) > 50:
+            raise ValidationError(f"{name} contains too many fields")
+        result = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValidationError(f"{name} contains a non-string key")
+            normalized = re.sub(r"[^a-z0-9]+", "_", key.casefold()).strip("_")
+            if _is_credential_key(normalized):
+                continue
+            result[normalized] = _clean_metadata_value(item, name, depth=depth + 1)
+        return result
+    raise ValidationError(f"{name} contains an unsupported value type")
+
+
+def sanitize_provider_metadata(provider: str, value: Any) -> dict[str, Any]:
+    raw = _mapping(value, "raw_metadata")
+    allowlist = _PROVIDER_METADATA_ALLOWLISTS.get(provider, set())
+    filtered = {key: item for key, item in raw.items() if str(key).casefold() in allowlist}
+    cleaned = _clean_metadata_value(filtered, "raw_metadata")
+    if len(json.dumps(cleaned, ensure_ascii=False)) > 50_000:
+        raise ValidationError("raw_metadata exceeds the 50KB safety limit")
+    return cleaned
+
+
+def _number(value: Any, name: str, *, minimum: float | None = None) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{name} must be numeric") from exc
+    if minimum is not None and result < minimum:
+        raise ValidationError(f"{name} must be >= {minimum}")
+    return result
+
+
+def _optional_number(value: Any, name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    return _number(value, name)
+
+
+def _score(value: Any, name: str) -> float:
+    result = _number(value, name)
+    if not 0 <= result <= 100:
+        raise ValidationError(f"{name} must be between 0 and 100")
+    return result
+
+
+def _timestamp(value: Any, name: str) -> str:
+    text = _require_text(value, name)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValidationError(f"{name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValidationError(f"{name} must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _urls(value: Any, name: str) -> list[str]:
+    urls = _string_list(value, name)
+    for url in urls:
+        if len(url) > 2048:
+            raise ValidationError(f"{name} contains an oversized URL")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValidationError(f"{name} contains an invalid HTTP(S) URL")
+        if any(_is_credential_key(key) for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
+            raise ValidationError(f"{name} contains credential-bearing query parameters")
+    return urls
+
+
+def _enum(enum_type: type[Enum], value: Any, name: str):
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in enum_type)
+        raise ValidationError(f"{name} must be one of: {allowed}") from exc
+
+
+@dataclass(frozen=True)
+class ScoreComponent:
+    name: str
+    score: float | None
+    confidence: float
+    source: str
+    unknown_reason: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ScoreComponent":
+        score = data.get("score")
+        confidence = _number(data.get("confidence", 0), "confidence")
+        if not 0 <= confidence <= 1:
+            raise ValidationError("confidence must be between 0 and 1")
+        return cls(
+            name=_require_text(data.get("name"), "component name"),
+            score=None if score is None else _score(score, "component score"),
+            confidence=confidence,
+            source=_require_text(data.get("source"), "component source"),
+            unknown_reason=_text(data.get("unknown_reason")),
+        )
+
+
+@dataclass(frozen=True)
+class TrendRequest:
+    brand_id: str
+    terms: list[str]
+    geographies: list[str]
+    languages: list[str]
+    window_hours: float = 24
+    max_results: int = 10
+    dry_run: bool = True
+    requested_at: str = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TrendRequest":
+        max_results = int(data.get("max_results", 10))
+        if not 1 <= max_results <= 100:
+            raise ValidationError("max_results must be between 1 and 100")
+        return cls(
+            brand_id=_require_text(data.get("brand_id"), "brand_id"),
+            terms=_string_list(data.get("terms"), "terms"),
+            geographies=_string_list(data.get("geographies"), "geographies") or ["WORLDWIDE"],
+            languages=_string_list(data.get("languages"), "languages") or ["en"],
+            window_hours=_number(data.get("window_hours", 24), "window_hours", minimum=1),
+            max_results=max_results,
+            dry_run=bool(data.get("dry_run", True)),
+            requested_at=_timestamp(data.get("requested_at", utc_now()), "requested_at"),
+        )
+
+
+@dataclass(frozen=True)
+class ProviderError:
+    code: str
+    message: str
+    retryable: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProviderError":
+        return cls(
+            code=_require_text(data.get("code"), "provider error code"),
+            message=_require_text(data.get("message"), "provider error message"),
+            retryable=bool(data.get("retryable", False)),
+        )
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    provider: str
+    signals: list[TrendSignal]
+    errors: list[ProviderError]
+    cache_hit: bool
+    request_count: int
+    resource_count: int
+    estimated_cost_usd: float
+    actual_cost_usd: float | None
+    collected_at: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProviderResult":
+        signals = data.get("signals") or []
+        errors = data.get("errors") or []
+        if not isinstance(signals, list) or not isinstance(errors, list):
+            raise ValidationError("provider signals and errors must be lists")
+        return cls(
+            provider=_require_text(data.get("provider"), "provider"),
+            signals=[item if isinstance(item, TrendSignal) else TrendSignal.from_dict(item) for item in signals],
+            errors=[item if isinstance(item, ProviderError) else ProviderError.from_dict(item) for item in errors],
+            cache_hit=bool(data.get("cache_hit", False)),
+            request_count=int(data.get("request_count", 0)),
+            resource_count=int(data.get("resource_count", len(signals))),
+            estimated_cost_usd=_number(data.get("estimated_cost_usd", 0), "estimated_cost_usd", minimum=0),
+            actual_cost_usd=_optional_number(data.get("actual_cost_usd"), "actual_cost_usd"),
+            collected_at=_timestamp(data.get("collected_at", utc_now()), "collected_at"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["signals"] = [signal.to_dict() for signal in self.signals]
+        return payload
+
+
+@dataclass(frozen=True)
+class TrendSignal:
+    provider: str
+    provider_signal_id: str
+    collected_at: str
+    term: str
+    normalized_entity: str
+    aliases: list[str] = field(default_factory=list)
+    entity_type: str = "unknown"
+    geography: str = "WORLDWIDE"
+    language: str = "und"
+    window_hours: float = 0
+    rank: float | None = None
+    volume: float | None = None
+    volume_is_absolute: bool = False
+    velocity: float | None = None
+    related_terms: list[str] = field(default_factory=list)
+    source_urls: list[str] = field(default_factory=list)
+    raw_metadata: dict[str, Any] = field(default_factory=dict)
+    signal_id: str = field(default_factory=lambda: new_id("sig"))
+    schema_version: int = SCHEMA_VERSION
+    metric_type: str = "unspecified"
+    expires_at: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TrendSignal":
+        provider = _require_text(data.get("provider"), "provider").lower()
+        raw = sanitize_provider_metadata(provider, data.get("raw_metadata"))
+        metric_type = _require_text(data.get("metric_type", "unspecified"), "metric_type")
+        absolute = bool(data.get("volume_is_absolute", False))
+        if provider == "google_trends" and absolute:
+            raise ValidationError("Google Trends interest is relative, not absolute volume")
+        expires_at = _text(data.get("expires_at"))
+        collected_at = _timestamp(data.get("collected_at"), "collected_at")
+        window_hours = _number(data.get("window_hours", 0), "window_hours", minimum=0)
+        if not expires_at and window_hours > 0:
+            collected = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+            expires_at = (collected + timedelta(hours=window_hours)).isoformat().replace("+00:00", "Z")
+        provider_signal_id = _require_text(data.get("provider_signal_id"), "provider_signal_id")
+        signal_id = _text(data.get("signal_id"))
+        if not signal_id:
+            digest = hashlib.sha256(
+                f"{provider}|{provider_signal_id}|{collected_at}".encode("utf-8")
+            ).hexdigest()[:32]
+            signal_id = f"sig_{digest}"
+        term = _require_text(data.get("term"), "term")
+        normalized_entity = _require_text(data.get("normalized_entity"), "normalized_entity")
+        if len(term) > 300 or len(normalized_entity) > 300:
+            raise ValidationError("trend term or normalized entity exceeds 300 characters")
+        aliases = _string_list(data.get("aliases"), "aliases")
+        related_terms = _string_list(data.get("related_terms"), "related_terms")
+        if any(len(value) > 300 for value in [*aliases, *related_terms]):
+            raise ValidationError("trend alias or related term exceeds 300 characters")
+        return cls(
+            signal_id=signal_id,
+            provider=provider,
+            provider_signal_id=provider_signal_id,
+            collected_at=collected_at,
+            term=term,
+            normalized_entity=normalized_entity,
+            aliases=aliases,
+            entity_type=_text(data.get("entity_type")) or "unknown",
+            geography=_text(data.get("geography")) or "WORLDWIDE",
+            language=_text(data.get("language")) or "und",
+            window_hours=window_hours,
+            rank=_optional_number(data.get("rank"), "rank"),
+            volume=_optional_number(data.get("volume"), "volume"),
+            volume_is_absolute=absolute,
+            velocity=_optional_number(data.get("velocity"), "velocity"),
+            related_terms=related_terms,
+            source_urls=_urls(data.get("source_urls"), "source_urls"),
+            raw_metadata=raw,
+            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+            metric_type=metric_type,
+            expires_at=_timestamp(expires_at, "expires_at") if expires_at else "",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TrendCluster:
+    cluster_id: str
+    canonical_entity: str
+    aliases: list[str]
+    entity_type: str
+    first_seen: str
+    last_seen: str
+    geographies: list[str]
+    languages: list[str]
+    signals: list[TrendSignal]
+    cross_source_count: int
+    trend_velocity_score: float | None
+    search_intent_score: float | None
+    news_confirmation_score: float | None
+    freshness_score: float | None
+    confidence: float
+    collection_horizon_hours: float = 24
+    competing_interpretations: list[dict[str, Any]] = field(default_factory=list)
+    unknowns: list[str] = field(default_factory=list)
+    schema_version: int = SCHEMA_VERSION
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TrendCluster":
+        signals_raw = data.get("signals") or []
+        if not isinstance(signals_raw, list) or not signals_raw:
+            raise ValidationError("signals must contain at least one TrendSignal")
+        signals = [
+            item if isinstance(item, TrendSignal) else TrendSignal.from_dict(item)
+            for item in signals_raw
+        ]
+        first_seen = _timestamp(data.get("first_seen"), "first_seen")
+        last_seen = _timestamp(data.get("last_seen"), "last_seen")
+        if datetime.fromisoformat(first_seen.replace("Z", "+00:00")) > datetime.fromisoformat(last_seen.replace("Z", "+00:00")):
+            raise ValidationError("first_seen must not be after last_seen")
+        confidence = _number(data.get("confidence", 0), "confidence")
+        if not 0 <= confidence <= 1:
+            raise ValidationError("confidence must be between 0 and 1")
+        providers = {signal.provider for signal in signals}
+        cross_source_count = int(data.get("cross_source_count", len(providers)))
+        if cross_source_count > len(providers):
+            raise ValidationError("cross_source_count cannot exceed independent providers")
+
+        def optional_score(name: str) -> float | None:
+            value = data.get(name)
+            return None if value is None else _score(value, name)
+
+        interpretations = data.get("competing_interpretations") or []
+        if not isinstance(interpretations, list):
+            raise ValidationError("competing_interpretations must be a list")
+        return cls(
+            cluster_id=_text(data.get("cluster_id")) or new_id("cluster"),
+            canonical_entity=_require_text(data.get("canonical_entity"), "canonical_entity"),
+            aliases=_string_list(data.get("aliases"), "aliases"),
+            entity_type=_text(data.get("entity_type")) or "unknown",
+            first_seen=first_seen,
+            last_seen=last_seen,
+            geographies=_string_list(data.get("geographies"), "geographies"),
+            languages=_string_list(data.get("languages"), "languages"),
+            signals=signals,
+            cross_source_count=cross_source_count,
+            trend_velocity_score=optional_score("trend_velocity_score"),
+            search_intent_score=optional_score("search_intent_score"),
+            news_confirmation_score=optional_score("news_confirmation_score"),
+            freshness_score=optional_score("freshness_score"),
+            confidence=confidence,
+            collection_horizon_hours=_number(
+                data.get("collection_horizon_hours", 24), "collection_horizon_hours", minimum=1
+            ),
+            competing_interpretations=[dict(item) for item in interpretations if isinstance(item, dict)],
+            unknowns=_string_list(data.get("unknowns"), "unknowns"),
+            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["signals"] = [signal.to_dict() for signal in self.signals]
+        return payload
+
+
+@dataclass(frozen=True)
+class ArchiveBridge:
+    trend_cluster_id: str
+    current_trigger_summary: str
+    historical_event: str
+    relationship_type: RelationshipType
+    relationship_explanation: str
+    specific_number: str
+    absurd_contradiction: str
+    first_spoken_sentence: str
+    first_frame_text: str
+    working_titles: list[str]
+    central_payoff: str
+    target_seconds: float
+    archive_fit_score: float
+    sourceability_score: float
+    visual_potential_score: float | None
+    competition_score: float | None
+    duplicate_similarity: float | None
+    risk_flags: list[str]
+    supporting_sources: list[str]
+    bridge_id: str = field(default_factory=lambda: new_id("bridge"))
+    current_news_sources: list[str] = field(default_factory=list)
+    historical_sources: list[str] = field(default_factory=list)
+    unknowns: list[str] = field(default_factory=list)
+    schema_version: int = SCHEMA_VERSION
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ArchiveBridge":
+        explanation = _require_text(data.get("relationship_explanation"), "relationship_explanation")
+        if len(explanation) > 400:
+            raise ValidationError("relationship_explanation must be explainable in one concise sentence")
+
+        def optional_score(name: str) -> float | None:
+            value = data.get(name)
+            return None if value is None else _score(value, name)
+
+        supporting = _urls(data.get("supporting_sources"), "supporting_sources")
+        current_sources = _urls(data.get("current_news_sources"), "current_news_sources")
+        historical_sources = _urls(data.get("historical_sources"), "historical_sources")
+        risk_flags = _string_list(data.get("risk_flags"), "risk_flags")
+        invalid_flags = sorted(set(risk_flags) - ALLOWED_RISK_FLAGS)
+        if invalid_flags:
+            raise ValidationError(f"unknown risk flags: {', '.join(invalid_flags)}")
+        return cls(
+            bridge_id=_text(data.get("bridge_id")) or new_id("bridge"),
+            trend_cluster_id=_require_text(data.get("trend_cluster_id"), "trend_cluster_id"),
+            current_trigger_summary=_require_text(data.get("current_trigger_summary"), "current_trigger_summary"),
+            historical_event=_require_text(data.get("historical_event"), "historical_event"),
+            relationship_type=_enum(RelationshipType, data.get("relationship_type"), "relationship_type"),
+            relationship_explanation=explanation,
+            specific_number=_text(data.get("specific_number")),
+            absurd_contradiction=_require_text(data.get("absurd_contradiction"), "absurd_contradiction"),
+            first_spoken_sentence=_require_text(data.get("first_spoken_sentence"), "first_spoken_sentence"),
+            first_frame_text=_require_text(data.get("first_frame_text"), "first_frame_text"),
+            working_titles=_string_list(data.get("working_titles"), "working_titles"),
+            central_payoff=_require_text(data.get("central_payoff"), "central_payoff"),
+            target_seconds=_number(data.get("target_seconds"), "target_seconds", minimum=1),
+            archive_fit_score=_score(data.get("archive_fit_score"), "archive_fit_score"),
+            sourceability_score=_score(data.get("sourceability_score"), "sourceability_score"),
+            visual_potential_score=optional_score("visual_potential_score"),
+            competition_score=optional_score("competition_score"),
+            duplicate_similarity=optional_score("duplicate_similarity"),
+            risk_flags=risk_flags,
+            supporting_sources=supporting,
+            current_news_sources=current_sources or supporting,
+            historical_sources=historical_sources,
+            unknowns=_string_list(data.get("unknowns"), "unknowns"),
+            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["relationship_type"] = self.relationship_type.value
+        return payload
+
+
+@dataclass(frozen=True)
+class TrendOpportunity:
+    trend: TrendCluster
+    bridge: ArchiveBridge
+    opportunity_score: float
+    recommended_action: RecommendedAction
+    existing_video_match: dict[str, Any] | None
+    expires_at: str
+    reasoning: list[str]
+    observed_facts: list[str]
+    inferences: list[str]
+    unknowns: list[str]
+    components: list[ScoreComponent]
+    opportunity_id: str = field(default_factory=lambda: new_id("opp"))
+    eligible: bool = False
+    eligibility_failures: list[str] = field(default_factory=list)
+    brand_id: str = ""
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    schema_version: int = SCHEMA_VERSION
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TrendOpportunity":
+        trend_raw = data.get("trend")
+        bridge_raw = data.get("bridge")
+        trend = trend_raw if isinstance(trend_raw, TrendCluster) else TrendCluster.from_dict(trend_raw or {})
+        bridge = bridge_raw if isinstance(bridge_raw, ArchiveBridge) else ArchiveBridge.from_dict(bridge_raw or {})
+        if bridge.trend_cluster_id != trend.cluster_id:
+            raise ValidationError("bridge must reference the opportunity trend cluster")
+        match = data.get("existing_video_match")
+        if match is not None and not isinstance(match, dict):
+            raise ValidationError("existing_video_match must be an object or null")
+        components_raw = data.get("components") or []
+        if not isinstance(components_raw, list):
+            raise ValidationError("components must be a list")
+        return cls(
+            opportunity_id=_text(data.get("opportunity_id")) or new_id("opp"),
+            trend=trend,
+            bridge=bridge,
+            opportunity_score=_score(data.get("opportunity_score"), "opportunity_score"),
+            recommended_action=_enum(RecommendedAction, data.get("recommended_action"), "recommended_action"),
+            existing_video_match=dict(match) if match else None,
+            expires_at=_timestamp(data.get("expires_at"), "expires_at"),
+            reasoning=_string_list(data.get("reasoning"), "reasoning"),
+            observed_facts=_string_list(data.get("observed_facts"), "observed_facts"),
+            inferences=_string_list(data.get("inferences"), "inferences"),
+            unknowns=_string_list(data.get("unknowns"), "unknowns"),
+            components=[item if isinstance(item, ScoreComponent) else ScoreComponent.from_dict(item) for item in components_raw],
+            eligible=bool(data.get("eligible", False)),
+            eligibility_failures=_string_list(data.get("eligibility_failures"), "eligibility_failures"),
+            brand_id=_require_text(data.get("brand_id"), "brand_id"),
+            status=_enum(ApprovalStatus, data.get("status", ApprovalStatus.PENDING.value), "status"),
+            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["trend"] = self.trend.to_dict()
+        payload["bridge"] = self.bridge.to_dict()
+        payload["recommended_action"] = self.recommended_action.value
+        payload["status"] = self.status.value
+        return payload
+
+
+@dataclass(frozen=True)
+class ApprovalRecord:
+    approval_id: str
+    opportunity_id: str
+    brand_id: str
+    status: ApprovalStatus
+    decided_at: str
+    operator: str
+    reason: str
+    content_mix_override: bool = False
+    override_reason: str = ""
+    previous_calculated_share: float = 0.0
+    resulting_calculated_share: float = 0.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ApprovalRecord":
+        override = bool(data.get("content_mix_override", False))
+        override_reason = _text(data.get("override_reason"))
+        if override and not override_reason:
+            raise ValidationError("content-mix override requires a recorded reason")
+        return cls(
+            approval_id=_text(data.get("approval_id")) or new_id("approval"),
+            opportunity_id=_require_text(data.get("opportunity_id"), "opportunity_id"),
+            brand_id=_require_text(data.get("brand_id"), "brand_id"),
+            status=_enum(ApprovalStatus, data.get("status"), "status"),
+            decided_at=_timestamp(data.get("decided_at"), "decided_at"),
+            operator=_require_text(data.get("operator"), "operator"),
+            reason=_require_text(data.get("reason"), "reason"),
+            content_mix_override=override,
+            override_reason=override_reason,
+            previous_calculated_share=_number(data.get("previous_calculated_share", 0), "previous_calculated_share"),
+            resulting_calculated_share=_number(data.get("resulting_calculated_share", 0), "resulting_calculated_share"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["status"] = self.status.value
+        return payload
+
+
+@dataclass(frozen=True)
+class SourceBackedClaim:
+    claim_id: str
+    kind: str
+    text: str
+    source_urls: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SourceBackedClaim":
+        kind = _require_text(data.get("kind"), "claim.kind")
+        text = _require_text(data.get("text"), "claim.text")
+        sources = _urls(data.get("source_urls"), "claim.source_urls")
+        if len({urlparse(url).hostname for url in sources}) < 2:
+            raise ValidationError("each required structured claim needs two source domains")
+        claim_id = _text(data.get("claim_id"))
+        if not claim_id:
+            claim_id = "claim_" + hashlib.sha256(f"{kind}|{text}".encode("utf-8")).hexdigest()[:24]
+        return cls(claim_id=claim_id, kind=kind, text=text, source_urls=sources)
+
+
+@dataclass(frozen=True)
+class StructuredEventClaims:
+    primary_entities: list[str]
+    event_identity: str
+    period: str
+    cause: str
+    official_response: str
+    central_contradiction: str
+    consequence: str
+    sourced_claims: list[SourceBackedClaim]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "StructuredEventClaims":
+        claims_raw = data.get("sourced_claims") or []
+        if not isinstance(claims_raw, list):
+            raise ValidationError("structured sourced_claims must be a list")
+        claims = [
+            item if isinstance(item, SourceBackedClaim) else SourceBackedClaim.from_dict(item)
+            for item in claims_raw
+        ]
+        required_kinds = {"event_identity", "official_response", "consequence"}
+        if not required_kinds.issubset({claim.kind for claim in claims}):
+            raise ValidationError("structured claims omit a required source-backed fact")
+        event_identity = _require_text(data.get("event_identity"), "event_identity")
+        official_response = _require_text(data.get("official_response"), "official_response")
+        consequence = _require_text(data.get("consequence"), "consequence")
+        expected = {
+            "event_identity": event_identity,
+            "official_response": official_response,
+            "consequence": consequence,
+        }
+        for kind, text in expected.items():
+            if not any(claim.kind == kind and claim.text == text for claim in claims):
+                raise ValidationError(f"structured {kind} does not match its source-backed claim")
+        return cls(
+            primary_entities=_string_list(data.get("primary_entities"), "primary_entities", required=True),
+            event_identity=event_identity,
+            period=_require_text(data.get("period"), "period"),
+            cause=_text(data.get("cause")),
+            official_response=official_response,
+            central_contradiction=_require_text(data.get("central_contradiction"), "central_contradiction"),
+            consequence=consequence,
+            sourced_claims=claims,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["sourced_claims"] = [asdict(claim) for claim in self.sourced_claims]
+        return payload
+
+
+@dataclass(frozen=True)
+class TopicSeed:
+    seed_id: str
+    brand_id: str
+    primary_entity: str
+    primary_keyword: str
+    keyword_aliases: list[str]
+    related_search_terms: list[str]
+    current_trigger_summary: str
+    current_news_source_references: list[str]
+    trend_geographies: list[str]
+    detected_at: str
+    expires_at: str
+    historical_event: str
+    historical_source_references: list[str]
+    relationship_type: RelationshipType
+    relationship_explanation: str
+    specific_number_date: str
+    absurd_contradiction: str
+    suggested_first_spoken_sentence: str
+    suggested_first_frame_text: str
+    description_context_sentence: str
+    catalog_decision: CatalogDecision
+    existing_video_match: dict[str, Any] | None
+    component_scores: list[ScoreComponent]
+    confidence: float
+    unknowns: list[str]
+    approval_record: ApprovalRecord
+    attribution_metadata: dict[str, Any]
+    created_at: str
+    structured_claims: StructuredEventClaims
+    schema_version: int = SCHEMA_VERSION
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TopicSeed":
+        approval_raw = data.get("approval_record")
+        approval = approval_raw if isinstance(approval_raw, ApprovalRecord) else ApprovalRecord.from_dict(approval_raw or {})
+        if approval.status != ApprovalStatus.APPROVED:
+            raise ValidationError("TopicSeed requires an approved approval record")
+        brand_id = _require_text(data.get("brand_id"), "brand_id")
+        if approval.brand_id != brand_id:
+            raise ValidationError("approval brand does not match TopicSeed brand")
+        decision = _enum(CatalogDecision, data.get("catalog_decision"), "catalog_decision")
+        if decision not in {CatalogDecision.NEW_VIDEO, CatalogDecision.ALTERNATE_ANGLE}:
+            raise ValidationError("only new-video or alternate-angle opportunities may create TopicSeed")
+        confidence = _number(data.get("confidence", 0), "confidence")
+        if not 0 <= confidence <= 1:
+            raise ValidationError("confidence must be between 0 and 1")
+        match = data.get("existing_video_match")
+        if match is not None and not isinstance(match, dict):
+            raise ValidationError("existing_video_match must be an object or null")
+        components = data.get("component_scores") or []
+        if not isinstance(components, list):
+            raise ValidationError("component_scores must be a list")
+        historical_sources = _urls(data.get("historical_source_references"), "historical_source_references")
+        structured_raw = data.get("structured_claims")
+        if not structured_raw:
+            structured_raw = _legacy_structured_claims(data, historical_sources)
+        structured = (
+            structured_raw if isinstance(structured_raw, StructuredEventClaims)
+            else StructuredEventClaims.from_dict(structured_raw)
+        )
+        return cls(
+            seed_id=_text(data.get("seed_id")) or new_id("seed"),
+            brand_id=brand_id,
+            primary_entity=_require_text(data.get("primary_entity"), "primary_entity"),
+            primary_keyword=_require_text(data.get("primary_keyword"), "primary_keyword"),
+            keyword_aliases=_string_list(data.get("keyword_aliases"), "keyword_aliases"),
+            related_search_terms=_string_list(data.get("related_search_terms"), "related_search_terms"),
+            current_trigger_summary=_require_text(data.get("current_trigger_summary"), "current_trigger_summary"),
+            current_news_source_references=_urls(data.get("current_news_source_references"), "current_news_source_references"),
+            trend_geographies=_string_list(data.get("trend_geographies"), "trend_geographies", required=True),
+            detected_at=_timestamp(data.get("detected_at"), "detected_at"),
+            expires_at=_timestamp(data.get("expires_at"), "expires_at"),
+            historical_event=_require_text(data.get("historical_event"), "historical_event"),
+            historical_source_references=historical_sources,
+            relationship_type=_enum(RelationshipType, data.get("relationship_type"), "relationship_type"),
+            relationship_explanation=_require_text(data.get("relationship_explanation"), "relationship_explanation"),
+            specific_number_date=_require_text(data.get("specific_number_date"), "specific_number_date"),
+            absurd_contradiction=_require_text(data.get("absurd_contradiction"), "absurd_contradiction"),
+            suggested_first_spoken_sentence=_require_text(data.get("suggested_first_spoken_sentence"), "suggested_first_spoken_sentence"),
+            suggested_first_frame_text=_require_text(data.get("suggested_first_frame_text"), "suggested_first_frame_text"),
+            description_context_sentence=_require_text(data.get("description_context_sentence"), "description_context_sentence"),
+            catalog_decision=decision,
+            existing_video_match=dict(match) if match else None,
+            component_scores=[item if isinstance(item, ScoreComponent) else ScoreComponent.from_dict(item) for item in components],
+            confidence=confidence,
+            unknowns=_string_list(data.get("unknowns"), "unknowns"),
+            approval_record=approval,
+            attribution_metadata=_mapping(data.get("attribution_metadata"), "attribution_metadata"),
+            created_at=_timestamp(data.get("created_at"), "created_at"),
+            structured_claims=structured,
+            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["relationship_type"] = self.relationship_type.value
+        payload["catalog_decision"] = self.catalog_decision.value
+        payload["approval_record"] = self.approval_record.to_dict()
+        payload["structured_claims"] = self.structured_claims.to_dict()
+        return payload
+
+
+def _legacy_structured_claims(data: dict[str, Any], sources: list[str]) -> dict[str, Any]:
+    def claim(kind: str, text: str) -> dict[str, Any]:
+        return {"kind": kind, "text": text, "source_urls": sources}
+
+    event = _require_text(data.get("historical_event"), "historical_event")
+    response = _require_text(data.get("absurd_contradiction"), "absurd_contradiction")
+    consequence = _require_text(
+        data.get("central_payoff") or data.get("description_context_sentence"), "structured consequence"
+    )
+    return {
+        "primary_entities": [_require_text(data.get("primary_entity"), "primary_entity")],
+        "event_identity": event,
+        "period": _require_text(data.get("specific_number_date"), "specific_number_date"),
+        "cause": "",
+        "official_response": response,
+        "central_contradiction": response,
+        "consequence": consequence,
+        "sourced_claims": [
+            claim("event_identity", event),
+            claim("official_response", response),
+            claim("consequence", consequence),
+        ],
+    }

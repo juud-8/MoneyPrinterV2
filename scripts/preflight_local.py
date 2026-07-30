@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import argparse
 from typing import Tuple
 
 import requests
@@ -57,7 +58,13 @@ def _find_default_install_profile_path(profiles_ini_text: str) -> str:
     return ""
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Validate local MoneyPrinterV2 readiness")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--offline", action="store_true", help="Skip every network check (default)")
+    mode.add_argument("--live", action="store_true", help="Explicitly authorize external readiness checks")
+    args = parser.parse_args(argv)
+    offline = not args.live
     if not os.path.exists(CONFIG_PATH):
         fail(f"Missing config file: {CONFIG_PATH}")
         return 1
@@ -91,12 +98,15 @@ def main() -> int:
 
     # Ollama (LLM)
     base = str(cfg.get("ollama_base_url", "http://127.0.0.1:11434")).rstrip("/")
-    reachable, detail = check_url(f"{base}/api/tags")
-    if not reachable:
-        fail(f"Ollama is not reachable at {base}: {detail}")
-        failures += 1
+    if offline:
+        ok("offline mode: skipped Ollama network check")
     else:
-        ok(f"Ollama reachable at {base}")
+        reachable, detail = check_url(f"{base}/api/tags")
+        if not reachable:
+            fail(f"Ollama is not reachable at {base}: {detail}")
+            failures += 1
+        else:
+            ok(f"Ollama reachable at {base}")
         try:
             tags = requests.get(f"{base}/api/tags", timeout=5).json()
             models = [m.get("name") for m in tags.get("models", [])]
@@ -121,11 +131,14 @@ def main() -> int:
         fail("nanobanana2_api_key is empty (and GEMINI_API_KEY is not set)")
         failures += 1
 
-    reachable, detail = check_url(nb2_base, timeout=8)
-    if not reachable:
-        warn(f"Nano Banana 2 base URL could not be reached: {detail}")
+    if offline:
+        ok("offline mode: skipped Nano Banana 2 network check")
     else:
-        ok(f"Nano Banana 2 base URL reachable: {nb2_base}")
+        reachable, detail = check_url(nb2_base, timeout=8)
+        if not reachable:
+            warn(f"Nano Banana 2 base URL could not be reached: {detail}")
+        else:
+            ok(f"Nano Banana 2 base URL reachable: {nb2_base}")
 
     if stt_provider == "local_whisper":
         try:
@@ -154,7 +167,7 @@ def main() -> int:
         # returns quota-exhaustion as a plain 401 (indistinguishable from a bad
         # key/voice in the logs) once the monthly character allowance runs out,
         # so surface remaining quota here instead of discovering it mid-run.
-        if el_key:
+        if el_key and not offline:
             MIN_CHARS_FOR_ONE_SCRIPT = 1000
             try:
                 sub = requests.get(
@@ -180,6 +193,8 @@ def main() -> int:
                     warn(f"Could not parse ElevenLabs subscription response: {sub}")
             except Exception as exc:
                 warn(f"Could not check ElevenLabs quota: {exc}")
+        elif el_key:
+            ok("offline mode: skipped ElevenLabs quota check")
 
     quality_llm = str(cfg.get("quality_llm_provider", "gemini")).lower()
     if quality_llm == "gemini":

@@ -1,0 +1,7 @@
+{
+  "provider": "google_trends",
+  "official_api_fixture": true,
+  "data": [
+    {"term": "bison", "search_interest": 73, "volume_is_absolute": false}
+  ]
+}
