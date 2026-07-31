@@ -295,6 +295,37 @@ class YouTube:
         """
         return generate_text(prompt, model_name=model_name, quality=quality)
 
+    def _generate_grounded_brief(
+        self, topic: str, sources: list[dict], max_attempts: int = 3
+    ) -> dict:
+        """Draft a source-mapped brief, re-prompting when the gate rejects it.
+
+        A single sampling of the model is not evidence that a topic is
+        ungroundable — weaker models routinely return three solid claims when
+        four were available. Re-prompt with the specific shortfall before
+        surfacing a failure the caller may answer by discarding the topic.
+        """
+        issues: list[str] = []
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            prompt = build_grounded_research_prompt(
+                topic, self.niche, sources, prior_issues=issues
+            )
+            try:
+                brief = parse_research_brief(
+                    self.generate_response(prompt, quality=True), topic, sources
+                )
+                issues = research_quality_issues(brief)
+            except ValueError as error:
+                brief, issues = None, [str(error)]
+            if not issues:
+                return brief
+            if attempt < max_attempts:
+                warning(
+                    f"Research attempt {attempt}/{max_attempts} rejected "
+                    f"({'; '.join(issues)}); re-prompting."
+                )
+        raise RuntimeError("Research quality gate failed: " + "; ".join(issues))
+
     def generate_research(self) -> str:
         """
         Add original value layer — key facts and angles for AI-policy compliance.
@@ -314,12 +345,7 @@ class YouTube:
                     f"Grounded research found only {len(sources)} usable source(s) for "
                     f"{topic!r}; refusing to generate an unverified nonfiction script."
                 )
-            prompt = build_grounded_research_prompt(topic, self.niche, sources)
-            raw = self.generate_response(prompt, quality=True)
-            brief = parse_research_brief(raw, topic, sources)
-            issues = research_quality_issues(brief)
-            if issues:
-                raise RuntimeError("Research quality gate failed: " + "; ".join(issues))
+            brief = self._generate_grounded_brief(topic, sources)
             brief["brand_id"] = active_brand.get("brand_id", "")
             brief["content_style"] = style_name
             self.research_brief = brief
@@ -648,6 +674,35 @@ class YouTube:
             return None
         return int(ceiling_secs * self._short_speech_wps())
 
+    def _trend_seed_script_requirements(self) -> str:
+        """Tell the writer what a trend-assisted script is validated against.
+
+        validate_topic_seed_script() rejects a script that drifts from the
+        approved claims: it wants the event named in the seed's own wording
+        inside one sentence, the period figure verbatim, and enough of the
+        contradiction and payoff to show the script is still about the thing
+        that was approved. None of that was ever passed to the writer, so the
+        validator was enforcing a contract the generator had never been given
+        — a faithful Steamboat Arabia script still failed because it never
+        happened to say "excavation" beside "Steamboat Arabia".
+
+        Empty for ordinary runs, so the daily pipeline is unaffected.
+        """
+        seed = getattr(self, "topic_seed", None)
+        if seed is None:
+            return ""
+        claims = seed.structured_claims
+        return f"""
+        APPROVED FACTS — this topic was approved on these exact claims and the
+        script is rejected if it drifts from them. Work them into the narration
+        naturally; never list them:
+        - Name the event with this wording, keeping those words together in a
+          single sentence: "{claims.event_identity}"
+        - Include this figure exactly as written: {claims.period}
+        - Land this contradiction: {claims.official_response}
+        - Land this outcome: {claims.consequence}
+"""
+
     def generate_script(self, _attempt: int = 0, shorten_note: str = "") -> str:
         """
         Generate a hook-first script with retention beats and CTA.
@@ -704,7 +759,7 @@ class YouTube:
         - Source markers such as [S1] are audit metadata; never include them in the spoken script
         - NO markdown, NO titles, NO stage directions, NO quotes around the script
         - Return ONLY the spoken script
-
+{self._trend_seed_script_requirements()}
         Topic: {self.subject}
         Research to incorporate:
         {research}
