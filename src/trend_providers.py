@@ -160,6 +160,8 @@ class ProviderSettings:
     # Minimum spacing between consecutive requests to this provider. Providers
     # that publish a rate floor set their own default; 0 means no pacing.
     min_request_interval_seconds: float = 0.0
+    # Attempts per request. Providers that 429 transiently raise their own.
+    max_attempts: int = 3
     cache_ttl_minutes: int = 180
     daily_cost_limit_usd: float = 0.0
     monthly_cost_limit_usd: float = 0.0
@@ -291,6 +293,11 @@ class GdeltProvider(BaseProvider):
     # Measured time-to-first-byte is ~13s, so the 12s default timeout is also
     # too tight; brands should raise timeout_seconds for this provider.
     default_min_request_interval_seconds = 5.0
+    # Measured 2026-07-31: GDELT still answered 429 to two of three probes
+    # spaced 12s apart, so its 429s are load-shedding rather than a penalty
+    # that pacing alone clears. Retrying is what actually gets a 200, and
+    # GDELT is the only news source feeding minimum_cross_source_count.
+    default_max_attempts = 5
 
     def __init__(
         self, settings: ProviderSettings | None = None,
@@ -298,13 +305,20 @@ class GdeltProvider(BaseProvider):
     ):
         super().__init__(settings, fetch_json, clock=clock)
         if fetch_json is fetch_json_with_retries:
-            # Bind the rate floor into retry backoff for real calls only, so the
-            # injected-fetcher contract stays four positional arguments.
-            self.fetch_json = partial(fetch_json_with_retries, min_retry_delay=self._pace())
+            # Bind the rate floor and attempt budget into real calls only, so
+            # the injected-fetcher contract stays four positional arguments.
+            self.fetch_json = partial(
+                fetch_json_with_retries,
+                min_retry_delay=self._pace(),
+                attempts=self._attempts(),
+            )
 
     def _pace(self) -> float:
         configured = float(self.settings.min_request_interval_seconds or 0.0)
         return max(configured, self.default_min_request_interval_seconds)
+
+    def _attempts(self) -> int:
+        return max(int(self.settings.max_attempts or 0), self.default_max_attempts)
 
     def collect(self, request: TrendRequest) -> ProviderResult:
         if not self.enabled:
