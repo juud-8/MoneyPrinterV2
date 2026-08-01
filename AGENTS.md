@@ -17,6 +17,24 @@ closed-loop channel optimization platform that:
 6. Diagnoses results honestly.
 7. Improves future strategy without overfitting.
 
+## Progress Log (read first, update last)
+
+`progress/` is the shared memory for Jeff and every agent working on this repo. It
+is gitignored and private — never commit it and never put secrets in it.
+
+- **Before non-trivial work:** read `progress/STATUS.md` and skim the newest few
+ files in `progress/entries/` so you don't re-solve a solved problem.
+- **After non-trivial work:** add an entry from `progress/TEMPLATE.md`, refresh
+ `progress/STATUS.md`, and restate your three next steps in your chat reply.
+
+Every entry must carry all four sections: a dense **Technical Record** (root cause
+and what you ruled out), a jargon-free **Plain English** summary for Jeff,
+**Verification** with real command output, and a mandatory **Best 3 Next Steps**
+ranked by expected value, each with a copy-paste prompt that works for a fresh agent
+with no prior context.
+
+Full protocol: `progress/README.md`.
+
 ## Non-Negotiable Architecture Rules
 
 - Preserve the brand-agnostic engine architecture.

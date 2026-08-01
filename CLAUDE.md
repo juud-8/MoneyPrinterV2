@@ -14,6 +14,26 @@ There is no web UI, no REST API, no CI, and no linting config. There is a small 
 
 The app is also used as a personal, multi-brand content factory (see "Multi-Brand System" below) — `brands/<brand_id>/` holds brand-specific manifests, assets, and scripts that are gitignored/private-by-convention; the engine code itself should never reference a specific brand by name or id.
 
+## Progress Log (read first, update last)
+
+`progress/` is the shared memory for Jeff and every agent working on this repo
+(Cursor, Claude Code, Codex). It is gitignored and private — never commit it and
+never put secrets in it.
+
+- **Before non-trivial work:** read `progress/STATUS.md` and skim the newest few
+  files in `progress/entries/` so you don't re-solve a solved problem or reintroduce
+  a bug that was already fixed once.
+- **After non-trivial work:** add an entry from `progress/TEMPLATE.md`, refresh
+  `progress/STATUS.md`, and restate your three next steps in your chat reply.
+
+Every entry must carry all four sections: a dense **Technical Record** (root cause
+and what you ruled out), a jargon-free **Plain English** summary for Jeff,
+**Verification** with real command output, and a mandatory **Best 3 Next Steps**
+ranked by expected value, each with a copy-paste prompt that works for a fresh agent
+with no prior context.
+
+Full protocol: `progress/README.md`.
+
 ## Running the Application
 
 ```bash
