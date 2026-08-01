@@ -77,6 +77,8 @@ def _settings(manifest: dict[str, Any], name: str) -> ProviderSettings:
     return ProviderSettings(
         enabled=bool(raw.get("enabled", False)),
         timeout_seconds=float(raw.get("timeout_seconds", 12)),
+        min_request_interval_seconds=max(0.0, float(raw.get("min_request_interval_seconds", 0))),
+        max_attempts=max(1, int(raw.get("max_attempts", 3))),
         cache_ttl_minutes=max(0, int(raw.get("cache_ttl_minutes", 180))),
         daily_cost_limit_usd=max(0.0, float(raw.get("daily_cost_limit_usd", 0))),
         monthly_cost_limit_usd=max(0.0, float(raw.get("monthly_cost_limit_usd", 0))),
@@ -139,15 +141,31 @@ def _collect(args, store: TrendStore) -> int:
 
     for signal in signals:
         store.save_signal(signal)
+    reference_now = args.now or utc_now()
     clusters = cluster_signals(
-        signals, now=args.now or utc_now(), brand_id=args.brand,
+        signals, now=reference_now, brand_id=args.brand,
         collection_horizon_hours=args.window_hours,
     ) if signals else []
+    notes = []
+    if signals and not clusters:
+        # Clustering drops expired signals, so a stale fixture yields signals
+        # and no clusters with nothing on screen explaining the gap.
+        expired = sum(
+            1 for signal in signals
+            if signal.expires_at and signal.expires_at <= reference_now
+        )
+        if expired:
+            notes.append(
+                f"{expired} of {len(signals)} signal(s) had already expired at {reference_now} "
+                "and cannot cluster. Collect fresh signals, or pass --now inside their validity "
+                "window when replaying a fixture."
+            )
     for cluster in clusters:
         store.save_cluster(cluster)
     _print_json(
         {
             "dry_run": not args.live,
+            "notes": notes,
             "signals_saved": len(signals),
             "clusters_saved": len(clusters),
             "clusters": [
@@ -205,6 +223,28 @@ def _local_completion(prompt: str) -> str:
     return str(response["message"]["content"] or "").strip()
 
 
+def _bridge_completion(prompt: str, *, local_only: bool = False) -> str:
+    """Generate bridge candidates with the quality model by default.
+
+    Bridging is the one step that has to reason across two domains at once and
+    fill a seventeen-field schema. Measured on the same live cluster,
+    llama3.2:3b returned three candidates that each failed validation on an
+    empty absurd_contradiction, called the Golden Gate Bridge a shipwreck, and
+    justified every link with "both represent significant engineering
+    achievements" — the forced relevance the prompt explicitly rejects. The
+    quality model returned Lake Nemi, Antikythera, and Project Azorian, all
+    valid on the first pass. It is one small text call per run, and human
+    approval still gates everything downstream.
+
+    --local-model keeps a fully offline path for operators who want one.
+    """
+    if local_only:
+        return _local_completion(prompt)
+    from llm_provider import generate_text
+
+    return str(generate_text(prompt, quality=True) or "").strip()
+
+
 def _expiry(cluster, now: str) -> str:
     values = [signal.expires_at for signal in cluster.signals if signal.expires_at]
     current = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -255,7 +295,10 @@ def _bridge(args, store: TrendStore) -> int:
         raw = json.dumps(raw_value.get("bridges", raw_value) if isinstance(raw_value, dict) else raw_value)
         fixture = True
     else:
-        raw = _local_completion(build_bridge_prompt(cluster, manifest))
+        raw = _bridge_completion(
+            build_bridge_prompt(cluster, manifest),
+            local_only=bool(getattr(args, "local_model", False)),
+        )
         fixture = False
     candidates = parse_bridge_candidates(raw, cluster)
     catalog = TrendCatalog.from_repository(args.brand)
@@ -427,6 +470,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--live-research",
         action="store_true",
         help="Explicitly authorize Wikipedia/Library of Congress source collection",
+    )
+    bridge.add_argument(
+        "--local-model",
+        action="store_true",
+        help="Generate bridges with the local Ollama model instead of the quality model",
     )
     bridge.add_argument("--now", default="")
     bridge.set_defaults(handler=_bridge)

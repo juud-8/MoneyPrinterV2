@@ -14,6 +14,7 @@ import os
 import re
 from datetime import datetime
 from typing import Callable
+from urllib.parse import urlparse
 
 import requests
 
@@ -22,6 +23,12 @@ from config import ROOT_DIR
 USER_AGENT = "MoneyPrinterV2/2.0 (source-backed video research)"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 LOC_SEARCH_API = "https://www.loc.gov/search/"
+
+# The prompt and the quality gate must agree on what "enough research" means,
+# otherwise a model can return a brief that satisfies the instructions it was
+# given and still fail the gate.
+MIN_CLAIMS = 4
+MIN_CITED_SOURCES = 2
 
 
 def _get_json(url: str, params: dict, timeout: float = 12.0) -> dict:
@@ -312,9 +319,29 @@ def _filter_relevant_sources(
     return deduped
 
 
+def _distinct_domains(sources: list[dict]) -> int:
+    """How many independent hosts a source set spans."""
+    hosts = set()
+    for source in sources:
+        host = urlparse(str(source.get("url") or "")).netloc.lower()
+        if host:
+            hosts.add(host[4:] if host.startswith("www.") else host)
+    return len(hosts)
+
+
 def collect_sources(topic: str, per_provider: int = 3) -> list[dict]:
-    """Collect and label source candidates, tolerating one provider outage."""
+    """Collect and label source candidates, tolerating one provider outage.
+
+    Stopping at "two sources" is not enough: downstream gates require two
+    *independent domains*, and Wikipedia alone will happily supply two links.
+    That combination silently blocked every trend opportunity with "fewer than
+    two independent historical source domains" while Library of Congress
+    results sat right there in the same batch, discarded by the early return.
+    Prefer domain breadth first, then count, and only stop early once both are
+    satisfied. A genuinely single-source topic still returns what it found.
+    """
     best: list[dict] = []
+    best_domains = 0
     for query in search_queries_for_topic(topic):
         collected = []
         for collector in (search_wikipedia, search_library_of_congress):
@@ -323,18 +350,37 @@ def collect_sources(topic: str, per_provider: int = 3) -> list[dict]:
             except (requests.RequestException, ValueError, TypeError):
                 continue
         filtered = _filter_relevant_sources(topic, collected, query=query)
-        if len(filtered) > len(best):
-            best = filtered
-        if len(best) >= 2:
+        domains = _distinct_domains(filtered)
+        if (domains, len(filtered)) > (best_domains, len(best)):
+            best, best_domains = filtered, domains
+        if len(best) >= 2 and best_domains >= 2:
             return best
     return best
 
 
-def build_grounded_research_prompt(topic: str, niche: str, sources: list[dict]) -> str:
+def build_grounded_research_prompt(
+    topic: str,
+    niche: str,
+    sources: list[dict],
+    *,
+    min_claims: int = MIN_CLAIMS,
+    min_cited_sources: int = MIN_CITED_SOURCES,
+    prior_issues: list[str] | None = None,
+) -> str:
     source_text = "\n\n".join(
         f"[{source['id']}] {source['title']}\nURL: {source['url']}\nEXCERPT: {source['excerpt']}"
         for source in sources
     )
+    available = min(len(sources), max(1, int(min_cited_sources)))
+    retry_block = ""
+    if prior_issues:
+        retry_block = (
+            "\nYour previous attempt was rejected: "
+            + "; ".join(prior_issues)
+            + ".\nRe-read every excerpt and extract additional distinct claims that "
+            "you missed. Each excerpt usually supports more than one claim (dates, "
+            "names, places, numbers, outcomes, consequences).\n"
+        )
     return f"""Create a factual research brief for a YouTube explainer.
 
 Topic: {topic}
@@ -344,6 +390,12 @@ Use ONLY facts directly supported by the supplied excerpts. Do not fill gaps fro
 memory. If sources conflict or a detail is uncertain, put it in disputed_points
 instead of stating it as fact. Every claim must cite one or more supplied source IDs.
 
+REQUIRED COVERAGE (a brief that misses either of these is rejected):
+- At least {min_claims} distinct claims, each with a non-empty source_ids list.
+- Claims must collectively cite at least {available} different source IDs.
+Prefer specific, checkable details (dates, names, places, numbers, outcomes) over
+broad summary statements, and never invent a source ID that is not supplied below.
+{retry_block}
 Return ONLY valid JSON with this exact shape:
 {{
   "summary": "one-sentence editorial angle",
@@ -421,7 +473,9 @@ def parse_research_brief(raw: str, topic: str, sources: list[dict]) -> dict:
 
 
 def research_quality_issues(
-    brief: dict, min_claims: int = 4, min_cited_sources: int = 2
+    brief: dict,
+    min_claims: int = MIN_CLAIMS,
+    min_cited_sources: int = MIN_CITED_SOURCES,
 ) -> list[str]:
     issues = []
     if len(brief.get("claims") or []) < min_claims:

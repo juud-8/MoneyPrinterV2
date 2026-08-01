@@ -174,7 +174,15 @@ def create_topic_seed(opportunity: TrendOpportunity, approval: ApprovalRecord) -
         }
 
     structured_claims = {
-        "primary_entities": [trend.canonical_entity],
+        # The bridge subject first, then the trend term. The script is written
+        # about the bridge, so validating it against the trend keyword alone
+        # demanded the exact keyword-stuffing this pipeline forbids: a seed
+        # bridging the "shipwreck" trend to the 1628 Vasa produced a correct
+        # Vasa script that failed "script primary entity does not match the
+        # approved TopicSeed", because a script about a capsizing warship need
+        # never say "shipwreck". Every sibling field here already derives from
+        # the bridge. Event-level agreement stays strict below.
+        "primary_entities": [bridge.historical_event, trend.canonical_entity],
         "event_identity": bridge.historical_event,
         "period": bridge.specific_number,
         "cause": "",

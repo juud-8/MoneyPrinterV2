@@ -1,0 +1,44 @@
+---
+description: Read and update the shared progress log in progress/ for any non-trivial change
+alwaysApply: true
+---
+
+# Progress Log Protocol
+
+`progress/` is the shared memory for Jeff and every agent (Cursor, Claude Code,
+Codex). It is gitignored and private — never commit it, never put secrets in it.
+
+## Before starting non-trivial work
+
+Read `progress/STATUS.md`, then skim the newest 3–5 files in `progress/entries/`.
+This is how you avoid re-solving a solved problem or reintroducing a fixed bug.
+
+## After finishing non-trivial work
+
+Non-trivial = a fix, feature, upgrade, config/provider change, data migration,
+architectural decision, failed experiment, or production incident. Skip it only for
+typos, comments, and formatting.
+
+1. Copy `progress/TEMPLATE.md` to `progress/entries/YYYY-MM-DD-HHMM-short-slug.md`.
+   Get the real timestamp with `Get-Date -Format "yyyy-MM-dd-HHmm"` — never guess it.
+2. Fill in **all four** required sections:
+   - **Technical Record** — dense and precise for the next agent: root cause (not
+     just symptom), exact paths/functions/config keys/error strings, and
+     **what you ruled out and why**.
+   - **Plain English** — for Jeff: no jargon, no file paths. Explain it in terms of
+     the channel and the business. Flag anything affecting cost, video quality, or
+     what gets published.
+   - **Verification** — the actual commands and their real output. State explicitly
+     what you did *not* test.
+   - **Best 3 Next Steps** — mandatory, ranked by expected value. Each needs a
+     what / why now / effort estimate / ready-to-paste prompt that works for a fresh
+     agent with zero prior context.
+3. Overwrite `progress/STATUS.md` to describe the new present state, and add your
+   entry to its history table.
+4. In your chat reply, tell Jeff you logged it and restate the three next steps —
+   he should not have to open a file to see them.
+
+`progress/entries/` is append-only. Never edit or delete a past entry; supersede it
+with a new one that links back.
+
+Full protocol: `progress/README.md`.

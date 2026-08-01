@@ -15,6 +15,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.parse import quote, urljoin, urlparse
@@ -70,6 +71,7 @@ def fetch_json_with_retries(
     timeout: float,
     *,
     attempts: int = 3,
+    min_retry_delay: float = 0.0,
 ) -> dict[str, Any]:
     parsed_initial = urlparse(url)
     if parsed_initial.scheme != "https" or parsed_initial.hostname not in ALLOWED_PROVIDER_HOSTS:
@@ -82,7 +84,14 @@ def fetch_json_with_retries(
             for redirect_count in range(MAX_REDIRECTS + 1):
                 response = requests.get(
                     current_url, params=params if redirect_count == 0 else None,
-                    headers=headers, timeout=(min(timeout, 5.0), timeout),
+                    # Scalar, not a (connect, read) tuple. Measured against
+                    # api.gdeltproject.org on requests 2.34.2/urllib3 2.7.0: a
+                    # short connect value stays on the socket for the read, so
+                    # (5.0, 30.0) and even Timeout(connect=5, read=30) both die
+                    # at ~5s with "read timeout=5.0". GDELT needs ~13s to first
+                    # byte, so the old cap made it permanently unusable and
+                    # silently limited every provider to a 5s read.
+                    headers=headers, timeout=timeout,
                     allow_redirects=False, stream=True,
                 )
                 try:
@@ -96,8 +105,12 @@ def fetch_json_with_retries(
                             raise ValueError("provider redirect target is not allowlisted")
                         continue
                     if response.status_code == 429 and attempt + 1 < attempts:
-                        retry_after = min(float(response.headers.get("Retry-After", "1") or 1), 5.0)
-                        time.sleep(max(retry_after, 0))
+                        # Honour the provider's own floor. GDELT asks for one
+                        # request every 5s and answers 429 in plain text; the
+                        # old 1s default retried well inside that window and
+                        # just collected more 429s.
+                        retry_after = min(float(response.headers.get("Retry-After", "1") or 1), 30.0)
+                        time.sleep(max(retry_after, min_retry_delay, 0))
                         break
                     response.raise_for_status()
                     length = response.headers.get("Content-Length")
@@ -118,6 +131,9 @@ def fetch_json_with_retries(
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
             if attempt + 1 < attempts:
+                # Ordinary backoff. The provider rate floor deliberately does
+                # not apply here — it answers 429s, not connection errors, and
+                # forcing it on every failure just slows the whole run down.
                 time.sleep(0.25 * (2**attempt))
     assert last_error is not None
     raise last_error
@@ -141,6 +157,11 @@ class ProviderNotDispatchedError(RuntimeError):
 class ProviderSettings:
     enabled: bool = False
     timeout_seconds: float = 12.0
+    # Minimum spacing between consecutive requests to this provider. Providers
+    # that publish a rate floor set their own default; 0 means no pacing.
+    min_request_interval_seconds: float = 0.0
+    # Attempts per request. Providers that 429 transiently raise their own.
+    max_attempts: int = 3
     cache_ttl_minutes: int = 180
     daily_cost_limit_usd: float = 0.0
     monthly_cost_limit_usd: float = 0.0
@@ -268,6 +289,36 @@ class ManualProvider(BaseProvider):
 class GdeltProvider(BaseProvider):
     name = "gdelt"
     endpoint = "https://api.gdeltproject.org/api/v2/doc/doc"
+    # GDELT's 429 body states: "Please limit requests to one every 5 seconds."
+    # Measured time-to-first-byte is ~13s, so the 12s default timeout is also
+    # too tight; brands should raise timeout_seconds for this provider.
+    default_min_request_interval_seconds = 5.0
+    # Measured 2026-07-31: GDELT still answered 429 to two of three probes
+    # spaced 12s apart, so its 429s are load-shedding rather than a penalty
+    # that pacing alone clears. Retrying is what actually gets a 200, and
+    # GDELT is the only news source feeding minimum_cross_source_count.
+    default_max_attempts = 5
+
+    def __init__(
+        self, settings: ProviderSettings | None = None,
+        fetch_json: JsonFetcher = fetch_json_with_retries, *, clock=utc_now,
+    ):
+        super().__init__(settings, fetch_json, clock=clock)
+        if fetch_json is fetch_json_with_retries:
+            # Bind the rate floor and attempt budget into real calls only, so
+            # the injected-fetcher contract stays four positional arguments.
+            self.fetch_json = partial(
+                fetch_json_with_retries,
+                min_retry_delay=self._pace(),
+                attempts=self._attempts(),
+            )
+
+    def _pace(self) -> float:
+        configured = float(self.settings.min_request_interval_seconds or 0.0)
+        return max(configured, self.default_min_request_interval_seconds)
+
+    def _attempts(self) -> int:
+        return max(int(self.settings.max_attempts or 0), self.default_max_attempts)
 
     def collect(self, request: TrendRequest) -> ProviderResult:
         if not self.enabled:
@@ -279,8 +330,13 @@ class GdeltProvider(BaseProvider):
         signals: list[TrendSignal] = []
         errors: list[ProviderError] = []
         requests_made = 0
-        for term in request.terms[: request.max_results]:
+        pace = self._pace()
+        for index, term in enumerate(request.terms[: request.max_results]):
             try:
+                # Space consecutive terms. Without this every term after the
+                # first fires immediately and comes back 429.
+                if index and pace > 0:
+                    time.sleep(pace)
                 requests_made += 1
                 payload = self.fetch_json(
                     self.endpoint,

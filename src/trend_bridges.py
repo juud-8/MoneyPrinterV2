@@ -8,7 +8,13 @@ import unicodedata
 from dataclasses import replace
 from typing import Callable
 
-from trend_models import ArchiveBridge, TrendCluster, ValidationError
+from trend_models import (
+    ALLOWED_RISK_FLAGS,
+    ArchiveBridge,
+    RelationshipType,
+    TrendCluster,
+    ValidationError,
+)
 
 
 BridgeCompletion = Callable[[str], str]
@@ -35,6 +41,10 @@ def build_bridge_prompt(cluster: TrendCluster, brand: dict) -> str:
     }
     evidence_json = json.dumps(evidence, ensure_ascii=True, sort_keys=True)
     niche = safe_text(brand.get("niche"), 300)
+    # Derived from the validators so the prompt cannot drift out of sync with
+    # what from_dict() will actually accept.
+    allowed_risk_flags = "\n".join(f"- {flag}" for flag in sorted(ALLOWED_RISK_FLAGS))
+    allowed_relationships = ", ".join(item.value for item in RelationshipType)
     return f"""Generate 3 materially different historical bridges for a trend-assisted video suggestion.
 
 Brand niche: {niche}
@@ -50,12 +60,40 @@ contain a concrete number/date, and explain the relationship in one concise sent
 forced relevance. Do not exploit recent deaths, disasters, victims, living-person allegations,
 political bait, unverified breaking claims, or copyrighted media.
 
-Return ONLY a JSON array. Every item must contain:
-historical_event, relationship_type, relationship_explanation, specific_number,
-absurd_contradiction, first_spoken_sentence, first_frame_text, working_titles,
-central_payoff, target_seconds, archive_fit_score, sourceability_score,
-visual_potential_score, competition_score, duplicate_similarity, risk_flags,
-unknowns. Scores are 0-100; duplicate_similarity is also expressed 0-100 here.
+Return ONLY a JSON array. Every item must be an object with exactly these keys
+and these JSON types:
+
+  historical_event         string
+  relationship_type        string (closed set, below)
+  relationship_explanation string, one sentence, 400 characters maximum
+  specific_number          string
+  absurd_contradiction     string
+  first_spoken_sentence    string
+  first_frame_text         string
+  working_titles           array of strings
+  central_payoff           string
+  target_seconds           number
+  archive_fit_score        number 0-100
+  sourceability_score      number 0-100
+  visual_potential_score   number 0-100
+  competition_score        number 0-100
+  duplicate_similarity     number 0-100
+  risk_flags               array of strings (closed set, below; [] when none)
+  unknowns                 array of strings ([] when none)
+
+working_titles, risk_flags, and unknowns must always be JSON arrays, never a
+string and never null. Use [] for empty rather than omitting the key.
+
+Every string field must be non-empty. absurd_contradiction in particular is
+rejected when blank: state the specific thing about this event that should not
+be true but is, in one sentence. Never emit "" for it.
+
+relationship_type is a closed set. Use exactly one of these strings:
+{allowed_relationships}
+
+risk_flags is a closed set. Use ONLY these exact strings, and use an empty list
+when none apply. Never invent a flag; put any other concern in unknowns instead.
+{allowed_risk_flags}
 """
 
 
@@ -74,6 +112,7 @@ def parse_bridge_candidates(raw: str, cluster: TrendCluster) -> list[ArchiveBrid
         raise ValidationError("Bridge response must be a list")
     current_sources = list(dict.fromkeys(url for signal in cluster.signals for url in signal.source_urls))
     candidates = []
+    rejected: list[str] = []
     for item in payload:
         if not isinstance(item, dict):
             continue
@@ -85,9 +124,17 @@ def parse_bridge_candidates(raw: str, cluster: TrendCluster) -> list[ArchiveBrid
             "current_news_sources": current_sources,
             "historical_sources": item.get("historical_sources") or [],
         }
-        candidates.append(ArchiveBridge.from_dict(enriched))
+        try:
+            candidates.append(ArchiveBridge.from_dict(enriched))
+        except ValidationError as exc:
+            # Drop the offending candidate, never its risk flags — an unknown
+            # flag is still a stated concern, so the candidate goes rather than
+            # the warning. One malformed item out of three should not discard
+            # the siblings and force another model run plus live research.
+            rejected.append(str(exc))
     if not candidates:
-        raise ValidationError("Bridge response contained no valid candidates")
+        detail = f" ({'; '.join(rejected)})" if rejected else ""
+        raise ValidationError(f"Bridge response contained no valid candidates{detail}")
     return candidates
 
 

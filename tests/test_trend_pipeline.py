@@ -158,6 +158,24 @@ class TrendPipelineTests(unittest.TestCase):
         self.assertFalse(mix.at_limit)
         self.assertEqual(self.store.get_topic_seed(seed.seed_id), seed)
 
+    def test_seed_primary_entities_lead_with_the_bridge_subject(self):
+        # The script is written about the bridge, so validating it against the
+        # trend keyword alone demanded keyword-stuffing the pipeline forbids: a
+        # correct script about the bridged event was rejected for not repeating
+        # the trend term, which a bridge exists to pivot away from.
+        _, seed, _ = approve_opportunity(
+            self.store,
+            self.opportunity.opportunity_id,
+            manifest(),
+            operator="reviewer",
+            reason="Verified safe and timely",
+            now=NOW,
+            videos=evergreen_videos(10),
+        )
+        entities = seed.structured_claims.primary_entities
+        self.assertEqual(entities[0], seed.structured_claims.event_identity)
+        self.assertIn(self.opportunity.trend.canonical_entity, entities)
+
     def test_seed_enters_normal_topic_and_research_gates(self):
         _, seed, _ = approve_opportunity(
             self.store,
