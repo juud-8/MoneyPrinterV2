@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
@@ -9,6 +10,9 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from research_brief import (
+    MIN_CITED_SOURCES,
+    MIN_CLAIMS,
+    build_grounded_research_prompt,
     collect_sources,
     parse_research_brief,
     render_research_notes,
@@ -49,6 +53,29 @@ class ResearchBriefTests(unittest.TestCase):
         issues = research_quality_issues(brief)
         self.assertEqual(len(issues), 2)
 
+    def test_prompt_states_the_thresholds_the_gate_enforces(self):
+        prompt = build_grounded_research_prompt("Topic", "niche", self.sources)
+        self.assertIn(f"At least {MIN_CLAIMS} distinct claims", prompt)
+        self.assertIn(f"at least {MIN_CITED_SOURCES} different source IDs", prompt)
+
+    def test_prompt_never_demands_more_sources_than_were_supplied(self):
+        prompt = build_grounded_research_prompt("Topic", "niche", self.sources[:1])
+        self.assertIn("at least 1 different source IDs", prompt)
+
+    def test_retry_prompt_reports_the_previous_shortfall(self):
+        prompt = build_grounded_research_prompt(
+            "Topic",
+            "niche",
+            self.sources,
+            prior_issues=["fewer than 4 source-mapped claims"],
+        )
+        self.assertIn("previous attempt was rejected", prompt)
+        self.assertIn("fewer than 4 source-mapped claims", prompt)
+
+    def test_first_prompt_has_no_retry_feedback(self):
+        prompt = build_grounded_research_prompt("Topic", "niche", self.sources)
+        self.assertNotIn("previous attempt was rejected", prompt)
+
     def test_wikipedia_collector_normalizes_pages(self):
         def fake_fetch(url, params, timeout):
             return {"query": {"pages": [{"index": 1, "title": "Event", "fullurl": "https://wiki/event", "extract": "  Useful   excerpt. "}]}}
@@ -75,6 +102,43 @@ class ResearchBriefTests(unittest.TestCase):
         ):
             result = collect_sources("Liechtenstein sent 80 soldiers to war")
         self.assertEqual([source["url"] for source in result], ["https://relevant"])
+
+    def test_collect_sources_prefers_two_domains_over_two_wikipedia_links(self):
+        # Downstream gates require two independent domains, so returning early
+        # on a pair of Wikipedia links silently blocked every trend opportunity
+        # while usable Library of Congress results sat in the same batch.
+        wiki = [
+            {"provider": "wikipedia", "title": "Steamboat Arabia", "url": "https://en.wikipedia.org/wiki/Arabia", "excerpt": "Steamboat Arabia sank in 1856"},
+            {"provider": "wikipedia", "title": "Steamboat Arabia cargo", "url": "https://en.wikipedia.org/wiki/Arabia_cargo", "excerpt": "Steamboat Arabia cargo preserved"},
+        ]
+        loc = [
+            {"provider": "loc", "title": "Steamboat Arabia salvage", "url": "https://www.loc.gov/item/arabia", "excerpt": "Steamboat Arabia salvage record"},
+        ]
+        with patch("research_brief.search_wikipedia", return_value=wiki), patch(
+            "research_brief.search_library_of_congress", return_value=loc
+        ):
+            result = collect_sources("Steamboat Arabia")
+
+        domains = {urlparse(source["url"]).netloc for source in result}
+        self.assertIn("www.loc.gov", domains)
+        self.assertGreaterEqual(len(domains), 2)
+
+    def test_collect_sources_still_returns_a_single_domain_topic(self):
+        # A topic that genuinely only has one source domain must not come back
+        # empty just because breadth is preferred.
+        wiki = [
+            {"provider": "wikipedia", "title": "Vasa warship", "url": "https://en.wikipedia.org/wiki/Vasa", "excerpt": "The Vasa warship sank in 1628"},
+            {"provider": "wikipedia", "title": "Vasa warship museum", "url": "https://en.wikipedia.org/wiki/Vasa_museum", "excerpt": "The Vasa warship was raised in 1961"},
+        ]
+        with patch("research_brief.search_wikipedia", return_value=wiki), patch(
+            "research_brief.search_library_of_congress", return_value=[]
+        ):
+            result = collect_sources("The Vasa warship sank in 1628")
+
+        self.assertTrue(result)
+        self.assertEqual(
+            {urlparse(source["url"]).netloc for source in result}, {"en.wikipedia.org"}
+        )
 
     def test_search_queries_add_compact_entity_year_fallback(self):
         topic = (
