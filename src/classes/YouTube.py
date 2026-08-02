@@ -851,7 +851,19 @@ Rules:
 - Under 70 characters
 - Do NOT include hashtags — they belong in the description, not the title
 - Use curiosity or specificity (numbers, real names, dates)
+- Vary the opening word. Do not reach for "How" by default — use it only when the
+  video really does explain how something happened
 - Return ONLY the title{extra_title_rules}"""
+
+        # Force at least one non-"How" candidate into the pool. Left to itself
+        # the LLM opens ~every title with "How", so `pick_best` never sees an
+        # alternative shape and the channel's feed turns into one repeated card.
+        alt_title_prompt = title_prompt.replace(
+            "- Return ONLY the title",
+            '- The title MUST NOT begin with the word "How" — find a different, equally\n'
+            '  specific angle ("The ...", "Why ...", "The day ...", or the fact stated flat)\n'
+            "- Return ONLY the title",
+        )
 
         preset_title = (getattr(self, "preset_title", "") or "").strip()
         if preset_title:
@@ -863,8 +875,16 @@ Rules:
                 1, int(style.get("title_candidate_count", 1) or 1)
             )
             title_candidates = []
-            for _ in range(title_candidate_count):
-                candidate = self.generate_response(title_prompt, quality=True)
+            for index in range(title_candidate_count):
+                # Last slot of a multi-candidate run is reserved for a
+                # guaranteed non-"How" phrasing, unless the pool already has one.
+                is_last = index == title_candidate_count - 1
+                needs_alt = is_last and title_candidate_count > 1 and all(
+                    c.lower().startswith("how ") for c in title_candidates
+                )
+                candidate = self.generate_response(
+                    alt_title_prompt if needs_alt else title_prompt, quality=True
+                )
                 if candidate:
                     cleaned = candidate.split("\n")[0].strip().strip('"').strip("'")
                     # Hashtags in titles get truncated into junk fragments ("#His")

@@ -332,9 +332,12 @@ CONTENT_STYLES: dict[str, ContentStyle] = {
 - The title MUST contain at least one specific number (a year, a count, or a quantity)
 - The title MUST pair that number with an absurd conflict or outcome, stated plainly —
   the number and the absurdity colliding is what earns the click
+- "How ..." is one valid shape, NOT the required one. Only open with "How" when the
+  video actually explains a causal chain. For an anomaly, a mystery, or a plain
+  strange event, lead with the thing itself ("The ...", "Why ...", "The day ...")
 - Best-performer examples to match in shape (not topic):
   "How Liechtenstein Sent 80 Men to War in 1866 and Returned with 81"
-  "How Cherries Made Millard Fillmore President in 1850"
+  "The 5-Year-Old Girl Mailed Across Idaho for 53 Cents in 1914"
 """,
         # Hard gate on real voiceover length: reject + retry shorter, and
         # abort (never upload) if the narration still runs past this.
