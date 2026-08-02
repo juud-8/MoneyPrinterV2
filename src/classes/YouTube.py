@@ -82,6 +82,7 @@ from youtube_tags import (
     merge_video_tags,
     topic_hashtags_for_description,
 )
+from youtube_titles import ALT_TITLE_RETRIES, clean_title_candidate, opens_with_how
 from topic_scoring import pick_best
 from content_strategy import (
     build_topic_avoid_block,
@@ -880,19 +881,29 @@ Rules:
                 # guaranteed non-"How" phrasing, unless the pool already has one.
                 is_last = index == title_candidate_count - 1
                 needs_alt = is_last and title_candidate_count > 1 and all(
-                    c.lower().startswith("how ") for c in title_candidates
+                    opens_with_how(c) for c in title_candidates
                 )
-                candidate = self.generate_response(
-                    alt_title_prompt if needs_alt else title_prompt, quality=True
+                cleaned = clean_title_candidate(
+                    self.generate_response(
+                        alt_title_prompt if needs_alt else title_prompt, quality=True
+                    )
                 )
-                if candidate:
-                    cleaned = candidate.split("\n")[0].strip().strip('"').strip("'")
-                    # Hashtags in titles get truncated into junk fragments ("#His")
-                    # once suffixes/length limits apply — hard-strip them even if
-                    # the LLM ignores the prompt rule. Description keeps hashtags.
-                    cleaned = re.sub(r"\s*#\w+", "", cleaned).strip(" -|—")
-                    if cleaned:
-                        title_candidates.append(cleaned)
+
+                # The LLM ignores the ban often enough that trusting it would
+                # make the reserved slot a no-op. Re-ask until it complies, then
+                # accept whatever came back rather than dropping the candidate.
+                if needs_alt:
+                    for _ in range(ALT_TITLE_RETRIES):
+                        if cleaned and not opens_with_how(cleaned):
+                            break
+                        if get_verbose():
+                            info(' => Reserved title candidate still opened with "How". Retrying...')
+                        cleaned = clean_title_candidate(
+                            self.generate_response(alt_title_prompt, quality=True)
+                        )
+
+                if cleaned:
+                    title_candidates.append(cleaned)
 
             if len(title_candidates) > 1:
                 title = pick_best(title_candidates)
