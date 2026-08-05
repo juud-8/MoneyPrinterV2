@@ -82,6 +82,7 @@ from youtube_tags import (
     merge_video_tags,
     topic_hashtags_for_description,
 )
+from youtube_titles import ALT_TITLE_RETRIES, clean_title_candidate, opens_with_how
 from topic_scoring import pick_best
 from content_strategy import (
     build_topic_avoid_block,
@@ -851,7 +852,19 @@ Rules:
 - Under 70 characters
 - Do NOT include hashtags — they belong in the description, not the title
 - Use curiosity or specificity (numbers, real names, dates)
+- Vary the opening word. Do not reach for "How" by default — use it only when the
+  video really does explain how something happened
 - Return ONLY the title{extra_title_rules}"""
+
+        # Force at least one non-"How" candidate into the pool. Left to itself
+        # the LLM opens ~every title with "How", so `pick_best` never sees an
+        # alternative shape and the channel's feed turns into one repeated card.
+        alt_title_prompt = title_prompt.replace(
+            "- Return ONLY the title",
+            '- The title MUST NOT begin with the word "How" — find a different, equally\n'
+            '  specific angle ("The ...", "Why ...", "The day ...", or the fact stated flat)\n'
+            "- Return ONLY the title",
+        )
 
         preset_title = (getattr(self, "preset_title", "") or "").strip()
         if preset_title:
@@ -863,16 +876,34 @@ Rules:
                 1, int(style.get("title_candidate_count", 1) or 1)
             )
             title_candidates = []
-            for _ in range(title_candidate_count):
-                candidate = self.generate_response(title_prompt, quality=True)
-                if candidate:
-                    cleaned = candidate.split("\n")[0].strip().strip('"').strip("'")
-                    # Hashtags in titles get truncated into junk fragments ("#His")
-                    # once suffixes/length limits apply — hard-strip them even if
-                    # the LLM ignores the prompt rule. Description keeps hashtags.
-                    cleaned = re.sub(r"\s*#\w+", "", cleaned).strip(" -|—")
-                    if cleaned:
-                        title_candidates.append(cleaned)
+            for index in range(title_candidate_count):
+                # Last slot of a multi-candidate run is reserved for a
+                # guaranteed non-"How" phrasing, unless the pool already has one.
+                is_last = index == title_candidate_count - 1
+                needs_alt = is_last and title_candidate_count > 1 and all(
+                    opens_with_how(c) for c in title_candidates
+                )
+                cleaned = clean_title_candidate(
+                    self.generate_response(
+                        alt_title_prompt if needs_alt else title_prompt, quality=True
+                    )
+                )
+
+                # The LLM ignores the ban often enough that trusting it would
+                # make the reserved slot a no-op. Re-ask until it complies, then
+                # accept whatever came back rather than dropping the candidate.
+                if needs_alt:
+                    for _ in range(ALT_TITLE_RETRIES):
+                        if cleaned and not opens_with_how(cleaned):
+                            break
+                        if get_verbose():
+                            info(' => Reserved title candidate still opened with "How". Retrying...')
+                        cleaned = clean_title_candidate(
+                            self.generate_response(alt_title_prompt, quality=True)
+                        )
+
+                if cleaned:
+                    title_candidates.append(cleaned)
 
             if len(title_candidates) > 1:
                 title = pick_best(title_candidates)

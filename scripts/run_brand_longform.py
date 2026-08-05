@@ -9,9 +9,20 @@ os.chdir(ROOT)
 
 from llm_provider import select_model
 from config import get_ollama_model, get_longform_enabled
-from brand_switcher import switch_brand, resolve_youtube_account, load_active_brand
+from brand_switcher import (
+    switch_brand,
+    resolve_youtube_account,
+    load_active_brand,
+    get_active_brand_id,
+)
 from classes.Tts import TTS
 from classes.YouTube import YouTube
+from run_lock import RunLockBusy, run_lock
+
+# Shared with any other generation job — see run_lock for why overlapping runs
+# corrupt each other through the .mp/ scratch directory.
+LOCK_DIR = os.path.join(ROOT, ".mp", "locks")
+LOCK_NAME = "generation"
 
 
 def build_theme_preset(niche: str) -> dict | None:
@@ -60,13 +71,40 @@ def build_theme_title(theme: dict) -> str:
 
 
 def main():
-    brand_id = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "the_strange_archive"
+    # No brand argument falls back to whichever brand is active rather than a
+    # hardcoded id — scheduled runs should pass their brand explicitly.
+    brand_id = (
+        sys.argv[1]
+        if len(sys.argv) > 1 and not sys.argv[1].startswith("-")
+        else get_active_brand_id()
+    )
+    if not brand_id:
+        print("ERROR: no brand specified and no active brand set")
+        sys.exit(1)
     do_upload = "--upload" in sys.argv
     # The shorts topic generator hunts for one novel incident and saturates once
     # the niche is well covered. --theme instead compiles already-researched
     # episodes into a chaptered subject, fed in as a preset topic.
     use_theme = "--theme" in sys.argv
+    # Set by the scheduler wrapper. Mirrors cron.py: it stages a pilot brand's
+    # upload as private for human review instead of the review gate refusing
+    # to upload at all because nobody is at the keyboard to approve it.
+    unattended = "--unattended" in sys.argv
+    if unattended:
+        os.environ["MPV2_UNATTENDED_UPLOAD"] = "1"
+        os.environ["MPV2_RUN_TASK"] = "longform"
 
+    # Exit 75 (EX_TEMPFAIL) so the wrapper can report "skipped, already
+    # running" rather than treating a deliberate no-op as a crash.
+    try:
+        with run_lock(LOCK_NAME, LOCK_DIR):
+            run(brand_id, do_upload, use_theme)
+    except RunLockBusy as busy:
+        print(f"SKIPPED: {busy}")
+        sys.exit(75)
+
+
+def run(brand_id: str, do_upload: bool, use_theme: bool):
     model = get_ollama_model()
     if not model:
         print("ERROR: ollama_model not set in config.json")
@@ -102,8 +140,11 @@ def main():
     if use_theme:
         theme = build_theme_preset(account["niche"])
         if not theme:
-            print("ERROR: no unused theme with enough published episodes yet")
-            sys.exit(1)
+            # Exit 66 (EX_NOINPUT), not 1: on a schedule this is "no material
+            # this week", which the wrapper logs as a skip. Every unused
+            # cluster having been made already is a normal state, not a fault.
+            print("SKIPPED: no unused theme with enough published episodes yet")
+            sys.exit(66)
         print(f"Theme: {theme['theme']} ({len(theme['chapters'])} chapters)")
         for index, chapter in enumerate(theme["chapters"], 1):
             print(f"  {index}. {chapter}")
