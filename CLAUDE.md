@@ -117,6 +117,8 @@ Selenium uses pre-authenticated Firefox profiles (never handles login). The prof
 ### CRON Scheduling
 Uses Python's `schedule` library (in-process, not OS cron) for the interactive menu's "Setup CRON Job" option, spawning `subprocess.run(["python", "src/cron.py", platform, account_id, model, brand_id])`. For unattended daily production, brand-pinned scripts under `brands/<brand_id>/` (e.g. a `run_daily.ps1` + `scheduled_run.py`) are driven by the OS's own scheduler (Windows Task Scheduler) instead — they call `brand_switcher.switch_brand()` explicitly rather than relying on whatever brand is currently active.
 
+Long-form runs weekly on its own Task Scheduler job: `scripts/run_longform_weekly.ps1 -Register -BrandId <id>` wraps `scripts/run_brand_longform.py` in `--theme` mode (a chaptered compilation of published shorts — see `src/longform_theme.py`). Because every generation job shares `.mp/` as scratch and `rem_temp_files()` deletes all non-JSON files there, concurrent runs would corrupt each other; `src/run_lock.py` gives them a shared PID-stamped lock (`.mp/locks/generation.lock`, 4h TTL) and a second run exits 75 instead of proceeding. Exit 66 means "no unused theme yet". Full reference: `docs/LongformScheduling.md`.
+
 ## Configuration
 
 All config lives in `config.json` at the project root (gitignored — never commit real keys). See `config.example.json` for the full template and `docs/Configuration.md` for reference. Key external dependencies to configure:
